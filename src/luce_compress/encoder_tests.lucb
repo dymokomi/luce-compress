@@ -1,0 +1,130 @@
+import compress_native as codec
+import compress
+import interop
+import thread
+
+func worker(raw: void*?):
+    discard(raw)
+    for iteration in 0..<16:
+        var encoder = codec.make_encoder() catch failure: trap(failure.message)
+        defer encoder.close()
+        let plain = b"package worker worker worker"
+        var encoded: u8[128]
+        var scratch: u8[1]
+        var input: usize
+        var output: usize
+        while true:
+            let size: usize = 1 if input < plain.length else 0
+            let step = encoder.step(plain[input..<input + size], scratch, input + size == plain.length) catch failure: trap(failure.message)
+            input += (usize)step.consumed
+            if step.produced == 1:
+                assert(output < encoded.length)
+                encoded[output] = scratch[0]
+                output += 1
+                scratch[0] = 0
+            if step.status == codec.finished: break
+        let decoded = compress.decode(encoded[..<output]) catch failure: trap(failure.message)
+        defer decoded.release()
+        assert((str)(decoded.value().bytes() catch failure: trap(failure.message)) == (str)plain)
+
+pub func main(arguments: str[]) -> i32!:
+    discard(arguments)
+    assert(codec.encoder_storage_bytes() >= 557056 and codec.encoder_storage_bytes() < 560000)
+    for framing in ["gzip", "auto"]:
+        var rejected = false
+        var unused = codec.make_encoder(framing) catch failure:
+            assert(failure.code == compress.invalid)
+            rejected = true
+            recover codec.Encoder()
+        unused.close()
+        assert(rejected)
+    for budget in 0..<2:
+        var rejected = false
+        var unused = codec.make_encoder("raw", -1 if budget == 0 else 1, -1 if budget == 1 else 1) catch failure:
+            assert(failure.code == compress.invalid)
+            rejected = true
+            recover codec.Encoder()
+        unused.close()
+        assert(rejected)
+    var large = try codec.make_encoder("raw", 9223372036854775807, 9223372036854775807)
+    large.close()
+    var empty: u8[]
+    var output: u8[100]
+    var uninitialized: codec.Encoder
+    var rejected = false
+    discard(uninitialized.step(b"", empty) catch failure:
+        assert(failure.code == compress.closed)
+        rejected = true
+        recover codec.Step())
+    assert(rejected)
+    uninitialized.close()
+    var encoder = try codec.make_encoder(max_input = 12)
+    defer encoder.close()
+    let first = try encoder.step(b"ABCABCABCABC", empty, true)
+    assert(first.status == codec.need_output and first.consumed == 0 and first.produced == 0)
+    let last = try encoder.step(b"ABCABCABCABC", output)
+    assert(last.status == codec.finished and last.consumed == 12)
+    try encoder.reset()
+    assert((try encoder.statistics()).input_bytes == 0 and not (try encoder.statistics()).finished)
+    ## No implicit EOF at the input budget: a separate empty final call is legal.
+    let open = try encoder.step(b"ABCABCABCABC", output)
+    assert(open.status == codec.need_input and open.consumed == 12)
+    assert((try encoder.step(b"", output, true)).status == codec.finished)
+    ## Substantial output is emitted before the source is declared finished.
+    var streaming = try codec.make_encoder(max_input = 1024)
+    defer streaming.close()
+    var source: u8[1024]
+    for i in 0..<source.length: source[i] = 65
+    let progress = try streaming.step(source, output)
+    assert(progress.status == codec.need_input and progress.consumed == 1024 and progress.produced > 2)
+    assert(not (try streaming.statistics()).finished)
+    assert((try streaming.step(b"", output, true)).status == codec.finished)
+    try encoder.reset()
+    discard(try encoder.step(b"ABCABCABCABC", empty, true))
+    rejected = false
+    discard(encoder.step(b"", output, true) catch failure:
+        assert(failure.code == compress.invalid)
+        rejected = true
+        recover codec.Step())
+    assert(rejected and (try encoder.statistics()).failed)
+    try encoder.reset()
+    assert(not (try encoder.statistics()).failed)
+    assert((try encoder.step(b"", output, true)).status == codec.finished)
+    var no_output = try codec.make_encoder(max_output = 0)
+    defer no_output.close()
+    rejected = false
+    discard(no_output.step(b"", empty, true) catch failure:
+        assert(failure.code == compress.limit_exceeded)
+        rejected = true
+        recover codec.Step())
+    assert(rejected and (try no_output.statistics()).failed)
+    encoder.close()
+    encoder.close()
+    rejected = false
+    encoder.reset() catch failure:
+        assert(failure.code == compress.closed)
+        rejected = true
+    assert(rejected)
+    var facade = try compress.Deflater()
+    defer facade.close()
+    for capacity in [-1, 1048577]:
+        rejected = false
+        let unavailable: interop.Reference[compress.Data]? = facade.feed(b"ABC", capacity) catch failure:
+            assert(failure.code == compress.invalid)
+            rejected = true
+            recover none
+        assert(rejected and unavailable == none)
+    assert((try facade.statistics()).input_bytes == 0 and (try facade.statistics()).output_bytes == 0)
+    let chunk = try facade.feed(b"ABC", 64, true)
+    defer chunk.release()
+    assert(try chunk.value().status() == compress.finished)
+    try facade.reset()
+    facade.close()
+    let decoded = try compress.decode(try chunk.value().bytes())
+    defer decoded.release()
+    assert((str)(try decoded.value().bytes()) == "ABC")
+    var workers: thread.Handle[8]
+    for i in 0..<8: workers[i] = try thread.spawn(worker, none, stack = 524288)
+    for handle in workers: try handle.join()
+    print(f"PASS incremental encoder lifecycle, EOF, budgets, ownership and 8 workers; retained={codec.encoder_storage_bytes()} bytes")
+    return 0

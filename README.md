@@ -5,8 +5,8 @@ MIT OR Apache-2.0; see [provenance](NOTICE.md) for the retained MIT source notic
 No zlib/C codec, foreign library or compression subprocess in the runtime.
 
 **Experimental M1a work: whole-buffer zlib encoding/decoding and incremental
-raw-DEFLATE/zlib decoding.** Incremental encoding remains unfinished; this is not
-yet the completed streaming compression milestone or a full zlib replacement.
+raw-DEFLATE/zlib encoding/decoding.** Fault-injection and work/resource gates remain;
+this is not yet the completed compression milestone or a full zlib replacement.
 
 ## API
 
@@ -96,6 +96,40 @@ sanitizer/lifetime tests are not evidence of every allocator failure path.
 See the [contract](docs/STREAMING_CONTRACT.md) and executable
 [Luce example](tests/facade.luc) / [native tests](src/luce_compress/stream_tests.lucb).
 
+## Incremental encoding
+
+`Deflater(framing="zlib", max_input=1073741824, max_output=1073741824)` has the same
+owning `feed`, `reset`, `close`, `statistics` and `Data` chunk interface as `Inflater`.
+Native consumers use `compress_native.make_encoder(...)`, returning an owning
+`Encoder` handle with `step(input, output, final_input)`. Do not copy this handle or
+share it across workers; its `close()` releases its two native allocations and is
+idempotent on that handle. The decoder remains a fixed-state value, not a handle.
+
+The encoder retains a 65,536-entry match table, 32 KiB history, 258-byte circular
+lookahead and bounded pending bits. `encoder_storage_bytes()` is 557,448 bytes on
+the initial 64-bit targets, including the handle but excluding allocator metadata
+and caller buffers. The table is a separate allocation to avoid a large struct
+initializer on small worker stacks. There are no allocations during native `step`;
+reset clears/reuses state. Eight independent 512 KiB-stack workers exercise this.
+
+It emits one final fixed-Huffman block with LZ77 matches, with optional zlib framing.
+For a given input and framing, compressed bytes do not depend on chunk partitions,
+empty calls or output capacity; the match policy agrees with the whole-buffer
+encoder. It starts producing output before EOF once it has sufficient lookahead,
+without retaining the whole source. Fixed codes can expand incompressible inputs;
+there is no claim of optimal compression or a stored-block fallback in this version.
+
+An explicit final-input declaration is required: reaching `max_input` does not
+implicitly end the source. After accepting exactly that budget, `need_input` can
+mean that an empty final call is needed; an additional source byte is rejected.
+EOF declarations survive output backpressure just as in the decoder. Successful
+input counts include up to 258 bytes of retained lookahead; output counts include
+only bytes delivered to the caller. Pending bits/lookahead can remain after a call.
+The same per-chunk 1 MiB facade cap, poisoned-error and quarantine rules apply.
+No sync/full-flush operation, dictionary, dynamic-Huffman encoder or tuning level
+is exposed. Git compatibility tests cover zlib loose objects and undeltified pack
+entries only, not a production Git engine.
+
 ## Bounds and errors
 
 For the whole-buffer API, input is limited to 1 GiB; the output bound defaults to
@@ -114,7 +148,7 @@ old and new allocations, encoding also uses a 65,536-entry native-size match tab
 and Luce byte copies add memory. Bound concurrency too. Do not use this API as an
 unbounded public decompression service.
 
-No gzip wrapper, preset dictionaries, incremental encoder, asynchronous cancellation,
+No gzip wrapper, preset dictionaries, asynchronous cancellation,
 dynamic-Huffman encoder or tuning levels yet. The one-shot encoder still emits zlib,
 not raw streams. The image library is not migrated to this package in this slice.
 
@@ -154,12 +188,18 @@ Stock Git also creates loose objects and an undeltified pack in a disposable loc
 repository; the decoder checks exact zlib boundaries with later pack bytes still
 present. This does not implement or validate a complete Git object/pack engine.
 
+Encoder tests independently stream-decode Base output through Python/zlib, compare
+compressed bytes across partitions and against the previous deterministic policy,
+exercise every first split around short/lookahead fixtures, exact and insufficient
+budgets, overwritten spans, canaries, reset/close and concurrent independent owners.
+Stock Git reads Base-encoded loose objects and validates/indexes a separately framed
+pack; a second empty repository verifies packed reads cannot fall back to loose data.
+
 ## Next commits
 
-1. Incremental encoding with raw-DEFLATE/zlib framing, backpressure and hostile
-   input/output chunk-boundary tests.
-2. Allocator-failure injection, cooperative work budgets, measured peak memory/latency
-   and further fuzzing. Full threaded Git-consumer integration follows in M2a.
+1. Allocator-failure injection and cooperative work budgets.
+2. Measured peak memory/latency and further fuzzing. Full threaded Git-consumer
+   integration follows in M2a.
 
 M1a remains incomplete until those streaming/limit gates pass. The overall public
 plan is in [luce-pkg-server](https://github.com/dymokomi/luce-pkg-server).

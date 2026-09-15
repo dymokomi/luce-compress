@@ -1,0 +1,207 @@
+## Incremental fixed-Huffman LZ77, sharing the existing encoder's match policy.
+## Two bounded allocations at construction; no allocation or borrowed spans in step.
+import memory
+import luce_compress.deflate as deflate
+from luce_compress.decoder import Step, Statistics, need_input, need_output, finished
+from luce_compress.binary import invalid, corrupt, limit, closed
+
+pub func make_encoder(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> Encoder!:
+    if framing != "zlib" and framing != "raw": error(invalid, "framing must be zlib or raw")
+    if max_input < 0 or max_output < 0: error(invalid, "stream budgets must be nonnegative")
+    let state = try new State() in memory.heap
+    errdefer free(state) in memory.heap
+    ## Keep the large table separate: current compilers can materialize struct
+    ## initializers on worker stacks even when their destination is the heap.
+    state.heads = try new u64[65536] in memory.heap
+    state.wrapped = framing == "zlib"
+    state.max_in = (u64)max_input
+    state.max_out = (u64)max_output
+    state.clear()
+    return Encoder(state = state)
+
+## Owning handle: do not copy or use/close concurrently. close() is idempotent on
+## this handle, not on copied aliases. Each worker owns a distinct encoder.
+pub struct Encoder:
+    var state: State*?
+
+    pub mutating func step(input: const u8[], output: u8[], final_input: bool = false) -> Step!:
+        let state = self.state else error(closed, "encoder is closed or uninitialized")
+        return try state.step(input, output, final_input)
+
+    pub mutating func reset() -> !:
+        let state = self.state else error(closed, "encoder is closed or uninitialized")
+        state.clear()
+
+    pub func statistics() -> Statistics!:
+        let state = self.state else error(closed, "encoder is closed or uninitialized")
+        return Statistics((i64)state.total_in, (i64)state.total_out, state.stage == 4, state.failed)
+
+    pub mutating func close():
+        if let state = self.state:
+            free(state.heads) in memory.heap
+            free(state) in memory.heap
+        self.state = none
+
+## Includes heap state and the owning handle; excludes allocator metadata/caller
+## spans. This is a retained-state bound, not a process memory measurement.
+pub func encoder_storage_bytes() -> usize:
+    return sizeof(State) + sizeof(Encoder) + 65536 * sizeof(u64)
+
+struct State:
+    var wrapped: bool
+    var failed: bool
+    var stage: u32
+    var max_in: u64
+    var max_out: u64
+    var total_in: u64
+    var total_out: u64
+    var position: u64
+    var final_known: bool
+    var final_at: u64
+    var heads: u64[]
+    var history: u8[32768]
+    var ahead: u8[258]
+    var ahead_at: usize
+    var ahead_count: usize
+    var bits: u64
+    var bit_count: u32
+    var adler_a: u32
+    var adler_b: u32
+
+    mutating func clear():
+        self.failed = false
+        self.stage = 0
+        self.total_in = 0
+        self.total_out = 0
+        self.position = 0
+        self.final_known = false
+        self.final_at = 0
+        self.ahead_at = 0
+        self.ahead_count = 0
+        self.bits = 0
+        self.bit_count = 0
+        self.adler_a = 1
+        self.adler_b = 0
+        for i in 0..<65536: self.heads[i] = 0
+        for i in 0..<32768: self.history[i] = 0
+        for i in 0..<258: self.ahead[i] = 0
+
+    mutating func poison():
+        self.failed = true
+
+    func peek(index: usize) -> u8:
+        return self.ahead[(self.ahead_at + index) % 258]
+
+    mutating func put(value: u32, count: u32):
+        ## At most seven pending bits plus one complete match (31 bits).
+        assert(self.bit_count + count <= 64)
+        self.bits |= (u64)value << self.bit_count
+        self.bit_count += count
+
+    mutating func code(value: u32, count: u32):
+        var reversed: u32
+        for i in 0..<count: reversed = (reversed << 1) | ((value >> i) & 1)
+        self.put(reversed, count)
+
+    mutating func symbol(value: u32):
+        if value < 144: self.code(value + 48, 8)
+        elif value < 256: self.code(value + 256, 9)
+        elif value < 280: self.code(value - 256, 7)
+        else: self.code(value - 88, 8)
+
+    mutating func encode_one():
+        var length: usize
+        var distance: usize
+        if self.ahead_count >= 3:
+            let bucket = (((usize)self.peek(0) * 251 + (usize)self.peek(1)) * 251 + (usize)self.peek(2)) & 65535
+            let prior = self.heads[bucket]
+            self.heads[bucket] = self.position + 1
+            if prior > 0 and self.position - (prior - 1) <= 32768:
+                distance = (usize)(self.position - (prior - 1))
+                assert(distance > 0)
+                while length < self.ahead_count:
+                    ## A match can overlap itself. Older bytes live in history;
+                    ## the overlapping part lives in the retained lookahead.
+                    let value = self.history[(usize)((self.position - (u64)distance + (u64)length) & 32767)] if length < distance else self.peek(length - distance)
+                    if value != self.peek(length): break
+                    length += 1
+        if length >= 3:
+            var li: usize
+            while li < 28 and (usize)deflate.length_base[li + 1] <= length: li += 1
+            self.symbol((u32)li + 257)
+            self.put((u32)length - deflate.length_base[li], deflate.length_extra[li])
+            var di: usize
+            while di < 29 and (usize)deflate.distance_base[di + 1] <= distance: di += 1
+            self.code((u32)di, 5)
+            self.put((u32)distance - deflate.distance_base[di], deflate.distance_extra[di])
+        else:
+            length = 1
+            self.symbol((u32)self.peek(0))
+        for i in 0..<length:
+            let value = self.peek(i)
+            self.history[(usize)((self.position + (u64)i) & 32767)] = value
+            self.adler_a = (self.adler_a + (u32)value) % 65521
+            self.adler_b = (self.adler_b + self.adler_a) % 65521
+        self.position += (u64)length
+        self.ahead_at = (self.ahead_at + length) % 258
+        self.ahead_count -= length
+
+    mutating func step(data: const u8[], output: u8[], final_input: bool) -> Step!:
+        if self.failed: error(corrupt, "encoder failed; reset before reuse")
+        if self.stage == 4: return Step(0, 0, finished)
+        errdefer self.poison()
+        let ending = self.total_in +? (u64)data.length else error(invalid, "input end offset overflow")
+        if self.final_known and (ending > self.final_at or (final_input and ending != self.final_at)):
+            error(invalid, "input contradicts the declared stream end")
+        if final_input:
+            self.final_known = true
+            self.final_at = ending
+        var consumed: usize
+        var produced: usize
+        while true:
+            ## Flush a pending symbol/header/trailer before doing more work.
+            while self.bit_count >= 8:
+                if self.total_out == self.max_out: error(limit, "compressed stream byte budget exceeded")
+                if produced == output.length: return Step((i64)consumed, (i64)produced, need_output)
+                output[produced] = (u8)self.bits
+                produced += 1
+                self.total_out += 1
+                self.bits >>= 8
+                self.bit_count -= 8
+            match self.stage:
+                0:
+                    if self.wrapped: self.put(376, 16)  ## 78 01 in wire order
+                    self.put(3, 3)  ## one final fixed-Huffman block
+                    self.stage = 1
+                1:
+                    while self.ahead_count < 258 and consumed < data.length:
+                        if self.total_in == self.max_in: error(limit, "source stream byte budget exceeded")
+                        self.ahead[(self.ahead_at + self.ahead_count) % 258] = data[consumed]
+                        self.ahead_count += 1
+                        self.total_in += 1
+                        consumed += 1
+                    let ending_known = self.final_known and self.total_in == self.final_at
+                    if self.ahead_count < 258 and not ending_known:
+                        ## Reaching max_input isn't EOF: an empty final call is
+                        ## still legal at the exact budget. No extra byte is read.
+                        return Step((i64)consumed, (i64)produced, need_input)
+                    if self.ahead_count > 0:
+                        self.encode_one()
+                    else:
+                        self.symbol(256)
+                        if self.bit_count % 8 != 0: self.put(0, 8 - self.bit_count % 8)
+                        self.stage = 2
+                2:
+                    if self.wrapped:
+                        let checksum = (self.adler_b << 16) | self.adler_a
+                        self.put(checksum >> 24, 8)
+                        self.put((checksum >> 16) & 255, 8)
+                        self.put((checksum >> 8) & 255, 8)
+                        self.put(checksum & 255, 8)
+                    self.stage = 3
+                3:
+                    self.stage = 4
+                4:
+                    return Step((i64)consumed, (i64)produced, finished)
+                _:
+                    trap("invalid encoder state")

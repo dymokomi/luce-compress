@@ -4,6 +4,7 @@ import memory
 import luce_compress.binary as binary
 import luce_compress.deflate as deflate
 import luce_compress.decoder as decoder
+import luce_compress.encoder as encoder
 
 pub let invalid = binary.invalid
 pub let corrupt = binary.corrupt
@@ -112,3 +113,37 @@ pub struct Inflater:
         self.state = none
 
 pub let inflater_type: interop.Type[Inflater] = interop.Type[Inflater]("Inflater", Inflater.close, closeable = true)
+
+pub struct Deflater:
+    var state: encoder.Encoder
+
+    pub func init(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> !:
+        self.state = try encoder.make_encoder(framing, max_input, max_output)
+
+    pub mutating func feed(input: const u8[], capacity: i64 = 65536, final_input: bool = false) -> interop.Reference[Data]!:
+        discard(try self.state.statistics())  ## reject closed before allocating
+        if capacity < 0 or capacity > 1048576 or input.length > 1048576:
+            error(invalid, "feed input/output chunks must be at most 1 MiB")
+        var buffer = binary.Buffer(maximum = (usize)capacity)
+        buffer.reserve((usize)capacity) catch failure:
+            buffer.close()
+            error(failure.code, failure.message)
+        let result = try owned(buffer, 0)
+        errdefer result.release()
+        let chunk = result.value()
+        let step = try self.state.step(input, chunk.buffer.data, final_input)
+        chunk.buffer.used = (usize)step.produced
+        chunk.input_bytes = step.consumed
+        chunk.progress = step.status
+        return result
+
+    pub mutating func reset() -> !:
+        try self.state.reset()
+
+    pub func statistics() -> Statistics!:
+        return try self.state.statistics()
+
+    pub mutating func close():
+        self.state.close()
+
+pub let deflater_type: interop.Type[Deflater] = interop.Type[Deflater]("Deflater", Deflater.close, closeable = true)

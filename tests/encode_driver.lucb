@@ -1,0 +1,85 @@
+## Fixture-only whole-file I/O. Native encoder sees short-lived disjoint spans.
+import compress_native as codec
+import compress
+import files
+import memory
+import strings
+import c
+
+pub func main(arguments: str[]) -> i32!:
+    assert(arguments.length == 9)
+    let plain = try files.read((c.str)arguments[1])
+    defer free(plain) in memory.heap
+    let input_chunk = strings.parse_i64(arguments[4]) else trap("input chunk")
+    let output_chunk = strings.parse_i64(arguments[5]) else trap("output chunk")
+    let max_input = strings.parse_i64(arguments[6]) else trap("input budget")
+    let max_output = strings.parse_i64(arguments[7]) else trap("output budget")
+    var encoder = try codec.make_encoder(arguments[3], max_input, max_output)
+    defer encoder.close()
+    let packed = try alloc u8[2097152] in memory.heap
+    defer free(packed) in memory.heap
+    var packed_size: usize
+    var input: u8[65536]
+    var output: u8[65537]
+    var consumed: usize
+    var steps: usize
+    var chunk_seed: u32 = 19511950
+    while true:
+        assert(steps < 10000000)
+        chunk_seed ^= chunk_seed << 13
+        chunk_seed ^= chunk_seed >> 17
+        chunk_seed ^= chunk_seed << 5
+        var count = (usize)input_chunk if input_chunk > 0 else 1 + (usize)(chunk_seed % 521)
+        if input_chunk < 0: count = (usize)(-input_chunk - 1) if steps == 0 else plain.length - consumed
+        if count > 65536: count = 65536
+        if count > plain.length - consumed: count = plain.length - consumed
+        var data: const u8[] = b""
+        if count > 0:
+            memory.copy(input, plain[consumed..<consumed + count], count)
+            data = input[..<count]
+        let capacity = (usize)output_chunk if output_chunk > 0 else (0 if steps % 5 == 0 else 1 + (usize)((chunk_seed >> 9) % 257))
+        assert(capacity <= 65536)
+        output[capacity] = 173
+        let last = (consumed == plain.length) if arguments[8] == "late" else (consumed + count == plain.length)
+        let step = encoder.step(data, output[..<capacity], last) catch failure:
+            let statistics = try encoder.statistics()
+            assert(statistics.failed and statistics.input_bytes <= max_input and statistics.output_bytes <= max_output)
+            var refused = false
+            discard(encoder.step(b"", output) catch again:
+                assert(again.code == compress.corrupt)
+                refused = true
+                recover codec.Step())
+            assert(refused)
+            print(f"REJECT {statistics.input_bytes} {statistics.output_bytes}")
+            return 1
+        assert(step.consumed >= 0 and (usize)step.consumed <= count)
+        assert(step.produced >= 0 and (usize)step.produced <= capacity)
+        assert(output[capacity] == 173)
+        assert((usize)step.produced <= packed.length - packed_size)
+        if step.produced > 0: memory.copy(packed[packed_size..], output, (usize)step.produced)
+        packed_size += (usize)step.produced
+        for index in 0..<(usize)step.produced: output[index] = 221
+        for index in 0..<count: input[index] = 222
+        consumed += (usize)step.consumed
+        let statistics = try encoder.statistics()
+        assert(statistics.input_bytes == (i64)consumed and statistics.output_bytes == (i64)packed_size and not statistics.failed)
+        if step.status == codec.finished:
+            assert(statistics.finished and consumed == plain.length)
+            let done = try encoder.step(b"a different stream", output, true)
+            assert(done.status == codec.finished and done.consumed == 0 and done.produced == 0)
+            ## Additional deterministic-policy regression; Python independently
+            ## validates the wire output, so this isn't the sole correctness oracle.
+            let reference = try compress.encode(plain, 2097152)
+            defer reference.release()
+            let wrapped = try reference.value().bytes()
+            let expected = wrapped if arguments[3] == "zlib" else wrapped[2..<wrapped.length - 4]
+            assert(expected.length == packed_size)
+            for i in 0..<expected.length: assert(expected[i] == packed[i])
+            try files.write((c.str)arguments[2], packed[..<packed_size])
+            print(f"OK {consumed} {packed_size} {steps + 1}")
+            return 0
+        if step.status == codec.need_input: assert((usize)step.consumed == count)
+        elif step.status == codec.need_output: assert((usize)step.produced == capacity)
+        else: trap("unknown status")
+        assert(step.consumed > 0 or step.produced > 0 or count == 0 or capacity == 0)
+        steps += 1

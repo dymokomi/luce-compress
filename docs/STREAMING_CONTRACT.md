@@ -1,7 +1,7 @@
 # Incremental codec contract
 
-The decoder implements this contract; incremental encoding and explicit allocator-
-failure injection remain follow-up work. The underlying formats are [RFC 1950](https://www.rfc-editor.org/info/rfc1950/)
+The decoder and encoder implement this contract; explicit allocator-failure
+injection and cooperative work limits remain follow-up work. The underlying formats are [RFC 1950](https://www.rfc-editor.org/info/rfc1950/)
 and [RFC 1951](https://www.rfc-editor.org/info/rfc1951/).
 
 One decoder owns a fixed 32 KiB history window and bounded Huffman/bit state. It
@@ -36,3 +36,30 @@ matches across the 32 KiB wrap, repeated blocks, final empty blocks, unfinished
 trailers, capacity/total-limit boundaries, multiple concatenated objects, and
 equivalence to an independent streaming oracle. Inspect total retained state and
 instrument sanitizer runs; a whole-buffer success is not streaming evidence.
+
+## Encoder-specific state and EOF
+
+Encoding uses a fixed-Huffman LZ77 policy and bounded 258-byte lookahead, a 32 KiB
+history ring and a 65,536-entry absolute-position match table. It allocates state
+and table once, does not allocate within native `step`, and does not retain caller
+spans. Reset reuses both allocations; close releases them. Native `Encoder` is an
+owning handle and must not be copied, unlike the decoder's self-contained value.
+
+Fill lookahead to 258 bytes before selecting a symbol, except at declared EOF.
+That policy makes output independent of input/output chunk partitions. Pending bits
+are drained before selecting another symbol; a partial drain never repeats the
+match/table/history/checksum update. All accepted input is represented exactly once.
+Only an explicit final-input declaration permits EOB/padding/zlib trailer emission.
+At the exact source budget, starvation may still request an empty final call; it
+must reject extra bytes, not silently infer EOF from a caller-selected budget.
+
+Input statistics count bytes accepted into retained state, which may include
+lookahead not yet encoded; output counts only delivered bytes. Budget/EOF errors
+poison the encoder just as decoder errors do. Encoder output remains unpublished
+until successful completion and enclosing integrity/authorization checks.
+
+Test independent Python/zlib streaming reads, deterministic partition equivalence,
+real stock-Git loose/packed consumers, progress before EOF, empty final input,
+lookahead/history wrap, output-limited finalization, source/output budgets, lifetime
+and explicit 512 KiB worker stacks. Compression ratio checks distinguish actual
+LZ77 matching from a stored-only implementation; they are not throughput claims.

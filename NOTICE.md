@@ -9,6 +9,9 @@ stricter malformed Huffman-tree validation. No image-library source is modified.
 The incremental decoder is new Base state-machine code sharing the validated
 Huffman builder and format constants with that core; it adds raw/zlib framing,
 bounded history, backpressure, end markers and cumulative byte budgets.
+The incremental encoder is new Base state-machine code adapting the existing
+fixed-Huffman/nearest-match policy to circular history/lookahead and partial output.
+The original encoder's MIT provenance and notice above apply to that adaptation.
 
 The bounded buffer and compiler-bootstrap approach are adapted from `luce-db`
 revision `d13a1d1ce1116914e2b63bc9dff99dbde816f345` (MIT OR Apache-2.0).

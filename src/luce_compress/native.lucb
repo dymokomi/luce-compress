@@ -1,0 +1,20 @@
+## Native incremental API. The decoder is a value; the encoder is an owning handle.
+import luce_compress.decoder as decoder
+import luce_compress.encoder as encoder
+
+pub type Step = decoder.Step
+pub type Statistics = decoder.Statistics
+pub type Decoder = decoder.Decoder
+pub type Encoder = encoder.Encoder
+pub let need_input = decoder.need_input
+pub let need_output = decoder.need_output
+pub let finished = decoder.finished
+
+pub func make_decoder(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> Decoder!:
+    return try decoder.make_decoder(framing, max_input, max_output)
+
+pub func make_encoder(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> Encoder!:
+    return try encoder.make_encoder(framing, max_input, max_output)
+
+pub func encoder_storage_bytes() -> usize:
+    return encoder.encoder_storage_bytes()
