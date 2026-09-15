@@ -233,3 +233,64 @@ memory and latency, larger stress workloads and further fuzzing remain. Full Git
 integration, registration, registry deployment and language CLI acceptance are
 separate pending gates. This is not exhaustive OOM, thread-sanitizer or independent
 security-review evidence.
+
+## Cooperative work limits — 2026-09-14 PDT / 2026-09-15 UTC
+
+Source/test revision: `37917350a4831285c6f419e3a86c9af3243629b7`.
+[CI run 34928398223](https://github.com/dymokomi/luce-compress/actions/runs/34928398223)
+passed all six compiler modes and AddressSanitizer/UndefinedBehaviorSanitizer on
+Ubuntu 24.04 x86-64 and macOS 15 arm64. Final-source local modes 0–2 passed before
+disk exhaustion interrupted mode 3 and a parallel sanitizer run. After removing
+verified stale compiler-cache binaries, modes 3, C-debug and C-release were rebuilt
+and passed; the full sanitizer and prebuilt suites were rerun successfully. The
+interrupted logs remain failure evidence, not successful runs. No codec change was
+needed for the host I/O failure, and neither language nor image source was changed.
+
+Native `step` and owning `feed` now accept 1–65,536 bounded state-machine dispatches
+per call, defaulting to 4,096, and report actual work. Exhaustion returns `yielded`
+without replaying input or losing partial state/EOF. Completion on the final allowed
+dispatch returns `finished`. A yield can consume and produce zero bytes; consumers
+must handle this new status and reschedule the owner, not wait indefinitely for
+input. This is a dispatch bound, not a wall-clock deadline or aggregate server
+scheduling policy. See [STREAMING_CONTRACT.md](STREAMING_CONTRACT.md).
+
+Each mode passed **6,000 codec fixture cases**, comprising the previous 5,072 plus
+**928 cooperative-work cases**. The new cases cover raw/zlib framing, stored/fixed/
+dynamic blocks, one-unit/varying/default/maximum allowances, exact resumed bytes,
+partition-independent encoder output, all first splits/truncated prefixes of short
+fixtures, sticky EOF, malformed streams and a 4,096-empty-block chain that produces
+no expanded bytes. Drivers assert per-call work and I/O bounds. Python/zlib remains
+an independent oracle; stock Git still reads Base-encoded loose and packed objects.
+
+Native and owning tests cover invalid-work rejection before mutation/allocation,
+closed/failed/finished precedence, owner-side reset or direct close at multiple
+unfinished yield points, retained output ownership, and eight independent workers
+with 512 KiB stacks. The real high-level Luce consumer resumes one-unit calls.
+The allocation suite now counts **388 failure/retry cases**, with additional native
+allocation-free and direct-unfinished-close assertions. Failed result allocation
+after yielding preserves counters and EOF for retry. The audited peak is 590,736
+requested live bytes, not RSS or process/aggregate memory. Retained decoder and
+encoder state remain 37,960 and 557,448 bytes on the tested targets.
+
+The verified public Linux native-opt-3 bundle has SHA256
+`8b8075732919978dbf39a654f480c487ecbe1673ad5a97dd33f472d4c9c2300d`.
+Its nine executables and six scripts passed the full prebuilt suite on the existing
+Ubuntu 24.04 VPS after regular-member, revision and per-file hash verification.
+The same transient dynamic-user/private-network/private-tmp isolation, read-only
+host/input, inaccessible live applications/home, no capabilities and resource caps
+were retained: 512 MiB RAM, no swap, 25% CPU, 64 tasks and 180 seconds. No dependency
+installation occurred. Systemd reported success, 99.520 seconds elapsed and 24.878
+seconds CPU. These are quota-limited whole-suite observations, not codec throughput
+or production capacity measurements.
+
+Removed only the exact staging directory after checking its revision and inactive
+unit. The unit was then absent/inactive. All 32 live service names matched the
+baseline; Caddy PID, activation/configuration hash and site HTTPS 200/ETag were
+unchanged. No live application/data/proxy/DNS/firewall changes occurred. The verified
+bundle and local/hosted/VPS logs are retained in the owner's ignored build directory.
+
+M1a remains incomplete: measured process/aggregate memory and latency, larger
+streaming stress workloads and further fuzzing are next. There is no claim of
+asynchronous cross-thread close, ThreadSanitizer coverage, exhaustive allocation
+failure handling or independent security review. Full Git service integration,
+real registration, deployment and standalone `luc` acceptance remain separate gates.
