@@ -294,3 +294,66 @@ streaming stress workloads and further fuzzing are next. There is no claim of
 asynchronous cross-thread close, ThreadSanitizer coverage, exhaustive allocation
 failure handling or independent security review. Full Git service integration,
 real registration, deployment and standalone `luc` acceptance remain separate gates.
+
+## Measured streaming resources — 2026-09-14 PDT / 2026-09-15 UTC
+
+Source/test revision: `98558cce430146a360f594404a6f3f30dd1ddb01`.
+[CI run 34930402188](https://github.com/dymokomi/luce-compress/actions/runs/34930402188)
+passed all six compiler modes and AddressSanitizer/UndefinedBehaviorSanitizer on
+Ubuntu 24.04 x86-64 and macOS 15 arm64. The same gates, complete prebuilt suite
+and eight measurement-harness tests passed locally. Each mode retains all 6,000
+codec fixtures, 388 allocation cases and native/Luce/worker suites, and adds five
+fixed-buffer streaming stress cases. Production codec, language and image sources
+did not change.
+
+The native-opt-3 full resource profile passed all eleven cases locally and on both
+CI hosts. Independent worker owners generate and verify every byte through paired
+Base encoder/decoder pipelines, with one/eight capped-stack workers, repeated reuse,
+raw/zlib framing, noise/repeated input and finite work/canary/count/EOF checks. The
+profile includes 16/128 MiB streams and one 4,294,967,297-byte zlib stream crossing
+32-bit input/output counts. No source-sized allocation or large temporary file is
+used. Exact-child OS peak RSS and bounded step-duration histograms are retained
+alongside CPU, wall time and paired-pipeline throughput in the resource logs.
+
+The >4 GiB case had these observed values, not hardware-independent guarantees:
+
+| Host | OS-reported peak child RSS, bytes | Whole-child wall time, seconds |
+| --- | ---: | ---: |
+| Local macOS arm64 | 2,441,216 | 92.204 |
+| CI macOS 15 arm64 | 2,342,912 | 147.501 |
+| CI Ubuntu 24.04 x86-64 | 17,432,576 | 201.147 |
+
+All eleven Linux measurements shared the same reported RSS floor; do not interpret
+that plateau as an allocation ledger or identical codec memory across worker counts.
+The macOS CI eight-worker maximum was 9,109,504 bytes. Both CI hosts passed the
+16-to-128 MiB memory-growth guard. These are exact-child OS observations including
+startup/runtime effects, not managed-facade/caller retention or aggregate server
+memory. Step-clock granularity/preemption and histogram rounding limit latency
+interpretation. The pipeline includes generating, encoding, decoding, verifying,
+overwriting buffers and scheduling; it is not isolated codec speed. See
+[RESOURCES.md](RESOURCES.md) for ceilings and measurement semantics.
+
+The verified public Linux native-opt-3 bundle has SHA256
+`cab9c65391b31363dc9718786c220abf6ca5821b14546e737f0d53318fea6c6e`.
+After regular-member, revision and per-file hash verification, its ten executables
+and seven scripts passed the complete prebuilt suite on the existing Ubuntu VPS,
+including all five quick resource cases. The eleven-case full profile and >4 GiB
+workload did not run on this live-infrastructure host. The same dynamic-user,
+private-network/tmp, read-only-host/input and inaccessible-live-app isolation was
+retained, with no installations and unchanged 512 MiB/no-swap, 25%-CPU, 64-task and
+180-second limits. Systemd reported success, exit 0, 123.591 seconds elapsed and
+30.882 seconds CPU. All five driver launches reported 23,117,824 bytes peak child
+RSS; this is separate from systemd's cgroup memory accounting. CPU throttling and
+scheduling affect recorded step durations; they are not intrinsic codec latency.
+
+After checking its revision, directory type and inactive/collected unit, removed
+only the exact test staging directory. The unit was absent/inactive afterward.
+All 32 running service names matched the baseline; Caddy PID/activation/config hash
+and the existing site's HTTPS 200/ETag were unchanged. No live service, data, proxy,
+DNS or firewall changes occurred. Removed inputs are reproducible from the retained
+public bundle; local, hosted and VPS logs remain in the ignored build directory.
+
+M1a remains incomplete. Independent larger-stream fixtures and further hostile-input
+fuzzing are the next sub-slice; this paired Base stress workload is not an
+independent oracle. Full Git/server admission, ThreadSanitizer, independent review,
+registration, deployment and standalone `luc` acceptance remain separate gates.
