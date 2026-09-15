@@ -1,0 +1,194 @@
+## Test-only generated-stream pipeline. Never retains a whole source or result.
+import compress_native as codec
+import thread
+import time
+import strings
+
+var ready: @u64
+var start: @u64
+
+struct Measure:
+    var histogram: u64[64]
+    var maximum: u64
+    var nanoseconds: u64
+    var calls: u64
+    var units: u64
+    var yields: u64
+
+func record(measure: Measure*, step: codec.Step, elapsed: u64, allowance: i64):
+    assert(step.work_units > 0 and step.work_units <= allowance)
+    if step.status == codec.yielded: assert(step.work_units == allowance)
+    var bucket: usize
+    var rounded = elapsed
+    while rounded > 1 and bucket < 63:
+        rounded = (rounded + 1) // 2
+        bucket += 1
+    measure.histogram[bucket] += 1
+    if elapsed > measure.maximum: measure.maximum = elapsed
+    measure.nanoseconds += elapsed
+    measure.calls += 1
+    measure.units += (u64)step.work_units
+    if step.status == codec.yielded: measure.yields += 1
+
+struct Generator:
+    var seed: u32
+    var noise: bool
+
+    mutating func next() -> u8:
+        if not self.noise: return 65
+        self.seed ^= self.seed << 13
+        self.seed ^= self.seed >> 17
+        self.seed ^= self.seed << 5
+        return (u8)self.seed
+
+struct Context:
+    var bytes: i64
+    var rounds: i64
+    var work: i64
+    var wrapped: bool
+    var noise: bool
+    var seed: u32
+    var encoded: u64
+    var encode: Measure
+    var decode: Measure
+
+func pipeline(context: Context*) -> !:
+    let framing = "zlib" if context.wrapped else "raw"
+    let packed_limit = context.bytes * 2 + 1024
+    var encoder = try codec.make_encoder(framing, context.bytes, packed_limit)
+    defer encoder.close()
+    var decoder = try codec.make_decoder(framing, packed_limit, context.bytes)
+    defer decoder.close()
+    var input: u8[32768]
+    var packed: u8[32769]
+    var output: u8[32769]
+    discard(ready.add(1, .release))
+    while start.load(.acquire) == 0: thread.sleep(1)
+    if start.load(.acquire) == 2: return
+    for round in 0..<context.rounds:
+        if round > 0:
+            try encoder.reset()
+            try decoder.reset()
+            assert((try encoder.statistics()).input_bytes == 0)
+            assert(decoder.statistics().input_bytes == 0)
+        var source = Generator(seed = context.seed + (u32)round, noise = context.noise)
+        var expected = Generator(seed = context.seed + (u32)round, noise = context.noise)
+        var generated: i64
+        var accepted: i64
+        var checked: i64
+        var encoded: i64
+        var input_at: usize
+        var input_size: usize
+        var decoded_end = false
+        while true:
+            if input_at == input_size and generated < context.bytes:
+                input_size = (usize)(context.bytes - generated)
+                if input_size > input.length: input_size = input.length
+                for index in 0..<input_size: input[index] = source.next()
+                generated += (i64)input_size
+                input_at = 0
+            packed[32768] = 173
+            let encode_start = time.now()
+            let step = try encoder.step(input[input_at..<input_size], packed[..<32768],
+                generated == context.bytes, context.work)
+            record(&context.encode, step, time.since(encode_start), context.work)
+            assert(step.consumed >= 0 and step.consumed <= (i64)(input_size - input_at))
+            assert(step.produced >= 0 and step.produced <= 32768 and packed[32768] == 173)
+            assert(step.consumed <= 258 * step.work_units and step.produced <= 8 * step.work_units)
+            for index in input_at..<input_at + (usize)step.consumed: input[index] = 221
+            input_at += (usize)step.consumed
+            accepted += step.consumed
+            encoded += step.produced
+            let encode_stats = try encoder.statistics()
+            assert(encode_stats.input_bytes == accepted and encode_stats.output_bytes == encoded)
+            if decoded_end: assert(step.produced == 0)
+            if not decoded_end and (step.produced > 0 or step.status == codec.finished):
+                var packed_at: usize
+                while true:
+                    output[32768] = 173
+                    let decode_start = time.now()
+                    let decoded = try decoder.step(packed[packed_at..<(usize)step.produced],
+                        output[..<32768], step.status == codec.finished, context.work)
+                    record(&context.decode, decoded, time.since(decode_start), context.work)
+                    assert(decoded.consumed >= 0 and decoded.consumed <= step.produced - (i64)packed_at)
+                    assert(decoded.produced >= 0 and decoded.produced <= 32768 and output[32768] == 173)
+                    assert(decoded.consumed <= 8 * decoded.work_units and decoded.produced <= 258 * decoded.work_units)
+                    for index in 0..<(usize)decoded.produced:
+                        assert(checked < context.bytes and output[index] == expected.next())
+                        checked += 1
+                        output[index] = 222
+                    for index in packed_at..<packed_at + (usize)decoded.consumed: packed[index] = 223
+                    packed_at += (usize)decoded.consumed
+                    assert(decoder.statistics().output_bytes == checked)
+                    if decoded.status == codec.finished:
+                        ## Raw EOB can reach the consumer before the producer's
+                        ## final zero-output state transitions have completed.
+                        assert(packed_at == (usize)step.produced)
+                        decoded_end = true
+                        break
+                    if decoded.status == codec.need_input:
+                        assert(packed_at == (usize)step.produced and step.status != codec.finished)
+                        break
+                    if decoded.status == codec.need_output: assert(decoded.produced == 32768)
+                    else: assert(decoded.status == codec.yielded)
+            if step.status == codec.finished:
+                assert(decoded_end and accepted == context.bytes and checked == context.bytes)
+                assert(encode_stats.finished and decoder.statistics().finished)
+                assert(decoder.statistics().input_bytes == encoded)
+                context.encoded += (u64)encoded
+                break
+            if step.status == codec.need_input: assert(input_at == input_size and generated < context.bytes)
+            elif step.status == codec.need_output: assert(step.produced == 32768)
+            else: assert(step.status == codec.yielded)
+
+func worker(raw: void*?):
+    let context = (Context*)(raw else trap("missing stress context"))
+    pipeline(context) catch failure: trap(failure.message)
+
+func merge(total: Measure*, item: Measure*):
+    for bucket in 0..<64: total.histogram[bucket] += item.histogram[bucket]
+    if item.maximum > total.maximum: total.maximum = item.maximum
+    total.nanoseconds += item.nanoseconds
+    total.calls += item.calls
+    total.units += item.units
+    total.yields += item.yields
+
+func report(name: str, measure: Measure*):
+    print(f"CALLS {name} {measure.calls} {measure.units} {measure.yields} {measure.nanoseconds} {measure.maximum}")
+    for bucket in 0..<64: print(f"HIST {name} {bucket} {measure.histogram[bucket]}")
+
+pub func main(arguments: str[]) -> i32!:
+    assert(arguments.length == 7)
+    let count = strings.parse_i64(arguments[1]) else trap("worker count")
+    let bytes = strings.parse_i64(arguments[2]) else trap("bytes per stream")
+    let rounds = strings.parse_i64(arguments[3]) else trap("rounds")
+    let allowance = strings.parse_i64(arguments[6]) else trap("work allowance")
+    assert(count >= 1 and count <= 8 and bytes >= 0 and bytes <= 4294967297)
+    assert(rounds >= 1 and rounds <= 32 and allowance >= 1 and allowance <= 65536)
+    assert(arguments[4] == "raw" or arguments[4] == "zlib")
+    assert(arguments[5] == "repeat" or arguments[5] == "noise")
+    var contexts: Context[8]
+    var handles: thread.Handle[8]
+    for index in 0..<count:
+        contexts[index] = Context(bytes = bytes, rounds = rounds, work = allowance,
+            wrapped = arguments[4] == "zlib", noise = arguments[5] == "noise", seed = (u32)index + 19511950)
+        handles[index] = thread.spawn(worker, &contexts[index], stack = 524288) catch failure:
+            start.store(2, .release)
+            for previous in 0..<index: try handles[previous].join()
+            error(failure.code, failure.message)
+    while ready.load(.acquire) != (u64)count: thread.sleep(1)
+    let began = time.now()
+    start.store(1, .release)
+    for index in 0..<count: try handles[index].join()
+    let elapsed = time.since(began)
+    var encoded: u64
+    var encode: Measure
+    var decode: Measure
+    for index in 0..<count:
+        encoded += contexts[index].encoded
+        merge(&encode, &contexts[index].encode)
+        merge(&decode, &contexts[index].decode)
+    print(f"RESULT {count} {bytes} {rounds} {count * bytes * rounds} {encoded} {elapsed} {ready.load(.acquire)}")
+    report("encode", &encode)
+    report("decode", &decode)
+    return 0

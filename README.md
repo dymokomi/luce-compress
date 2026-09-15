@@ -225,10 +225,19 @@ The production library has no test hooks or new allocator dependency. This does
 not simulate process-wide OOM, Luce managed-runtime trap-on-exhaustion, OS resource
 failures, or concurrent replacement of the process-global heap.
 
+A generated-stream stress driver uses fixed 32 KiB spans, independent worker-owned
+codec pairs and eight 512 KiB-stack workers. Five cases run in every compiler mode,
+under sanitizers and in the VPS bundle. The full native-opt-3 profile adds sustained
+16/128 MiB workloads and a 4 GiB + 1 byte logical stream, without large temporary
+files. It checks process peak RSS and records step-latency histograms and paired
+pipeline throughput. See [RESOURCES.md](docs/RESOURCES.md) for exact ceilings,
+measurement units, exclusions and commands; these are not production SLOs.
+
 ## Next commits
 
-1. Measured process/aggregate memory and latency under larger concurrent workloads.
-2. Further stress/fuzzing. Full threaded Git-consumer integration follows in M2a.
+1. Validate the measured resource profiles on supported hosts and isolated VPS.
+2. Independent large-stream fixtures and further fuzzing. Full threaded
+   Git-consumer integration and aggregate server admission follow in M2a/M3a.
 
 M1a remains incomplete until those streaming/limit gates pass. The overall public
 plan is in [luce-pkg-server](https://github.com/dymokomi/luce-pkg-server).

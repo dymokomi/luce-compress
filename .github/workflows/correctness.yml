@@ -48,6 +48,12 @@ jobs:
       - name: Memory safety instrumentation
         working-directory: luce-compress
         run: python3 tests/sanitize.py
+      - name: Larger native streaming resource workloads
+        working-directory: luce-compress
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tests/check_stress.py build/native3/stress-driver --full 2>&1 | tee build/resources.log
       - name: Package Linux test binaries
         if: runner.os == 'Linux'
         working-directory: luce-compress
@@ -62,4 +68,6 @@ jobs:
         if: always()
         with:
           name: compression-tests-${{ matrix.os }}
-          path: luce-compress/build/correctness.log
+          path: |
+            luce-compress/build/correctness.log
+            luce-compress/build/resources.log
