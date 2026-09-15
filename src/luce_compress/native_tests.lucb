@@ -1,0 +1,50 @@
+import compress
+import thread
+import interop
+import luce_compress.binary as binary
+
+func worker(raw: void*?):
+    discard(raw)
+    for iteration in 0..<32:
+        let encoded = compress.encode(b"parallel codec test test test") catch failure: trap(failure.message)
+        defer encoded.release()
+        let bytes = encoded.value().bytes() catch failure: trap(failure.message)
+        let decoded = compress.decode(bytes, 29) catch failure: trap(failure.message)
+        defer decoded.release()
+        let plain = decoded.value().bytes() catch failure: trap(failure.message)
+        assert((str)plain == "parallel codec test test test")
+
+pub func main(arguments: str[]) -> i32!:
+    discard(arguments)
+    assert(compress.adler32(b"") == 1 and compress.crc32(b"") == 0)
+    assert(compress.adler32(b"Wikipedia") == 300286872)
+    assert(compress.crc32(b"123456789") == 3421780262)
+    var buffer = binary.Buffer()
+    defer buffer.close()
+    try buffer.put(b"")
+    assert(buffer.view().length == 0)
+    let empty = try compress.encode(b"")
+    defer empty.release()
+    let decoded = try compress.decode(try empty.value().bytes(), 0)
+    defer decoded.release()
+    assert((try decoded.value().bytes()).length == 0)
+    decoded.value().close()
+    decoded.value().close()
+    var refused = false
+    discard(decoded.value().bytes() catch failure:
+        assert(failure.code == compress.closed)
+        refused = true
+        recover b"")
+    assert(refused)
+    for maximum in [-1, 1073741825]:
+        var rejected = false
+        let bad: interop.Reference[compress.Data]? = compress.encode(b"", maximum) catch failure:
+            assert(failure.code == compress.invalid)
+            rejected = true
+            recover none
+        assert(rejected and bad == none)
+    var workers: thread.Handle[8]
+    for index in 0..<8: workers[index] = try thread.spawn(worker, none)
+    for handle in workers: try handle.join()
+    print("PASS checksums, empty buffers, ownership, invalid limits, 8 independent worker contexts")
+    return 0

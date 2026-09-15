@@ -1,0 +1,16 @@
+import compress
+import files
+import memory
+import strings
+import c
+
+pub func main(arguments: str[]) -> i32!:
+    assert(arguments.length == 6)
+    let input = try files.read((c.str)arguments[2])
+    defer free(input) in memory.heap
+    let maximum = strings.parse_i64(arguments[4]) else trap("invalid limit")
+    let result = try compress.encode(input, maximum) if arguments[1] == "encode" else try compress.decode(input, maximum, allow_trailing = arguments[5] == "trailing")
+    defer result.release()
+    try files.write((c.str)arguments[3], try result.value().bytes())
+    print(f"OK {try result.value().consumed()} {compress.adler32(input)} {compress.crc32(input)}")
+    return 0

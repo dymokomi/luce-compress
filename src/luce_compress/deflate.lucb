@@ -1,0 +1,251 @@
+## RFC 1950/1951: stored, fixed and dynamic Huffman blocks, bounded LZ77.
+## Adapted from luce-image 422e1cf, Copyright (c) 2026 Dy Mokomi; see NOTICE.md.
+import memory
+from luce_compress.binary import Reader, Buffer, corrupt, unsupported, limit, maximum
+
+pub func adler32(data: const u8[]) -> u32:
+    var a: u32 = 1
+    var b: u32 = 0
+    for byte in data:
+        a = (a + (u32)byte) % 65521
+        b = (b + a) % 65521
+    return (b << 16) | a
+
+pub func crc32(data: const u8[]) -> u32:
+    var table: u32[256]
+    for i in 0..<(usize)256:
+        var value = (u32)i
+        for bit in 0..<8:
+            value = (value >> 1) ^ (3988292384 if (value & 1) != 0 else 0)
+        table[i] = value
+    var crc: u32 = 4294967295
+    for byte in data:
+        crc = (crc >> 8) ^ table[(usize)((crc ^ (u32)byte) & 255)]
+    return crc ^ 4294967295
+
+struct Bits:
+    var reader: Reader
+    var value: u64
+    var count: u32
+
+    mutating func read(n: u32) -> u32!:
+        while self.count < n:
+            self.value |= (u64)(try self.reader.byte()) << self.count
+            self.count += 8
+        let result = (u32)(self.value & (((u64)1 << n) - 1))
+        self.value >>= n
+        self.count -= n
+        return result
+
+struct Tree:
+    var counts: u32[16]
+    var symbols: u32[288]
+
+    mutating func build(lengths: const u32[], code_lengths: bool = false) -> !:
+        self = Tree()
+        for length in lengths:
+            if length > 15:
+                error(corrupt, "invalid Huffman code length")
+            self.counts[(usize)length] += 1
+        var left: i32 = 1
+        var offsets: u32[16]
+        for n in 1..<16:
+            left = left * 2 - (i32)self.counts[n]
+            if left < 0:
+                error(corrupt, "oversubscribed Huffman tree")
+            if n < 15:
+                offsets[n + 1] = offsets[n] + self.counts[n]
+        ## Only a single one-bit symbol may be incomplete in literal/distance
+        ## alphabets. An empty distance alphabet is accepted but cannot decode.
+        let present = (u32)lengths.length - self.counts[0]
+        if left > 0 and (code_lengths or (present > 0 and (present != 1 or self.counts[1] != 1))):
+            error(corrupt, "incomplete Huffman tree")
+        for i in 0..<lengths.length:
+            let length = (usize)lengths[i]
+            if length > 0:
+                self.symbols[(usize)offsets[length]] = (u32)i
+                offsets[length] += 1
+
+    func decode(bits: Bits*) -> u32!:
+        var code: u32 = 0
+        var first: u32 = 0
+        var index: u32 = 0
+        for length in 1..<16:
+            code |= try bits.read(1)
+            let count = self.counts[length]
+            if code >= first and code - first < count:
+                return self.symbols[(usize)(index + code - first)]
+            index += count
+            first = (first + count) << 1
+            code <<= 1
+        error(corrupt, "invalid Huffman symbol")
+
+let length_base: u32[29] = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258]
+let length_extra: u32[29] = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
+let distance_base: u32[30] = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577]
+let distance_extra: u32[30] = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+
+pub func inflate(data: const u8[], output: Buffer*) -> usize!:
+    if data.length > maximum: error(limit, "compressed input exceeds 1 GiB")
+    if data.length < 6 or (data[0] & 15) != 8 or data[0] >> 4 > 7 or (((u32)data[0] << 8) | (u32)data[1]) % 31 != 0:
+        error(corrupt, "invalid zlib header")
+    if (data[1] & 32) != 0: error(unsupported, "preset zlib dictionaries are not supported")
+    let window = (usize)1 << ((u32)(data[0] >> 4) + 8)
+    var bits = Bits(reader = Reader(data = data[2..]))
+    var used: usize = 0
+    var final_block: u32 = 0
+    while final_block == 0:
+        final_block = try bits.read(1)
+        let kind = try bits.read(2)
+        if kind == 0:
+            bits.value = 0
+            bits.count = 0
+            let count = (usize)(try bits.reader.uint(2))
+            if (try bits.reader.uint(2)) != (65535 ^ (u64)count):
+                error(corrupt, "invalid stored deflate block")
+            let stored = try bits.reader.take(count)
+            try output.put(stored)
+            used += count
+            continue
+        if kind == 3:
+            error(corrupt, "reserved deflate block type")
+        var lengths: u32[320]
+        var literals: Tree
+        var distances: Tree
+        if kind == 1:
+            for i in 0..<288:
+                lengths[i] = 8 if i < 144 else 9 if i < 256 else 7 if i < 280 else 8
+            try literals.build(lengths[..<288])
+            for i in 0..<32:
+                lengths[i] = 5
+            try distances.build(lengths[..<32])
+        else:
+            let nlit = (usize)(try bits.read(5)) + 257
+            let ndist = (usize)(try bits.read(5)) + 1
+            let ncode = (usize)(try bits.read(4)) + 4
+            if nlit > 286:
+                error(corrupt, "too many literal codes")
+            let order: usize[19] = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
+            var codes: u32[19]
+            for i in 0..<ncode:
+                codes[order[i]] = try bits.read(3)
+            var tree: Tree
+            try tree.build(codes, code_lengths = true)
+            var n: usize = 0
+            while n < nlit + ndist:
+                let symbol = try tree.decode(&bits)
+                if symbol < 16:
+                    lengths[n] = symbol
+                    n += 1
+                else:
+                    if symbol == 16 and n == 0:
+                        error(corrupt, "deflate repeat has no previous length")
+                    let count = (usize)(try bits.read(2 if symbol == 16 else 3 if symbol == 17 else 7)) + (11 if symbol == 18 else 3)
+                    if count > nlit + ndist - n:
+                        error(corrupt, "deflate code repeat exceeds table")
+                    let value = lengths[n - 1] if symbol == 16 else 0
+                    for i in 0..<count:
+                        lengths[n] = value
+                        n += 1
+            if lengths[256] == 0:
+                error(corrupt, "deflate tree lacks end marker")
+            try literals.build(lengths[..<nlit])
+            try distances.build(lengths[nlit..<nlit + ndist])
+        while true:
+            let symbol = try literals.decode(&bits)
+            if symbol == 256:
+                break
+            if symbol < 256:
+                try output.byte((u8)symbol)
+                used += 1
+                continue
+            if symbol > 285:
+                error(corrupt, "invalid deflate length symbol")
+            let index = (usize)(symbol - 257)
+            let length = (usize)(length_base[index] + (try bits.read(length_extra[index])))
+            let dsym = try distances.decode(&bits)
+            if dsym > 29:
+                error(corrupt, "invalid deflate distance symbol")
+            let distance = (usize)(distance_base[(usize)dsym] + (try bits.read(distance_extra[(usize)dsym])))
+            if distance > used or distance > window:
+                error(corrupt, "invalid deflate back reference")
+            try output.reserve(length)
+            for i in 0..<length:
+                output.data[used] = output.data[used - distance]
+                used += 1
+            output.used = used
+    ## Bits.read never reads ahead more than one partly consumed byte; the
+    ## aligned reader position is therefore exactly the start of ADLER32.
+    bits.reader.little = false
+    if (try bits.reader.uint(4)) != (u64)adler32(output.view()):
+        error(corrupt, "zlib Adler checksum mismatch")
+    return bits.reader.position + 2
+
+struct Writer:
+    var output: Buffer*
+    var value: u64
+    var count: u32
+
+    mutating func put(value: u32, count: u32) -> !:
+        self.value |= (u64)value << self.count
+        self.count += count
+        while self.count >= 8:
+            try self.output.byte((u8)self.value)
+            self.value >>= 8
+            self.count -= 8
+
+    mutating func code(value: u32, count: u32) -> !:
+        var reversed: u32 = 0
+        for i in 0..<count:
+            reversed = (reversed << 1) | ((value >> i) & 1)
+        try self.put(reversed, count)
+
+    mutating func emit_symbol(symbol: u32) -> !:
+        if symbol < 144:
+            try self.code(symbol + 48, 8)
+        elif symbol < 256:
+            try self.code(symbol + 256, 9)
+        elif symbol < 280:
+            try self.code(symbol - 256, 7)
+        else:
+            try self.code(symbol - 88, 8)
+
+## Deterministic fixed Huffman encoder with a bounded 32 KiB match window.
+pub func compress(data: const u8[], output: Buffer*) -> !:
+    if data.length > maximum: error(limit, "input exceeds 1 GiB")
+    try output.put(b"\x78\x01")
+    var bits = Writer(output = output)
+    try bits.put(3, 3)
+    let heads = try new usize[65536] in memory.heap
+    defer free(heads) in memory.heap
+    var position: usize = 0
+    while position < data.length:
+        var length: usize = 0
+        var distance: usize = 0
+        if data.length - position >= 3:
+            let bucket = (((usize)data[position] * 251 + (usize)data[position + 1]) * 251 + (usize)data[position + 2]) & 65535
+            let prior = heads[bucket]
+            heads[bucket] = position + 1
+            if prior > 0 and position - (prior - 1) <= 32768:
+                distance = position - (prior - 1)
+                while length < 258 and length < data.length - position and data[prior - 1 + length] == data[position + length]:
+                    length += 1
+        if length >= 3:
+            var li: usize = 0
+            while li < 28 and (usize)length_base[li + 1] <= length:
+                li += 1
+            try bits.emit_symbol((u32)li + 257)
+            try bits.put((u32)length - length_base[li], length_extra[li])
+            var di: usize = 0
+            while di < 29 and (usize)distance_base[di + 1] <= distance:
+                di += 1
+            try bits.code((u32)di, 5)
+            try bits.put((u32)distance - distance_base[di], distance_extra[di])
+            position += length
+        else:
+            try bits.emit_symbol((u32)data[position])
+            position += 1
+    try bits.emit_symbol(256)
+    if bits.count > 0:
+        try bits.put(0, 8 - bits.count)
+    try output.uint((u64)adler32(data), 4, false)

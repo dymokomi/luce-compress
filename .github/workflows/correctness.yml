@@ -1,0 +1,65 @@
+name: Native compression correctness
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  correctness:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: luce-compress
+      - name: Read source pins
+        id: pins
+        shell: bash
+        run: |
+          echo "base=$(tr -d '\n' < luce-compress/bootstrap/BASE)" >> "$GITHUB_OUTPUT"
+          echo "luce=$(tr -d '\n' < luce-compress/bootstrap/LUCE)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: dymokomi/luce-base
+          ref: ${{ steps.pins.outputs.base }}
+          path: luce-base
+      - uses: actions/checkout@v4
+        with:
+          repository: dymokomi/luce
+          ref: ${{ steps.pins.outputs.luce }}
+          path: luce
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Bootstrap pinned compilers without modifying their sources
+        working-directory: luce-compress
+        run: python3 tools/bootstrap.py
+      - name: All six compiler modes
+        working-directory: luce-compress
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tests/run.py 2>&1 | tee build/correctness.log
+      - name: Memory safety instrumentation
+        working-directory: luce-compress
+        run: python3 tests/sanitize.py
+      - name: Package Linux test binaries
+        if: runner.os == 'Linux'
+        working-directory: luce-compress
+        run: python3 tools/test_bundle.py --output build/luce-compress-smoke-x86_64-linux.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: luce-compress-smoke-x86_64-linux
+          path: luce-compress/build/luce-compress-smoke-x86_64-linux.tar.gz
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compression-tests-${{ matrix.os }}
+          path: luce-compress/build/correctness.log

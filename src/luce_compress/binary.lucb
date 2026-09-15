@@ -1,0 +1,84 @@
+import memory
+
+pub let invalid: ErrorCode = ErrorCode.package(1)
+pub let corrupt: ErrorCode = ErrorCode.package(2)
+pub let limit: ErrorCode = ErrorCode.package(3)
+pub let unsupported: ErrorCode = ErrorCode.package(4)
+pub let closed: ErrorCode = ErrorCode.package(5)
+pub let maximum: usize = 1073741824
+
+pub func checked_limit(value: i64) -> usize!:
+    if value < 0 or value > (i64)maximum: error(invalid, "byte limit must be in 0-1073741824")
+    return (usize)value
+
+pub struct Reader:
+    pub var data: const u8[]
+    pub var position: usize
+    pub var little: bool = true
+
+    pub mutating func take(count: usize) -> const u8[]!:
+        if self.position > self.data.length or count > self.data.length - self.position:
+            error(corrupt, "truncated compressed data")
+        if count == 0: return b""
+        let start = self.position
+        self.position += count
+        return self.data[start..<self.position]
+
+    pub mutating func byte() -> u8!:
+        let data = try self.take(1)
+        return data[0]
+
+    pub mutating func uint(count: usize) -> u64!:
+        if count > 8: error(invalid, "integer field exceeds eight bytes")
+        let data = try self.take(count)
+        var result: u64
+        for i in 0..<count:
+            let index = count - 1 - i if self.little else i
+            result = (result << 8) | (u64)data[index]
+        return result
+
+pub struct Buffer:
+    pub var data: u8[]
+    pub var used: usize
+    pub var maximum: usize = 67108864
+
+    pub mutating func reserve(count: usize) -> !:
+        if count > self.maximum or self.used > self.maximum - count:
+            error(limit, "compressed or expanded byte limit exceeded")
+        let needed = self.used + count
+        if needed <= self.data.length: return
+        var capacity: usize = self.data.length if self.data.length > 0 else 256
+        if capacity > self.maximum: capacity = self.maximum
+        while capacity < needed:
+            capacity = self.maximum if capacity > self.maximum // 2 else capacity * 2
+        let next = try alloc u8[capacity] in memory.heap
+        if self.used > 0: memory.copy(next, self.data, self.used)
+        if self.data.length > 0: free(self.data) in memory.heap
+        self.data = next
+
+    pub mutating func put(data: const u8[]) -> !:
+        if data.length == 0: return
+        try self.reserve(data.length)
+        memory.copy(self.data[self.used..], data, data.length)
+        self.used += data.length
+
+    pub mutating func byte(value: u8) -> !:
+        try self.reserve(1)
+        self.data[self.used] = value
+        self.used += 1
+
+    pub mutating func uint(value: u64, count: usize, little: bool = true) -> !:
+        if count > 8: error(invalid, "integer field exceeds eight bytes")
+        for i in 0..<count:
+            let shift = i * 8 if little else (count - 1 - i) * 8
+            try self.byte((u8)(value >> shift))
+
+    pub func view() -> const u8[]:
+        if self.used == 0: return b""
+        return self.data[..<self.used]
+
+    pub mutating func close():
+        if self.data.length > 0: free(self.data) in memory.heap
+        var empty: u8[]
+        self.data = empty
+        self.used = 0

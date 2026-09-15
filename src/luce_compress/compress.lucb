@@ -1,0 +1,61 @@
+## Owning Luce facade; all codec implementation remains Luce Base.
+import interop
+import memory
+import luce_compress.binary as binary
+import luce_compress.deflate as deflate
+
+pub let invalid = binary.invalid
+pub let corrupt = binary.corrupt
+pub let limit_exceeded = binary.limit
+pub let unsupported = binary.unsupported
+pub let closed = binary.closed
+
+pub struct Data:
+    var buffer: binary.Buffer
+    var input_bytes: i64
+    var disposed: bool
+
+    pub func bytes() -> const u8[]!:
+        if self.disposed: error(closed, "compression result is closed")
+        return self.buffer.view()
+
+    pub func consumed() -> i64!:
+        if self.disposed: error(closed, "compression result is closed")
+        return self.input_bytes
+
+    pub mutating func close():
+        self.buffer.close()
+        self.disposed = true
+
+pub let data_type: interop.Type[Data] = interop.Type[Data]("CompressionData", Data.close, closeable = true)
+
+func owned(buffer: binary.Buffer, consumed: i64) -> interop.Reference[Data]!:
+    let native = new Data(buffer = buffer, input_bytes = consumed) in memory.heap catch failure:
+        var cleanup = buffer
+        cleanup.close()
+        error(failure.code, failure.message)
+    return try interop.Reference[Data].adopt(native, data_type, memory.heap)
+
+pub func encode(data: const u8[], max_output: i64 = 67108864) -> interop.Reference[Data]!:
+    var output = binary.Buffer(maximum = try binary.checked_limit(max_output))
+    deflate.compress(data, &output) catch failure:
+        output.close()
+        error(failure.code, failure.message)
+    return try owned(output, (i64)data.length)
+
+pub func decode(data: const u8[], max_output: i64 = 67108864, allow_trailing: bool = false) -> interop.Reference[Data]!:
+    var output = binary.Buffer(maximum = try binary.checked_limit(max_output))
+    let used = deflate.inflate(data, &output) catch failure:
+        output.close()
+        error(failure.code, failure.message)
+    if not allow_trailing and used != data.length:
+        output.close()
+        error(corrupt, "trailing bytes after zlib stream")
+    return try owned(output, (i64)used)
+
+## Checksums are corruption checks, not cryptographic integrity/authentication.
+pub func adler32(data: const u8[]) -> i64:
+    return (i64)deflate.adler32(data)
+
+pub func crc32(data: const u8[]) -> i64:
+    return (i64)deflate.crc32(data)

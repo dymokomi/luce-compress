@@ -1,0 +1,14 @@
+from compress import encode, decode, crc32
+
+pub func main(arguments: list[str]) -> int!:
+    let encoded = encode(b"Luce package source")
+    let decoded = decode(encoded.bytes(), max_output = 19)
+    assert(decoded.bytes() == b"Luce package source")
+    assert(decoded.consumed() == encoded.bytes().length)
+    let retained = decoded.bytes()
+    decoded.close()
+    encoded.close()
+    assert(retained == b"Luce package source")
+    assert(crc32(b"123456789") == 3421780262)
+    print("PASS Luce codec API, binary ownership and consumed-byte count")
+    return 0

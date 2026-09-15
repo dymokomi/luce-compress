@@ -1,0 +1,6 @@
+[package]
+name = "luce_compress"
+source = "src"
+
+[exports]
+compress = "luce_compress.compress"
