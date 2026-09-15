@@ -244,9 +244,11 @@ test definitions alone are not a claim that every deployment gate has passed.
 
 ## Next commits
 
-1. Finish hosted and isolated-VPS validation of the expanded test gates.
-2. Review M1a exit criteria alongside the still-open M0 contracts. Full threaded
-   Git-consumer integration and aggregate server admission follow in M2a/M3a.
+1. Close the remaining M0 contracts before marking the dependent M1a milestone
+   complete. The expanded codec gates passed locally, on Linux/macOS CI and in the
+   isolated VPS suite at `b04e20e`; see the revision-specific validation record.
+2. Full threaded Git-consumer integration and aggregate server admission follow
+   in M2a/M3a, after their crypto/storage prerequisites.
 
-M1a remains incomplete until those streaming/limit gates pass. The overall public
+M1a remains incomplete while its M0 prerequisite is open. The overall public
 plan is in [luce-pkg-server](https://github.com/dymokomi/luce-pkg-server).

@@ -357,3 +357,76 @@ M1a remains incomplete. Independent larger-stream fixtures and further hostile-i
 fuzzing are the next sub-slice; this paired Base stress workload is not an
 independent oracle. Full Git/server admission, ThreadSanitizer, independent review,
 registration, deployment and standalone `luc` acceptance remain separate gates.
+
+## Independent fuzz and larger file streams — 2026-09-14 PDT / 2026-09-15 UTC
+
+Source/test revision: `b04e20e85c31de992caff98dff4f36e8583e617d`.
+[CI run 34931867570](https://github.com/dymokomi/luce-compress/actions/runs/34931867570)
+passed all six compiler modes and AddressSanitizer/UndefinedBehaviorSanitizer on
+Ubuntu 24.04 x86-64 and macOS 15 arm64. Each mode retains the previous 6,000 codec
+fixtures, 388 allocation cases, five resource cases and native/Luce/worker suites,
+and adds 4,096 independently classified decoder mutations plus 24 larger-file
+oracle/budget cases. The same complete gates and prebuilt suite passed locally.
+Seven new oracle/diagnostic harness tests and eight resource-harness tests passed.
+Production codec, language and image sources did not change.
+
+Both hosted native-opt-3 jobs and the local final run passed a second-seed corpus
+of 65,536 decoder mutations: 22,380 accepted, 43,156 rejected, 512 batches, seed
+19510002 and corpus SHA256
+`9c22801de2c8b8a45a83dd4e8601745c111131b284df5c850bb2f2807fd7b443`.
+The default 4,096-case seed 19510001 produced 1,425 accepted and 2,671 rejected cases,
+with corpus SHA256
+`dc985628192de2f9a979a9c8e2c892c3e779b886e6455d3b57fe58e8ae52c32d`.
+Local Python was 3.14.6/zlib 1.2.12; both CI hosts used Python 3.14.7, with zlib 1.3
+on Linux and 1.2.12 on macOS. These particular corpora agreed across those versions;
+seed alone is not a general cross-version byte-identity guarantee.
+
+Zlib supplies bounded independent bytes, EOF and exact first-stream consumed
+boundaries. The Base driver varies borrowed chunks, empty spans, work allowances,
+budgets and EOF timing, checking every accepted byte, canaries, counters, poison
+and reset. Mutated-but-valid input must decode correctly; negative cases must
+reject normally. Signals, sanitizer findings and missing completion reports fail
+the suite. Exact failure batches are retained in writable local/CI build storage;
+read-only storage failures do not hide the original failure. Final diagnostic-only
+checker adjustments were replayed across all six local modes and the sanitizer
+driver before publication. See [FUZZING.md](FUZZING.md) for format bounds and limits.
+
+The full independent file profile passed 48 cases on both CI hosts and locally:
+raw/zlib, repeated/noise data at 1 MiB + 1 byte and 16 MiB + 3 bytes, both encoding
+and decoding directions, exact bytes/EOF and insufficient input/output budgets.
+Working spans are bounded; scratch files are reused and cleaned. This differs
+from the paired Base resource pipeline. All eleven full resource cases also passed
+in both new jobs, including the logical 4 GiB + 1 byte stream without a huge file;
+that resource test is not independent >4 GiB oracle coverage.
+
+The verified Linux native-opt-3 bundle has SHA256
+`9d8b577ac00fc635be6061cd655e6c0b9772623cb3bb1b0f8ee84d479e7509f3`.
+After regular-member, revision and per-file hash verification, its twelve
+executables and nine scripts passed the complete prebuilt suite on the existing
+Ubuntu VPS. This includes all previous suites, 4,096 new fuzz cases and 24
+independent 1 MiB + 1 byte file cases. The extended 65,536-case corpus, full file
+profile and >4 GiB resource workload were confined to local/CI hosts. Existing
+Python 3.12.3/zlib 1.3 on the VPS produced the same default-corpus digest/counts;
+Git 2.43.0 remained a test-only oracle. No dependencies were installed.
+
+The sandbox retained its dynamic user, private network/tmp, read-only host/input,
+inaccessible live applications/home, no capabilities, 512 MiB/no swap, 25% CPU,
+64-task and 180-second limits. Systemd reported success, exit 0, 151.113 seconds
+elapsed and 37.770 seconds CPU. This is a quota-limited smoke-suite observation,
+not a codec throughput or production capacity claim.
+
+Removed only the exact staging directory after checking its revision, non-symlink
+type and inactive/collected unit. The unit was absent/inactive afterward. All 32
+running service names, Caddy PID/activation/configuration hash and site HTTPS
+200/ETag matched the precheck. No live data, application, proxy, DNS or firewall
+changes occurred. The inputs are reproducible from the retained public bundle;
+local/hosted/VPS logs remain in the ignored build directory.
+
+These are finite differential tests, not coverage-guided/exhaustive fuzzing,
+ThreadSanitizer or independent security review. The planned native streaming,
+independent-fixture, consumed-byte, truncation/expansion/bounds, ownership, fault,
+cooperative-work and finite resource/fuzz validation now has local, supported-host
+CI and isolated-VPS evidence. M1a remains in progress because its M0 prerequisite
+is not complete; this does not silently replace the remaining contract review.
+Full Git integration, server admission, registration, deployment and verified
+standalone `luc` acceptance remain separate uncompleted milestones.
