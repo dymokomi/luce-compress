@@ -108,3 +108,73 @@ the stock-Git codec fixtures here do not complete it. There is no claim of
 ThreadSanitizer coverage, multi-gigabyte stress coverage, asynchronous cancellation,
 exhaustive allocation-failure handling or independent security review. No real
 account or package-service deployment is enabled by these tests.
+
+## Incremental raw-DEFLATE/zlib encoder — 2026-09-14 PDT / 2026-09-15 UTC
+
+Source revision: `f11a20e6d5da33e57199557fe91eaf751d37a00b`.
+[CI run 34924210219](https://github.com/dymokomi/luce-compress/actions/runs/34924210219)
+passed all six compiler modes and AddressSanitizer/UndefinedBehaviorSanitizer on
+Ubuntu 24.04 x86-64 and macOS 15 arm64. The same final suite passed locally. Source
+pins are unchanged; neither language nor the image library was modified.
+
+The encoder implements bounded fixed-Huffman LZ77 with raw/zlib framing, sticky
+absolute EOF, input/output budgets, partial output, poisoned errors and reset/close.
+It retains 557,448 bytes on both initial targets, including its owning handle,
+65,536-entry match table, 32 KiB history, 258-byte lookahead and pending bits. The
+table and smaller control/history state are two bounded heap allocations; native
+`step` allocates nothing, and reset reuses both. The owning Luce `Deflater` allocates
+each result before advancing the stream, matching the `Inflater` ownership policy.
+
+Each compiler mode passed **5,072 codec fixture cases**: the existing 646
+whole-buffer, 1,846 incremental decoder and 24 stock-Git boundary cases, plus 2,556
+incremental encoder cases. Native lifecycle/eight-worker suites and the high-level
+Luce consumer also passed. The sanitizer gate runs all four fixture groups and
+native suites, including the new encoder tests. This is not ThreadSanitizer or an
+independent security audit.
+
+Encoder coverage includes explicit raw/zlib framing, exact/insufficient source and
+output budgets, zero output space, one-byte/seeded/large partitions, every first
+split of representative short and lookahead-boundary fixtures, overwritten input
+and output scratch buffers, canaries, emitted output before EOF, empty final calls,
+EOF retention through output backpressure, deterministic encoded bytes across
+partitions, history wrap, output ownership after reset/close, poison/reset and eight
+independent workers with explicitly capped 512 KiB stacks. An independent fixed
+block inspector verifies actual length-258/distance-1 and length-258/distance-32768
+matches; the repeated-source ratio check excludes a stored-only implementation.
+
+Python/zlib independently stream-decodes every successful encoder fixture with
+exact completion checks. Stock Git reads four Base-encoded loose objects, then
+strictly indexes and reads four Base-encoded pack entries in a separate empty bare
+repository so packed reads cannot silently use loose objects. Git and Python supply
+only disposable test fixtures/consumers, not any production implementation. This
+still does not validate a complete Git parser, delta/ref engine or server.
+
+During development, a large inline heap-state initializer exhausted small macOS
+worker stacks in native-opt-0 and C-debug. A separate minimal reproducer confirmed
+failure at 512 KiB and success at 4 MiB. Generated C-debug stack-usage reports showed
+557,936 bytes for that constructor. The package-only separate-table workaround
+reduced it to 33,952 bytes, and the final capped-worker gates pass on both hosts.
+The compiler follow-up is documented separately in the owner's workspace; no
+language patch was made. These static frame sizes are not process-memory metrics.
+
+The verified public Linux native-opt-3 bundle has SHA256
+`400354729fc2aa0f4dd77cc635866abbf2540b9b4b0ef8cefd58c5a99622e98e`.
+Its seven executables and five scripts passed the full prebuilt suite on the same
+Ubuntu 24.04 VPS after archive-member, revision and per-file hash checks, using the
+same transient dynamic-user isolation and resource caps as previous checkpoints.
+No dependencies were installed. Git 2.43.0 was already present. Systemd reported
+73.934 seconds elapsed and 18.498 seconds CPU under the 25% CPU quota; these are
+whole-suite smoke observations, not throughput or production capacity measurements.
+
+The exact staging directory was removed and the test unit was absent/inactive.
+All 32 live service names, Caddy PID/activation/configuration hash and the site's
+HTTPS 200/ETag were unchanged. No production data, proxy, DNS or firewall changes
+occurred. The verified bundle, local/CI correctness logs and VPS log are retained
+in the owner's ignored build directory; hosted evidence is linked above.
+
+M1a is still incomplete: explicit allocator-failure injection, cooperative work
+limits, aggregate/peak-memory and latency measurements, larger stress workloads and
+further fuzzing remain. There is no sync/full flush, dictionary, gzip wrapper,
+dynamic-Huffman encoder, tuning-level or asynchronous-cancellation claim. Full Git
+integration is M2a work; registration, hosting and real language CLI acceptance
+remain separate uncompleted gates.
