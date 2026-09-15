@@ -1,0 +1,295 @@
+## Incremental RFC 1950/1951 decoder. No heap allocation or retained caller spans.
+import luce_compress.deflate as deflate
+from luce_compress.binary import invalid, corrupt, unsupported, limit, closed
+
+pub let need_input: i64 = 0
+pub let need_output: i64 = 1
+pub let finished: i64 = 2
+
+pub struct Step:
+    pub let consumed: i64
+    pub let produced: i64
+    pub let status: i64
+
+pub struct Statistics:
+    pub let input_bytes: i64
+    pub let output_bytes: i64
+    pub let finished: bool
+    pub let failed: bool
+
+pub func make_decoder(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> Decoder!:
+    if framing != "zlib" and framing != "raw": error(invalid, "framing must be zlib or raw")
+    if max_input < 0 or max_output < 0: error(invalid, "stream budgets must be nonnegative")
+    return Decoder(ready = true, wrapped = framing == "zlib", state = 0 if framing == "zlib" else 1,
+        window = 32768, adler_a = 1, max_in = (u64)max_input, max_out = (u64)max_output)
+
+struct Input:
+    var data: const u8[]
+    var used: usize
+
+## Explicit initialization is required. Copying an active decoder duplicates its
+## stream state; callers must not mutate one instance concurrently across workers.
+pub struct Decoder:
+    var ready: bool
+    var failed: bool
+    var wrapped: bool
+    var state: i32
+    var final_block: bool
+    var bits: u64
+    var bit_count: u32
+    var total_in: u64
+    var total_out: u64
+    var max_in: u64
+    var max_out: u64
+    var final_known: bool
+    var final_at: u64
+    var window: usize
+    var history: u8[32768]
+    var history_at: usize
+    var adler_a: u32
+    var adler_b: u32
+    var literals: deflate.Tree
+    var distances: deflate.Tree
+    var codes: deflate.Tree
+    var lengths: u32[320]
+    var code_lengths: u32[19]
+    var nlit: usize
+    var ndist: usize
+    var ncode: usize
+    var index: usize
+    var repeat: u32
+    var remaining: usize
+    var distance: usize
+    var extra: u32
+    var literal: u8
+    var symbol_length: u32
+    var symbol_code: u32
+    var symbol_first: u32
+    var symbol_index: u32
+
+    pub mutating func close():
+        self.ready = false
+
+    mutating func poison():
+        self.failed = true
+
+    pub mutating func reset() -> !:
+        if not self.ready: error(closed, "decoder is closed or uninitialized")
+        self = try make_decoder("zlib" if self.wrapped else "raw", (i64)self.max_in, (i64)self.max_out)
+
+    pub func statistics() -> Statistics:
+        return Statistics((i64)self.total_in, (i64)self.total_out, self.state == 20, self.failed)
+
+    mutating func read(input: Input*, count: u32) -> u32?!:
+        while self.bit_count < count:
+            if input.used == input.data.length: return none
+            if self.total_in == self.max_in: error(limit, "compressed stream byte budget exceeded")
+            self.bits |= (u64)input.data[input.used] << self.bit_count
+            self.bit_count += 8
+            self.total_in += 1
+            input.used += 1
+        let value = (u32)(self.bits & (((u64)1 << count) - 1))
+        self.bits >>= count
+        self.bit_count -= count
+        return value
+
+    mutating func symbol(tree: deflate.Tree*, input: Input*) -> u32?!:
+        if self.symbol_length == 0:
+            self.symbol_length = 1
+            self.symbol_code = 0
+            self.symbol_first = 0
+            self.symbol_index = 0
+        while self.symbol_length <= 15:
+            let bit = try self.read(input, 1) else return none
+            self.symbol_code |= bit
+            let count = tree.counts[(usize)self.symbol_length]
+            if self.symbol_code >= self.symbol_first and self.symbol_code - self.symbol_first < count:
+                let value = tree.symbols[(usize)(self.symbol_index + self.symbol_code - self.symbol_first)]
+                self.symbol_length = 0
+                return value
+            self.symbol_index += count
+            self.symbol_first = (self.symbol_first + count) << 1
+            self.symbol_code <<= 1
+            self.symbol_length += 1
+        error(corrupt, "invalid Huffman symbol")
+
+    func starved(input: Input, produced: usize) -> Step!:
+        if self.final_known and self.total_in == self.final_at:
+            error(corrupt, "truncated compressed stream at declared end of input")
+        if self.total_in == self.max_in:
+            error(limit, "compressed stream byte budget exhausted before completion")
+        return Step((i64)input.used, (i64)produced, need_input)
+
+    mutating func emit(output: u8[], used: usize*, value: u8) -> !:
+        if self.total_out == self.max_out: error(limit, "expanded stream byte budget exceeded")
+        output[*used] = value
+        *used += 1
+        self.history[self.history_at] = value
+        self.history_at = (self.history_at + 1) & 32767
+        self.total_out += 1
+        self.adler_a = (self.adler_a + (u32)value) % 65521
+        self.adler_b = (self.adler_b + self.adler_a) % 65521
+
+    mutating func end_block():
+        if self.final_block:
+            ## read() never buffers a complete unused byte after a field/symbol.
+            self.bits = 0
+            self.bit_count = 0
+            self.state = 13 if self.wrapped else 20
+        else:
+            self.state = 1
+
+    ## final_input declares the end offset of the offered span; the declaration
+    ## survives output backpressure. Reoffer any unconsumed suffix, not the prefix.
+    ## An error may have consumed/emitted bytes: diagnostics remain available, but
+    ## the stream is poisoned and its output must not be published.
+    pub mutating func step(data: const u8[], output: u8[], final_input: bool = false) -> Step!:
+        if not self.ready: error(closed, "decoder is closed or uninitialized")
+        if self.failed: error(corrupt, "decoder failed; reset before reuse")
+        if self.state == 20: return Step(0, 0, finished)
+        errdefer self.poison()
+        let ending = self.total_in +? (u64)data.length else error(invalid, "input end offset overflow")
+        if self.final_known and (ending > self.final_at or (final_input and ending != self.final_at)):
+            error(invalid, "input contradicts the declared stream end")
+        if final_input:
+            self.final_known = true
+            self.final_at = ending
+        var input = Input(data = data)
+        var used: usize
+        while true:
+            match self.state:
+                0:
+                    let header = try self.read(&input, 16) else return try self.starved(input, used)
+                    let cmf = header & 255
+                    let flags = header >> 8
+                    if (cmf & 15) != 8 or cmf >> 4 > 7 or ((cmf << 8) | flags) % 31 != 0:
+                        error(corrupt, "invalid zlib header")
+                    if (flags & 32) != 0: error(unsupported, "preset zlib dictionaries are not supported")
+                    self.window = (usize)1 << ((cmf >> 4) + 8)
+                    self.state = 1
+                1:
+                    let header = try self.read(&input, 3) else return try self.starved(input, used)
+                    self.final_block = (header & 1) != 0
+                    let kind = header >> 1
+                    if kind == 0:
+                        self.bits = 0
+                        self.bit_count = 0
+                        self.state = 2
+                    elif kind == 1:
+                        for i in 0..<288:
+                            self.lengths[i] = 8 if i < 144 else 9 if i < 256 else 7 if i < 280 else 8
+                        try self.literals.build(self.lengths[..<288])
+                        for i in 0..<32: self.lengths[i] = 5
+                        try self.distances.build(self.lengths[..<32])
+                        self.state = 8
+                    elif kind == 2:
+                        self.state = 4
+                    else:
+                        error(corrupt, "reserved deflate block type")
+                2:
+                    let sizes = try self.read(&input, 32) else return try self.starved(input, used)
+                    self.remaining = (usize)(sizes & 65535)
+                    if (sizes >> 16) != ((sizes & 65535) ^ 65535): error(corrupt, "invalid stored block length")
+                    self.state = 3
+                3:
+                    if self.remaining == 0:
+                        self.end_block()
+                        continue
+                    if self.total_out == self.max_out: error(limit, "expanded stream byte budget exceeded")
+                    if used == output.length: return Step((i64)input.used, (i64)used, need_output)
+                    let byte = try self.read(&input, 8) else return try self.starved(input, used)
+                    try self.emit(output, &used, (u8)byte)
+                    self.remaining -= 1
+                4:
+                    let counts = try self.read(&input, 14) else return try self.starved(input, used)
+                    self.nlit = (usize)(counts & 31) + 257
+                    self.ndist = (usize)((counts >> 5) & 31) + 1
+                    self.ncode = (usize)(counts >> 10) + 4
+                    if self.nlit > 286: error(corrupt, "too many literal codes")
+                    for i in 0..<19: self.code_lengths[i] = 0
+                    self.index = 0
+                    self.state = 5
+                5:
+                    let order: usize[19] = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
+                    while self.index < self.ncode:
+                        let value = try self.read(&input, 3) else return try self.starved(input, used)
+                        self.code_lengths[order[self.index]] = value
+                        self.index += 1
+                    try self.codes.build(self.code_lengths, code_lengths = true)
+                    self.index = 0
+                    self.state = 6
+                6:
+                    if self.index == self.nlit + self.ndist:
+                        if self.lengths[256] == 0: error(corrupt, "deflate tree lacks end marker")
+                        try self.literals.build(self.lengths[..<self.nlit])
+                        try self.distances.build(self.lengths[self.nlit..<self.nlit + self.ndist])
+                        self.state = 8
+                        continue
+                    let value = try self.symbol(&self.codes, &input) else return try self.starved(input, used)
+                    if value < 16:
+                        self.lengths[self.index] = value
+                        self.index += 1
+                    else:
+                        if value == 16 and self.index == 0: error(corrupt, "repeat has no previous length")
+                        self.repeat = value
+                        self.state = 7
+                7:
+                    let extra = try self.read(&input, 2 if self.repeat == 16 else 3 if self.repeat == 17 else 7) else return try self.starved(input, used)
+                    let count = (usize)extra + (11 if self.repeat == 18 else 3)
+                    if count > self.nlit + self.ndist - self.index: error(corrupt, "code repeat exceeds table")
+                    let value = self.lengths[self.index - 1] if self.repeat == 16 else 0
+                    for i in 0..<count:
+                        self.lengths[self.index] = value
+                        self.index += 1
+                    self.state = 6
+                8:
+                    let value = try self.symbol(&self.literals, &input) else return try self.starved(input, used)
+                    if value < 256:
+                        self.literal = (u8)value
+                        self.state = 9
+                    elif value == 256:
+                        self.end_block()
+                    elif value <= 285:
+                        self.remaining = (usize)deflate.length_base[(usize)value - 257]
+                        self.extra = deflate.length_extra[(usize)value - 257]
+                        self.state = 10
+                    else:
+                        error(corrupt, "invalid deflate length symbol")
+                9:
+                    if self.total_out == self.max_out: error(limit, "expanded stream byte budget exceeded")
+                    if used == output.length: return Step((i64)input.used, (i64)used, need_output)
+                    try self.emit(output, &used, self.literal)
+                    self.state = 8
+                10:
+                    let value = try self.read(&input, self.extra) else return try self.starved(input, used)
+                    self.remaining += (usize)value
+                    self.state = 11
+                11:
+                    let value = try self.symbol(&self.distances, &input) else return try self.starved(input, used)
+                    if value > 29: error(corrupt, "invalid deflate distance symbol")
+                    self.distance = (usize)deflate.distance_base[(usize)value]
+                    self.extra = deflate.distance_extra[(usize)value]
+                    self.state = 12
+                12:
+                    let value = try self.read(&input, self.extra) else return try self.starved(input, used)
+                    self.distance += (usize)value
+                    if (u64)self.distance > self.total_out or self.distance > self.window:
+                        error(corrupt, "invalid deflate back reference")
+                    self.state = 14
+                13:
+                    let value = try self.read(&input, 32) else return try self.starved(input, used)
+                    let expected = (value >> 24) | ((value >> 8) & 65280) | ((value << 8) & 16711680) | (value << 24)
+                    if expected != ((self.adler_b << 16) | self.adler_a): error(corrupt, "zlib Adler checksum mismatch")
+                    self.state = 20
+                14:
+                    while self.remaining > 0:
+                        if self.total_out == self.max_out: error(limit, "expanded stream byte budget exceeded")
+                        if used == output.length: return Step((i64)input.used, (i64)used, need_output)
+                        let value = self.history[(self.history_at + 32768 - self.distance) & 32767]
+                        try self.emit(output, &used, value)
+                        self.remaining -= 1
+                    self.state = 8
+                20:
+                    return Step((i64)input.used, (i64)used, finished)
+                _:
+                    trap("invalid decoder state")

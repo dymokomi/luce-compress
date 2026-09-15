@@ -4,6 +4,8 @@ import argparse
 from pathlib import Path
 import subprocess
 from check_codecs import check
+from check_stream import check as check_stream
+from check_git import check as check_git
 
 
 def main():
@@ -11,12 +13,14 @@ def main():
     parser.add_argument("binaries", type=Path)
     args = parser.parse_args()
     binaries = args.binaries.resolve()
-    for name in ["native", "facade", "driver"]:
+    for name in ["native", "facade", "driver", "stream-tests", "stream-driver"]:
         if not (binaries / name).is_file():
             raise SystemExit(f"missing {name}")
-    for name in ["native", "facade"]:
+    for name in ["native", "facade", "stream-tests"]:
         subprocess.run([str(binaries / name)], check=True, timeout=90)
     check(binaries / "driver")
+    check_stream(binaries / "stream-driver")
+    check_git(binaries / "stream-driver")
     print("PASS prebuilt compression suite", flush=True)
 
 

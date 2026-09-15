@@ -37,11 +37,11 @@ struct Bits:
         self.count -= n
         return result
 
-struct Tree:
-    var counts: u32[16]
-    var symbols: u32[288]
+pub struct Tree:
+    pub var counts: u32[16]
+    pub var symbols: u32[288]
 
-    mutating func build(lengths: const u32[], code_lengths: bool = false) -> !:
+    pub mutating func build(lengths: const u32[], code_lengths: bool = false) -> !:
         self = Tree()
         for length in lengths:
             if length > 15:
@@ -80,10 +80,10 @@ struct Tree:
             code <<= 1
         error(corrupt, "invalid Huffman symbol")
 
-let length_base: u32[29] = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258]
-let length_extra: u32[29] = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
-let distance_base: u32[30] = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577]
-let distance_extra: u32[30] = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+pub let length_base: u32[29] = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258]
+pub let length_extra: u32[29] = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
+pub let distance_base: u32[30] = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577]
+pub let distance_extra: u32[30] = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
 
 pub func inflate(data: const u8[], output: Buffer*) -> usize!:
     if data.length > maximum: error(limit, "compressed input exceeds 1 GiB")

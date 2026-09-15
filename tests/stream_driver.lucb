@@ -1,0 +1,85 @@
+## Independent Python fixtures supply bytes; only this driver loads whole files.
+## The decoder itself receives overwritten, short-lived input/output chunks.
+import compress_native as codec
+import compress
+import files
+import memory
+import strings
+import c
+
+pub func main(arguments: str[]) -> i32!:
+    assert(arguments.length == 10)
+    let packed = try files.read((c.str)arguments[1])
+    defer free(packed) in memory.heap
+    let expected = try files.read((c.str)arguments[2])
+    defer free(expected) in memory.heap
+    let input_chunk = strings.parse_i64(arguments[4]) else trap("input chunk")
+    let output_chunk = strings.parse_i64(arguments[5]) else trap("output chunk")
+    let max_input = strings.parse_i64(arguments[6]) else trap("input budget")
+    let max_output = strings.parse_i64(arguments[7]) else trap("output budget")
+    let compare = arguments[9] == "valid"
+    var decoder = try codec.make_decoder(arguments[3], max_input, max_output)
+    defer decoder.close()
+    var input: u8[65536]
+    var output: u8[65537]
+    var consumed: usize
+    var produced: usize
+    var steps: usize
+    var chunk_seed: u32 = 1951
+    while true:
+        assert(steps < 10000000)
+        ## Reproducible pseudorandom input/output partitions without shared state.
+        chunk_seed ^= chunk_seed << 13
+        chunk_seed ^= chunk_seed >> 17
+        chunk_seed ^= chunk_seed << 5
+        var count = (usize)input_chunk if input_chunk > 0 else 1 + (usize)(chunk_seed % 257)
+        if input_chunk < 0:
+            count = (usize)(-input_chunk - 1) if steps == 0 else packed.length - consumed
+        if count > 65536: count = 65536
+        if count > packed.length - consumed: count = packed.length - consumed
+        var data: const u8[] = b""
+        if count > 0:
+            memory.copy(input, packed[consumed..<consumed + count], count)
+            data = input[..<count]
+        let capacity = (usize)output_chunk if output_chunk > 0 else (0 if steps % 5 == 0 else 1 + (usize)((chunk_seed >> 9) % 257))
+        assert(capacity <= 65536)
+        output[capacity] = 173
+        let last = (consumed == packed.length) if arguments[8] == "late" else (consumed + count == packed.length)
+        let step = decoder.step(data, output[..<capacity], last) catch failure:
+            let statistics = decoder.statistics()
+            assert(statistics.failed)
+            assert(statistics.input_bytes <= max_input and statistics.output_bytes <= max_output)
+            var refused = false
+            discard(decoder.step(b"", output) catch again:
+                assert(again.code == compress.corrupt)
+                refused = true
+                recover codec.Step())
+            assert(refused)
+            print(f"REJECT {statistics.input_bytes} {statistics.output_bytes}")
+            return 1
+        assert(step.consumed >= 0 and (usize)step.consumed <= count)
+        assert(step.produced >= 0 and (usize)step.produced <= capacity)
+        assert(output[capacity] == 173)
+        if compare:
+            assert((usize)step.produced <= expected.length - produced)
+            for index in 0..<(usize)step.produced:
+                assert(output[index] == expected[produced + index])
+        for index in 0..<(usize)step.produced: output[index] = 221
+        for index in 0..<count: input[index] = 222
+        consumed += (usize)step.consumed
+        produced += (usize)step.produced
+        let statistics = decoder.statistics()
+        assert(statistics.input_bytes == (i64)consumed and statistics.output_bytes == (i64)produced)
+        assert(not statistics.failed)
+        if step.status == codec.finished:
+            assert(statistics.finished)
+            if compare: assert(produced == expected.length)
+            let done = try decoder.step(b"a different stream", output)
+            assert(done.status == codec.finished and done.consumed == 0 and done.produced == 0)
+            print(f"OK {consumed} {produced} {steps + 1}")
+            return 0
+        if step.status == codec.need_input: assert((usize)step.consumed == count)
+        elif step.status == codec.need_output: assert((usize)step.produced == capacity)
+        else: trap("unknown status")
+        assert(step.consumed > 0 or step.produced > 0 or count == 0 or capacity == 0)
+        steps += 1

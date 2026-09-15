@@ -1,11 +1,11 @@
-# Incremental codec contract — next implementation slice
+# Incremental codec contract
 
-This specifies the next tests/API, not functionality present in the whole-buffer
-slice. The underlying formats are [RFC 1950](https://www.rfc-editor.org/info/rfc1950/)
+The decoder implements this contract; incremental encoding and explicit allocator-
+failure injection remain follow-up work. The underlying formats are [RFC 1950](https://www.rfc-editor.org/info/rfc1950/)
 and [RFC 1951](https://www.rfc-editor.org/info/rfc1951/).
 
 One decoder owns a fixed 32 KiB history window and bounded Huffman/bit state. It
-borrows only the current input/output spans; it never retains their pointers after
+borrows only the current, disjoint input/output spans; it never retains their pointers after
 a step. A step reports consumed input, produced output, and exactly one of
 `need_input`, `need_output`, `finished`. Empty spans are legal and cannot trigger
 null-pointer arithmetic. No chunk is replayed from the beginning to simulate

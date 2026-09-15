@@ -38,6 +38,6 @@ were unchanged, and the existing site still returned HTTPS 200 with the same ETa
 No DNS, proxy, firewall, production data or live service configuration was modified.
 
 M1a is still incomplete: this validates a bounded whole-buffer core, not incremental
-streaming, raw-DEFLATE/Git packs, cancellation, aggregate memory guarantees,
+streaming, raw-DEFLATE framing, Git-pack integration, cancellation, aggregate memory guarantees,
 performance targets or production security. See [STREAMING_CONTRACT.md](STREAMING_CONTRACT.md)
 for the next implementation and its required boundary tests.

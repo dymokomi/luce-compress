@@ -6,6 +6,9 @@
 published under MIT; its permission/copyright notice is retained in LICENSE-MIT.
 Changes here add bounded variable-size decoding, consumed-byte reporting and
 stricter malformed Huffman-tree validation. No image-library source is modified.
+The incremental decoder is new Base state-machine code sharing the validated
+Huffman builder and format constants with that core; it adds raw/zlib framing,
+bounded history, backpressure, end markers and cumulative byte budgets.
 
 The bounded buffer and compiler-bootstrap approach are adapted from `luce-db`
 revision `d13a1d1ce1116914e2b63bc9dff99dbde816f345` (MIT OR Apache-2.0).

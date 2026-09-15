@@ -1,4 +1,4 @@
-from compress import encode, decode, crc32
+from compress import encode, decode, crc32, Inflater, finished, need_output
 
 pub func main(arguments: list[str]) -> int!:
     let encoded = encode(b"Luce package source")
@@ -10,5 +10,16 @@ pub func main(arguments: list[str]) -> int!:
     encoded.close()
     assert(retained == b"Luce package source")
     assert(crc32(b"123456789") == 3421780262)
+    let source = encode(b"small streaming result")
+    let inflater = Inflater(max_output = 22)
+    let first = inflater.feed(source.bytes(), capacity = 0, final_input = true)
+    assert(first.status() == need_output and first.bytes().length == 0)
+    let next = inflater.feed(source.bytes()[first.consumed()..], capacity = 64)
+    assert(next.status() == finished and next.bytes() == b"small streaming result")
+    assert(inflater.statistics().finished and inflater.statistics().output_bytes == 22)
+    inflater.reset()
+    assert(inflater.statistics().input_bytes == 0)
+    inflater.close()
+    assert(next.bytes() == b"small streaming result")
     print("PASS Luce codec API, binary ownership and consumed-byte count")
     return 0

@@ -4,3 +4,4 @@ source = "src"
 
 [exports]
 compress = "luce_compress.compress"
+compress_native = "luce_compress.decoder"
