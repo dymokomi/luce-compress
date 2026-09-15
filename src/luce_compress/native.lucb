@@ -9,6 +9,9 @@ pub type Encoder = encoder.Encoder
 pub let need_input = decoder.need_input
 pub let need_output = decoder.need_output
 pub let finished = decoder.finished
+pub let yielded = decoder.yielded
+pub let default_work_limit = decoder.default_work_limit
+pub let maximum_work_limit = decoder.maximum_work_limit
 
 pub func make_decoder(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> Decoder!:
     return try decoder.make_decoder(framing, max_input, max_output)

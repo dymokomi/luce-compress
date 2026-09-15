@@ -7,13 +7,14 @@ import strings
 import c
 
 pub func main(arguments: str[]) -> i32!:
-    assert(arguments.length == 9)
+    assert(arguments.length == 9 or arguments.length == 10)
     let plain = try files.read((c.str)arguments[1])
     defer free(plain) in memory.heap
     let input_chunk = strings.parse_i64(arguments[4]) else trap("input chunk")
     let output_chunk = strings.parse_i64(arguments[5]) else trap("output chunk")
     let max_input = strings.parse_i64(arguments[6]) else trap("input budget")
     let max_output = strings.parse_i64(arguments[7]) else trap("output budget")
+    let requested_work = (strings.parse_i64(arguments[9]) else trap("work limit")) if arguments.length == 10 else codec.default_work_limit
     var encoder = try codec.make_encoder(arguments[3], max_input, max_output)
     defer encoder.close()
     let packed = try alloc u8[2097152] in memory.heap
@@ -23,6 +24,9 @@ pub func main(arguments: str[]) -> i32!:
     var output: u8[65537]
     var consumed: usize
     var steps: usize
+    var yields: usize
+    var empty_yields: usize
+    var total_work: i64
     var chunk_seed: u32 = 19511950
     while true:
         assert(steps < 10000000)
@@ -41,7 +45,8 @@ pub func main(arguments: str[]) -> i32!:
         assert(capacity <= 65536)
         output[capacity] = 173
         let last = (consumed == plain.length) if arguments[8] == "late" else (consumed + count == plain.length)
-        let step = encoder.step(data, output[..<capacity], last) catch failure:
+        let allowance = requested_work if requested_work > 0 else 1 + (i64)((chunk_seed >> 16) % 31)
+        let step = encoder.step(data, output[..<capacity], last, allowance) catch failure:
             let statistics = try encoder.statistics()
             assert(statistics.failed and statistics.input_bytes <= max_input and statistics.output_bytes <= max_output)
             var refused = false
@@ -54,6 +59,9 @@ pub func main(arguments: str[]) -> i32!:
             return 1
         assert(step.consumed >= 0 and (usize)step.consumed <= count)
         assert(step.produced >= 0 and (usize)step.produced <= capacity)
+        assert(step.work_units > 0 and step.work_units <= allowance)
+        assert(step.consumed <= 258 * step.work_units and step.produced <= 8 * step.work_units)
+        total_work += step.work_units
         assert(output[capacity] == 173)
         assert((usize)step.produced <= packed.length - packed_size)
         if step.produced > 0: memory.copy(packed[packed_size..], output, (usize)step.produced)
@@ -66,7 +74,7 @@ pub func main(arguments: str[]) -> i32!:
         if step.status == codec.finished:
             assert(statistics.finished and consumed == plain.length)
             let done = try encoder.step(b"a different stream", output, true)
-            assert(done.status == codec.finished and done.consumed == 0 and done.produced == 0)
+            assert(done.status == codec.finished and done.consumed == 0 and done.produced == 0 and done.work_units == 0)
             ## Additional deterministic-policy regression; Python independently
             ## validates the wire output, so this isn't the sole correctness oracle.
             let reference = try compress.encode(plain, 2097152)
@@ -76,10 +84,14 @@ pub func main(arguments: str[]) -> i32!:
             assert(expected.length == packed_size)
             for i in 0..<expected.length: assert(expected[i] == packed[i])
             try files.write((c.str)arguments[2], packed[..<packed_size])
-            print(f"OK {consumed} {packed_size} {steps + 1}")
+            print(f"OK {consumed} {packed_size} {steps + 1} {yields} {empty_yields} {total_work}")
             return 0
         if step.status == codec.need_input: assert((usize)step.consumed == count)
         elif step.status == codec.need_output: assert((usize)step.produced == capacity)
+        elif step.status == codec.yielded:
+            assert(step.work_units == allowance)
+            yields += 1
+            if step.consumed == 0 and step.produced == 0: empty_yields += 1
         else: trap("unknown status")
-        assert(step.consumed > 0 or step.produced > 0 or count == 0 or capacity == 0)
+        assert(step.consumed > 0 or step.produced > 0 or count == 0 or capacity == 0 or step.status == codec.yielded)
         steps += 1

@@ -91,16 +91,17 @@ struct Stream:
     var encoder: compress.Deflater?
     var decoder: compress.Inflater?
 
-    mutating func feed(input: const u8[], capacity: i64, final_input: bool) -> interop.Reference[compress.Data]!:
+    mutating func feed(input: const u8[], capacity: i64, final_input: bool,
+        work_limit: i64 = codec.maximum_work_limit) -> interop.Reference[compress.Data]!:
         if self.encoding:
             var selected = self.encoder else trap("encoder absent")
-            let result = selected.feed(input, capacity, final_input) catch failure:
+            let result = selected.feed(input, capacity, final_input, work_limit) catch failure:
                 self.encoder = selected
                 error(failure.code, failure.message)
             self.encoder = selected
             return result
         var selected = self.decoder else trap("decoder absent")
-        let result = selected.feed(input, capacity, final_input) catch failure:
+        let result = selected.feed(input, capacity, final_input, work_limit) catch failure:
             self.decoder = selected
             error(failure.code, failure.message)
         self.decoder = selected
@@ -253,13 +254,27 @@ func native_without_allocations(heap: Heap*, plain: const u8[], packed: const u8
     var decoder = try codec.make_decoder()
     var output: u8[16384]
     heap.arm(1, true)
-    let encoded = try encoder.step(plain, output, true)
-    assert(encoded.status == codec.finished)
-    equal(output[..<(usize)encoded.produced], packed)
+    var input_at: usize
+    var output_at: usize
+    while true:
+        let encoded = try encoder.step(plain[input_at..], output, true, 1)
+        assert(encoded.work_units == 1)
+        equal(output[..<(usize)encoded.produced], packed[output_at..<output_at + (usize)encoded.produced])
+        input_at += (usize)encoded.consumed
+        output_at += (usize)encoded.produced
+        if encoded.status == codec.finished: break
+    assert(input_at == plain.length and output_at == packed.length)
     try encoder.reset()
-    let decoded = try decoder.step(packed, output, true)
-    assert(decoded.status == codec.finished)
-    equal(output[..<(usize)decoded.produced], plain)
+    input_at = 0
+    output_at = 0
+    while true:
+        let decoded = try decoder.step(packed[input_at..], output, true, 1)
+        assert(decoded.work_units == 1)
+        equal(output[..<(usize)decoded.produced], plain[output_at..<output_at + (usize)decoded.produced])
+        input_at += (usize)decoded.consumed
+        output_at += (usize)decoded.produced
+        if decoded.status == codec.finished: break
+    assert(input_at == packed.length and output_at == plain.length)
     try decoder.reset()
     encoder.close()
     decoder.close()
@@ -422,6 +437,82 @@ func retry_without_eof(heap: Heap*, encoding: bool, input: const u8[], expected:
     last.release()
     heap.clean()
 
+func cooperative_failures(heap: Heap*, encoding: bool, input: const u8[], expected: const u8[]) -> usize!:
+    var current = try stream(encoding)
+    var checks: usize
+    for work in [-1, 0, 65537, 9223372036854775807]:
+        let before = try current.statistics()
+        heap.arm(1, true)
+        var rejected = false
+        let candidate: interop.Reference[compress.Data]? = current.feed(input, 31, true, work) catch failure:
+            assert(failure.code == compress.invalid)
+            rejected = true
+            recover none
+        assert(rejected and candidate == none and heap.attempts == 0 and heap.refused == 0)
+        same(try current.statistics(), before)
+        checks += 1
+    heap.disarm()
+    let first = try current.feed(input, 31, true, 1)
+    assert((try first.value().status()) == codec.yielded and (try first.value().work_units()) == 1)
+    let first_bytes = try first.value().bytes()
+    var consumed = (usize)(try first.value().consumed())
+    var produced = first_bytes.length
+    equal(first_bytes, expected[..<produced])
+    let baseline_live = heap.live
+    let baseline_bytes = heap.bytes
+    for persistent in [false, true]:
+        for at in (usize)1..<(usize)4:
+            let before = try current.statistics()
+            heap.arm(at, persistent)
+            let candidate: interop.Reference[compress.Data]? = current.feed(input[consumed..], 31, false, 1) catch failure:
+                assert(failure.code == memory.exhausted)
+                recover none
+            assert(candidate == none and heap.refused == 1 and heap.attempts == at)
+            assert(heap.live == baseline_live and heap.bytes == baseline_bytes)
+            same(try current.statistics(), before)
+            heap.disarm()
+            let retry = try current.feed(input[consumed..], 31, false, 1)
+            assert(try retry.value().work_units() == 1)
+            let bytes = try retry.value().bytes()
+            equal(bytes, expected[produced..<produced + bytes.length])
+            consumed += (usize)(try retry.value().consumed())
+            produced += bytes.length
+            retry.release()
+            checks += 1
+    var calls: usize
+    while true:
+        let result = try current.feed(input[consumed..], 31, false, 1)
+        let bytes = try result.value().bytes()
+        equal(bytes, expected[produced..<produced + bytes.length])
+        consumed += (usize)(try result.value().consumed())
+        produced += bytes.length
+        let status = try result.value().status()
+        result.release()
+        calls += 1
+        assert(calls < 1000)
+        if status == codec.finished: break
+    assert(consumed == input.length and produced == expected.length)
+    heap.arm(1, true)
+    current.close()
+    equal(try first.value().bytes(), expected[..<first_bytes.length])
+    first.release()
+    assert(heap.attempts == 0 and heap.refused == 0)
+    heap.disarm()
+    heap.clean()
+    ## Direct cancellation at a live yield, not only reset or completed close.
+    var abandoned = try stream(encoding)
+    let retained = try abandoned.feed(input, 31, true, 1)
+    assert(try retained.value().status() == codec.yielded)
+    heap.arm(1, true)
+    abandoned.close()
+    abandoned.close()
+    equal(try retained.value().bytes(), expected[..<(try retained.value().bytes()).length])
+    retained.release()
+    assert(heap.attempts == 0 and heap.refused == 0)
+    heap.disarm()
+    heap.clean()
+    return checks
+
 pub func main(arguments: str[]) -> i32!:
     discard(arguments)
     ## Inputs and clean expected bytes belong to the original allocator. They are
@@ -439,6 +530,10 @@ pub func main(arguments: str[]) -> i32!:
     let empty_encoded = try compress.encode(b"")
     defer empty_encoded.release()
     let empty_packed = try empty_encoded.value().bytes()
+    let short_plain = b"yield-safe retry retry"
+    let short_encoded = try compress.encode(short_plain)
+    defer short_encoded.release()
+    let short_packed = try short_encoded.value().bytes()
     let oversized = try alloc u8[1048577] in memory.heap
     defer free(oversized) in memory.heap
     var damaged: u8[10000]
@@ -474,6 +569,7 @@ pub func main(arguments: str[]) -> i32!:
                             discard(try feed_attempt(&heap, encoding, framing, input, expected, capacity, target, at, persistent))
                             checks += 1
         checks += try validation_and_finished(&heap, encoding, plain if encoding else packed, oversized)
+        checks += try cooperative_failures(&heap, encoding, short_plain if encoding else short_packed, short_packed if encoding else short_plain)
         try retry_without_eof(&heap, encoding, plain if encoding else packed, packed if encoding else plain)
         checks += 1
     try poisoned_cleanup(&heap, true, "zlib", plain)

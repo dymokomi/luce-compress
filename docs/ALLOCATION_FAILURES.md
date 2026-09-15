@@ -2,8 +2,8 @@
 
 The test executable `src/luce_compress/failure_tests.lucb` is entirely Luce Base and
 uses the existing `memory.Allocator` interface. It temporarily replaces the Base
-heap **inside its own single-threaded test process**. Production code and either
-language's sources are unchanged. Do not run this heap replacement concurrently:
+heap **inside its own single-threaded test process**. Production code has no fault
+hooks, and either language's sources are unchanged. Do not run this heap replacement concurrently:
 `memory.heap` is process-global, and allocator witnesses must outlive their owners.
 
 The interceptor forwards successful requests to the saved heap and records live
@@ -41,10 +41,13 @@ must not fire. This is deterministic fault injection, not probabilistic memory s
   earlier owning chunks; reset/close and repeated result close remain safe.
 - Native encoder/decoder step, reset and close succeed with an armed allocator that
   would refuse its first request; the test requires **zero allocation attempts**.
+- Native steps run with one-operation budgets, including zero-I/O yields. Owning
+  facades reject invalid work bounds before allocating; failures after an earlier
+  yield preserve stream state and retained chunks, and retry completes exact bytes.
 
-There are 368 counted failure/retry cases plus direct buffer/native no-allocation
+There are 388 counted failure/retry cases plus direct buffer/native no-allocation
 assertions and clean replay traces. Each compiler mode runs the separate executable,
-as do the sanitizer and prebuilt VPS suites. The regular 5,072 codec fixture cases,
+as do the sanitizer and prebuilt VPS suites. The regular 6,000 codec fixture cases,
 high-level Luce consumer and threaded/lifetime suites continue to run independently.
 
 ## Limits of this evidence
@@ -58,8 +61,9 @@ with independent stream owners; no thread is started while this interceptor is a
 
 The ledger's peak is the sum of requested live bytes **within the audited scope**,
 not process RSS, allocator metadata, stack use, unrelated buffers or an aggregate
-server memory bound. Large/concurrent workload resource measurements and cooperative
-work limits remain separate gates. A finite set of fault traces is not a claim of
+server memory bound. Large/concurrent workload resource measurements remain a
+separate gate. Cooperative work is tested independently of the allocation model.
+A finite set of fault traces is not a claim of
 exhaustive behavior for every possible input, memory condition or runtime path.
 
 After bootstrapping the pinned compilers, a focused run is:

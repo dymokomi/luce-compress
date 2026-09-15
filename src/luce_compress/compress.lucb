@@ -14,12 +14,16 @@ pub let closed = binary.closed
 pub let need_input = decoder.need_input
 pub let need_output = decoder.need_output
 pub let finished = decoder.finished
+pub let yielded = decoder.yielded
+pub let default_work_limit = decoder.default_work_limit
+pub let maximum_work_limit = decoder.maximum_work_limit
 pub type Statistics = decoder.Statistics
 
 pub struct Data:
     var buffer: binary.Buffer
     var input_bytes: i64
     var progress: i64 = decoder.finished
+    var work: i64
     var disposed: bool
 
     pub func bytes() -> const u8[]!:
@@ -33,6 +37,10 @@ pub struct Data:
     pub func status() -> i64!:
         if self.disposed: error(closed, "compression result is closed")
         return self.progress
+
+    pub func work_units() -> i64!:
+        if self.disposed: error(closed, "compression result is closed")
+        return self.work
 
     pub mutating func close():
         self.buffer.close()
@@ -81,8 +89,10 @@ pub struct Inflater:
         *state = initialized
         self.state = state
 
-    pub mutating func feed(input: const u8[], capacity: i64 = 65536, final_input: bool = false) -> interop.Reference[Data]!:
+    pub mutating func feed(input: const u8[], capacity: i64 = 65536, final_input: bool = false,
+        work_limit: i64 = decoder.default_work_limit) -> interop.Reference[Data]!:
         let state = self.state else error(closed, "inflater is closed")
+        try decoder.check_work_limit(work_limit)
         if capacity < 0 or capacity > 1048576 or input.length > 1048576:
             error(invalid, "feed input/output chunks must be at most 1 MiB")
         var buffer = binary.Buffer(maximum = (usize)capacity)
@@ -94,10 +104,11 @@ pub struct Inflater:
         let result = try owned(buffer, 0)
         errdefer result.release()
         let chunk = result.value()
-        let step = try state.step(input, chunk.buffer.data, final_input)
+        let step = try state.step(input, chunk.buffer.data, final_input, work_limit)
         chunk.buffer.used = (usize)step.produced
         chunk.input_bytes = step.consumed
         chunk.progress = step.status
+        chunk.work = step.work_units
         return result
 
     pub mutating func reset() -> !:
@@ -120,8 +131,10 @@ pub struct Deflater:
     pub func init(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> !:
         self.state = try encoder.make_encoder(framing, max_input, max_output)
 
-    pub mutating func feed(input: const u8[], capacity: i64 = 65536, final_input: bool = false) -> interop.Reference[Data]!:
+    pub mutating func feed(input: const u8[], capacity: i64 = 65536, final_input: bool = false,
+        work_limit: i64 = decoder.default_work_limit) -> interop.Reference[Data]!:
         discard(try self.state.statistics())  ## reject closed before allocating
+        try decoder.check_work_limit(work_limit)
         if capacity < 0 or capacity > 1048576 or input.length > 1048576:
             error(invalid, "feed input/output chunks must be at most 1 MiB")
         var buffer = binary.Buffer(maximum = (usize)capacity)
@@ -131,10 +144,11 @@ pub struct Deflater:
         let result = try owned(buffer, 0)
         errdefer result.release()
         let chunk = result.value()
-        let step = try self.state.step(input, chunk.buffer.data, final_input)
+        let step = try self.state.step(input, chunk.buffer.data, final_input, work_limit)
         chunk.buffer.used = (usize)step.produced
         chunk.input_bytes = step.consumed
         chunk.progress = step.status
+        chunk.work = step.work_units
         return result
 
     pub mutating func reset() -> !:

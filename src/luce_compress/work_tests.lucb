@@ -1,0 +1,178 @@
+## Scheduling tests: no scheduler or shared ownership is hidden in the codec.
+import compress
+import compress_native as codec
+import interop
+import thread
+
+func equal(actual: const u8[], expected: const u8[]):
+    assert(actual.length == expected.length)
+    for i in 0..<actual.length: assert(actual[i] == expected[i])
+
+func native_validation(framing: str) -> !:
+    let plain = b"cooperative cooperative cooperative"
+    let source = try compress.encode(plain)
+    defer source.release()
+    let wrapped = try source.value().bytes()
+    let packed = wrapped if framing == "zlib" else wrapped[2..<wrapped.length - 4]
+    var decoder = try codec.make_decoder(framing)
+    var encoder = try codec.make_encoder(framing)
+    defer encoder.close()
+    var output: u8[128]
+    for i in 0..<output.length: output[i] = 173
+    for work in [-1, 0, 65537, 9223372036854775807]:
+        var rejected = false
+        discard(decoder.step(packed, output, true, work) catch failure:
+            assert(failure.code == compress.invalid)
+            rejected = true
+            recover codec.Step())
+        assert(rejected and not decoder.statistics().failed and decoder.statistics().input_bytes == 0)
+        rejected = false
+        discard(encoder.step(plain, output, true, work) catch failure:
+            assert(failure.code == compress.invalid)
+            rejected = true
+            recover codec.Step())
+        assert(rejected and not (try encoder.statistics()).failed and (try encoder.statistics()).input_bytes == 0)
+        for byte in output: assert(byte == 173)
+    ## Rejected EOF-bearing calls must not constrain a shorter nonfinal retry.
+    let initial_decode = try decoder.step(packed[..<1], output, false, 1)
+    assert(initial_decode.work_units == 1 and initial_decode.produced == 0)
+    var consumed = (usize)initial_decode.consumed
+    var produced: usize
+    var calls: usize
+    while true:
+        let step = try decoder.step(packed[consumed..], output, calls == 0, 1)
+        assert(step.work_units == 1 and step.status != codec.need_input)
+        equal(output[..<(usize)step.produced], plain[produced..<produced + (usize)step.produced])
+        consumed += (usize)step.consumed
+        produced += (usize)step.produced
+        calls += 1
+        assert(calls < 200)
+        if step.status == codec.finished: break
+        assert(step.status == codec.yielded)
+    assert(consumed == packed.length and produced == plain.length)
+    let initial_encode = try encoder.step(plain[..<1], output, false, 1)
+    assert(initial_encode.status == codec.yielded and initial_encode.work_units == 1)
+    assert(initial_encode.consumed == 0 and initial_encode.produced == 0)
+    consumed = 0
+    produced = 0
+    calls = 0
+    while true:
+        let step = try encoder.step(plain[consumed..], output, calls == 0, 1)
+        assert(step.work_units == 1)
+        equal(output[..<(usize)step.produced], packed[produced..<produced + (usize)step.produced])
+        consumed += (usize)step.consumed
+        produced += (usize)step.produced
+        calls += 1
+        assert(calls < 200)
+        if step.status == codec.finished: break
+        assert(step.status == codec.yielded)
+    assert(consumed == plain.length and produced == packed.length)
+    assert((try decoder.step(b"next", output, true, 1)).work_units == 0)
+    assert((try encoder.step(b"next", output, true, 1)).work_units == 0)
+    ## Invalid work still rejects after completion, without clearing completion.
+    var rejected = false
+    discard(decoder.step(b"", output, true, 0) catch failure:
+        assert(failure.code == compress.invalid)
+        rejected = true
+        recover codec.Step())
+    assert(rejected and decoder.statistics().finished and not decoder.statistics().failed)
+    rejected = false
+    discard(encoder.step(b"", output, true, 0) catch failure:
+        assert(failure.code == compress.invalid)
+        rejected = true
+        recover codec.Step())
+    assert(rejected and (try encoder.statistics()).finished and not (try encoder.statistics()).failed)
+    try decoder.reset()
+    try encoder.reset()
+    assert((try decoder.step(packed, output, true, codec.maximum_work_limit)).status == codec.finished)
+    assert((try encoder.step(plain, output, true, codec.maximum_work_limit)).status == codec.finished)
+    decoder.close()
+    encoder.close()
+    rejected = false
+    discard(decoder.step(packed, output, true, 0) catch failure:
+        assert(failure.code == compress.closed)
+        rejected = true
+        recover codec.Step())
+    assert(rejected)
+    rejected = false
+    discard(encoder.step(plain, output, true, 0) catch failure:
+        assert(failure.code == compress.closed)
+        rejected = true
+        recover codec.Step())
+    assert(rejected)
+
+func facade_and_cancellation(framing: str) -> !:
+    let plain = b"cancellable package stream stream stream"
+    let original = try compress.encode(plain)
+    defer original.release()
+    assert(try original.value().work_units() == 0)  ## whole-buffer API is not step-budgeted
+    let wrapped = try original.value().bytes()
+    let packed = wrapped if framing == "zlib" else wrapped[2..<wrapped.length - 4]
+    ## Stop at several internal yield points. There is no concurrent cross-worker
+    ## close: cancellation is simply owner-side reset/close between bounded calls.
+    for stop in 1..<9:
+        var inflater = try compress.Inflater(framing)
+        var deflater = try compress.Deflater(framing)
+        var decoded: usize
+        var encoded: usize
+        var plain_at: usize
+        var packed_at: usize
+        for turn in 0..<stop:
+            let input_chunk = try inflater.feed(packed[packed_at..], 128, turn == 0, 1)
+            let output_chunk = try deflater.feed(plain[plain_at..], 128, turn == 0, 1)
+            assert(try input_chunk.value().work_units() == 1)
+            assert(try output_chunk.value().work_units() == 1)
+            assert(try input_chunk.value().status() == codec.yielded)
+            assert(try output_chunk.value().status() == codec.yielded)
+            let input_bytes = try input_chunk.value().bytes()
+            let output_bytes = try output_chunk.value().bytes()
+            equal(input_bytes, plain[decoded..<decoded + input_bytes.length])
+            equal(output_bytes, packed[encoded..<encoded + output_bytes.length])
+            decoded += input_bytes.length
+            encoded += output_bytes.length
+            packed_at += (usize)(try input_chunk.value().consumed())
+            plain_at += (usize)(try output_chunk.value().consumed())
+            if turn + 1 == stop:
+                if stop % 2 == 0:
+                    try inflater.reset()
+                    try deflater.reset()
+                    assert((try inflater.statistics()).input_bytes == 0 and not (try inflater.statistics()).failed)
+                    assert((try deflater.statistics()).input_bytes == 0 and not (try deflater.statistics()).failed)
+                    let fresh_decode = try inflater.feed(packed, 128, true, codec.maximum_work_limit)
+                    let fresh_encode = try deflater.feed(plain, 128, true, codec.maximum_work_limit)
+                    assert(try fresh_decode.value().status() == codec.finished)
+                    assert(try fresh_encode.value().status() == codec.finished)
+                    equal(try fresh_decode.value().bytes(), plain)
+                    equal(try fresh_encode.value().bytes(), packed)
+                    fresh_decode.release()
+                    fresh_encode.release()
+                ## Odd stops close the unfinished stream directly; even stops
+                ## cancel by reset, then prove clean reuse before closing.
+                inflater.close()
+                deflater.close()
+                ## Already returned chunks remain readable after cancellation/reuse.
+                equal(try input_chunk.value().bytes(), plain[decoded - input_bytes.length..<decoded])
+                equal(try output_chunk.value().bytes(), packed[encoded - output_bytes.length..<encoded])
+                assert(try input_chunk.value().work_units() == 1)
+                assert(try output_chunk.value().work_units() == 1)
+            input_chunk.release()
+            output_chunk.release()
+        inflater.close()
+        deflater.close()
+
+func worker(raw: void*?):
+    discard(raw)
+    native_validation("raw") catch failure: trap(failure.message)
+    native_validation("zlib") catch failure: trap(failure.message)
+    facade_and_cancellation("zlib") catch failure: trap(failure.message)
+
+pub func main(arguments: str[]) -> i32!:
+    discard(arguments)
+    for framing in ["raw", "zlib"]:
+        try native_validation(framing)
+        try facade_and_cancellation(framing)
+    var workers: thread.Handle[8]
+    for i in 0..<8: workers[i] = try thread.spawn(worker, none, stack = 524288)
+    for handle in workers: try handle.join()
+    print("PASS cooperative native/facade budgets, zero-I/O yields, EOF retry, cancellation/reset/retained chunks and 8 bounded-stack workers")
+    return 0

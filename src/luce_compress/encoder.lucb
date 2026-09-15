@@ -2,7 +2,7 @@
 ## Two bounded allocations at construction; no allocation or borrowed spans in step.
 import memory
 import luce_compress.deflate as deflate
-from luce_compress.decoder import Step, Statistics, need_input, need_output, finished
+from luce_compress.decoder import Step, Statistics, need_input, need_output, finished, yielded, default_work_limit, check_work_limit
 from luce_compress.binary import invalid, corrupt, limit, closed
 
 pub func make_encoder(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> Encoder!:
@@ -24,9 +24,10 @@ pub func make_encoder(framing: str = "zlib", max_input: i64 = 1073741824, max_ou
 pub struct Encoder:
     var state: State*?
 
-    pub mutating func step(input: const u8[], output: u8[], final_input: bool = false) -> Step!:
+    pub mutating func step(input: const u8[], output: u8[], final_input: bool = false,
+        work_limit: i64 = default_work_limit) -> Step!:
         let state = self.state else error(closed, "encoder is closed or uninitialized")
-        return try state.step(input, output, final_input)
+        return try state.step(input, output, final_input, work_limit)
 
     pub mutating func reset() -> !:
         let state = self.state else error(closed, "encoder is closed or uninitialized")
@@ -146,9 +147,10 @@ struct State:
         self.ahead_at = (self.ahead_at + length) % 258
         self.ahead_count -= length
 
-    mutating func step(data: const u8[], output: u8[], final_input: bool) -> Step!:
+    mutating func step(data: const u8[], output: u8[], final_input: bool, work_limit: i64) -> Step!:
         if self.failed: error(corrupt, "encoder failed; reset before reuse")
-        if self.stage == 4: return Step(0, 0, finished)
+        try check_work_limit(work_limit)
+        if self.stage == 4: return Step(0, 0, finished, 0)
         errdefer self.poison()
         let ending = self.total_in +? (u64)data.length else error(invalid, "input end offset overflow")
         if self.final_known and (ending > self.final_at or (final_input and ending != self.final_at)):
@@ -158,11 +160,17 @@ struct State:
             self.final_at = ending
         var consumed: usize
         var produced: usize
+        var work_units: i64
         while true:
+            if self.stage == 4: return Step((i64)consumed, (i64)produced, finished, work_units)
+            if work_units == work_limit: return Step((i64)consumed, (i64)produced, yielded, work_units)
+            ## One bounded dispatch: drain <=8 pending bytes, accept <=258 bytes,
+            ## then encode at most one <=258-byte match or one literal.
+            work_units += 1
             ## Flush a pending symbol/header/trailer before doing more work.
             while self.bit_count >= 8:
                 if self.total_out == self.max_out: error(limit, "compressed stream byte budget exceeded")
-                if produced == output.length: return Step((i64)consumed, (i64)produced, need_output)
+                if produced == output.length: return Step((i64)consumed, (i64)produced, need_output, work_units)
                 output[produced] = (u8)self.bits
                 produced += 1
                 self.total_out += 1
@@ -184,7 +192,7 @@ struct State:
                     if self.ahead_count < 258 and not ending_known:
                         ## Reaching max_input isn't EOF: an empty final call is
                         ## still legal at the exact budget. No extra byte is read.
-                        return Step((i64)consumed, (i64)produced, need_input)
+                        return Step((i64)consumed, (i64)produced, need_input, work_units)
                     if self.ahead_count > 0:
                         self.encode_one()
                     else:
@@ -201,7 +209,5 @@ struct State:
                     self.stage = 3
                 3:
                     self.stage = 4
-                4:
-                    return Step((i64)consumed, (i64)produced, finished)
                 _:
                     trap("invalid encoder state")

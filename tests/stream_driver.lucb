@@ -8,7 +8,7 @@ import strings
 import c
 
 pub func main(arguments: str[]) -> i32!:
-    assert(arguments.length == 10)
+    assert(arguments.length == 10 or arguments.length == 11)
     let packed = try files.read((c.str)arguments[1])
     defer free(packed) in memory.heap
     let expected = try files.read((c.str)arguments[2])
@@ -18,6 +18,7 @@ pub func main(arguments: str[]) -> i32!:
     let max_input = strings.parse_i64(arguments[6]) else trap("input budget")
     let max_output = strings.parse_i64(arguments[7]) else trap("output budget")
     let compare = arguments[9] == "valid"
+    let requested_work = (strings.parse_i64(arguments[10]) else trap("work limit")) if arguments.length == 11 else codec.default_work_limit
     var decoder = try codec.make_decoder(arguments[3], max_input, max_output)
     defer decoder.close()
     var input: u8[65536]
@@ -25,6 +26,9 @@ pub func main(arguments: str[]) -> i32!:
     var consumed: usize
     var produced: usize
     var steps: usize
+    var yields: usize
+    var empty_yields: usize
+    var total_work: i64
     var chunk_seed: u32 = 1951
     while true:
         assert(steps < 10000000)
@@ -45,7 +49,8 @@ pub func main(arguments: str[]) -> i32!:
         assert(capacity <= 65536)
         output[capacity] = 173
         let last = (consumed == packed.length) if arguments[8] == "late" else (consumed + count == packed.length)
-        let step = decoder.step(data, output[..<capacity], last) catch failure:
+        let allowance = requested_work if requested_work > 0 else 1 + (i64)((chunk_seed >> 16) % 31)
+        let step = decoder.step(data, output[..<capacity], last, allowance) catch failure:
             let statistics = decoder.statistics()
             assert(statistics.failed)
             assert(statistics.input_bytes <= max_input and statistics.output_bytes <= max_output)
@@ -59,6 +64,9 @@ pub func main(arguments: str[]) -> i32!:
             return 1
         assert(step.consumed >= 0 and (usize)step.consumed <= count)
         assert(step.produced >= 0 and (usize)step.produced <= capacity)
+        assert(step.work_units > 0 and step.work_units <= allowance)
+        assert(step.consumed <= 8 * step.work_units and step.produced <= 258 * step.work_units)
+        total_work += step.work_units
         assert(output[capacity] == 173)
         if compare:
             assert((usize)step.produced <= expected.length - produced)
@@ -75,11 +83,15 @@ pub func main(arguments: str[]) -> i32!:
             assert(statistics.finished)
             if compare: assert(produced == expected.length)
             let done = try decoder.step(b"a different stream", output)
-            assert(done.status == codec.finished and done.consumed == 0 and done.produced == 0)
-            print(f"OK {consumed} {produced} {steps + 1}")
+            assert(done.status == codec.finished and done.consumed == 0 and done.produced == 0 and done.work_units == 0)
+            print(f"OK {consumed} {produced} {steps + 1} {yields} {empty_yields} {total_work}")
             return 0
         if step.status == codec.need_input: assert((usize)step.consumed == count)
         elif step.status == codec.need_output: assert((usize)step.produced == capacity)
+        elif step.status == codec.yielded:
+            assert(step.work_units == allowance)
+            yields += 1
+            if step.consumed == 0 and step.produced == 0: empty_yields += 1
         else: trap("unknown status")
-        assert(step.consumed > 0 or step.produced > 0 or count == 0 or capacity == 0)
+        assert(step.consumed > 0 or step.produced > 0 or count == 0 or capacity == 0 or step.status == codec.yielded)
         steps += 1

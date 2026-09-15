@@ -5,8 +5,8 @@ MIT OR Apache-2.0; see [provenance](NOTICE.md) for the retained MIT source notic
 No zlib/C codec, foreign library or compression subprocess in the runtime.
 
 **Experimental M1a work: whole-buffer zlib encoding/decoding and incremental
-raw-DEFLATE/zlib encoding/decoding, with deterministic allocation-failure tests.**
-Work/resource gates remain;
+raw-DEFLATE/zlib encoding/decoding, with cooperative work budgets and deterministic
+allocation-failure tests.** Measured resource/stress gates remain;
 this is not yet the completed compression milestone or a full zlib replacement.
 
 ## API
@@ -54,14 +54,18 @@ stream is not automatically parallelized.
 `Inflater(framing="zlib", max_input=1073741824, max_output=1073741824)` owns a native
 decoder. Git loose objects and pack entries use **zlib** framing. Select
 `framing="raw"` only for an enclosing format that specifies unwrapped DEFLATE;
-there is no framing autodetection. `feed(input, capacity=65536, final_input=false)` returns an owned
-`Data` chunk with `bytes()`, `consumed()` and `status()`:
+there is no framing autodetection. `feed(input, capacity=65536, final_input=false,
+work_limit=4096)` returns an owned `Data` chunk with `bytes()`, `consumed()`,
+`status()` and `work_units()`:
 
 - `need_input`: the offered input was consumed; supply the next bytes.
 - `need_output`: the output chunk filled; reoffer the unconsumed input suffix with
   a positive output capacity. Do not resubmit bytes counted as consumed.
 - `finished`: exactly one stream ended. Any unconsumed suffix belongs to the caller;
   reset or create a different decoder for the next stream.
+- `yielded`: the operation allowance was used. Requeue the owner, then reoffer the
+  unconsumed suffix. Zero consumed/produced bytes are legal; this is not a request
+  for more input. All callers must handle this status, including with default limits.
 
 The final-input flag declares an absolute end offset, not a promise that the stream
 finishes in this call. It survives output backpressure; later calls can drain with
@@ -71,8 +75,9 @@ is an error. Empty input/output chunks are supported. A finished decoder returns
 clears history, counters, end markers and error state; `close()` is idempotent.
 
 Native zero-copy consumers use `compress_native.make_decoder(...)` and
-`Decoder.step(input, output, final_input)` with disjoint caller-owned spans. Its `Step`
-contains `consumed`, `produced`, `status`. The core retains a 32 KiB history ring and
+`Decoder.step(input, output, final_input, work_limit)` with disjoint caller-owned spans.
+The last two arguments default to `false` and `4096`. Its `Step` contains `consumed`,
+`produced`, `status`, `work_units`. The core retains a 32 KiB history ring and
 bounded bit/Huffman state, not caller pointers or the complete input/output. On the
 initial 64-bit targets `sizeof(Decoder)` is 37,960 bytes. Independent streams may
 run on separate bounded workers; never mutate/close one instance concurrently.
@@ -82,6 +87,14 @@ Streaming total budgets accept nonnegative signed 64-bit values and default to
 The owning facade limits each input chunk and output capacity to 1 MiB; native
 callers control their own span sizes. The caller schedules calls and can stop/close
 between them; there is no background worker or asynchronous cancellation.
+
+`work_limit` accepts 1–65,536 bounded state-machine dispatches per call; invalid
+values reject before mutation or facade allocation. `yielded` reports exactly the
+chosen allowance; already finished streams report zero work. Native steps allocate
+nothing. This is an operation bound, **not a millisecond deadline**: constructor,
+reset, facade allocation/managed copies, caller I/O and aggregate concurrency are
+outside it. See the [precise counting and scheduling contract](docs/STREAMING_CONTRACT.md#cooperative-scheduling-contract).
+The whole-buffer API is not cooperative; its result reports zero counted step work.
 
 Parse/budget errors poison a decoder; reset or close it. The current failed call
 returns no chunk, but earlier chunks are **untrusted until final validation**. Keep
@@ -103,7 +116,7 @@ See the [contract](docs/STREAMING_CONTRACT.md) and executable
 `Deflater(framing="zlib", max_input=1073741824, max_output=1073741824)` has the same
 owning `feed`, `reset`, `close`, `statistics` and `Data` chunk interface as `Inflater`.
 Native consumers use `compress_native.make_encoder(...)`, returning an owning
-`Encoder` handle with `step(input, output, final_input)`. Do not copy this handle or
+`Encoder` handle with `step(input, output, final_input=false, work_limit=4096)`. Do not copy this handle or
 share it across workers; its `close()` releases its two native allocations and is
 idempotent on that handle. The decoder remains a fixed-state value, not a handle.
 
@@ -197,7 +210,13 @@ budgets, overwritten spans, canaries, reset/close and concurrent independent own
 Stock Git reads Base-encoded loose objects and validates/indexes a separately framed
 pack; a second empty repository verifies packed reads cannot fall back to loose data.
 
-The separate single-threaded allocation test executable runs 368 failure/retry
+An additional 928 independent work-budget cases run one-unit, varying and default
+allowances across raw/zlib stored/fixed/dynamic fixtures, exact splits/truncations,
+empty-block chains, checksum/limit errors and deterministic encoder output. Together
+the five oracle groups contain 6,000 cases per mode. Native and Luce suites cover
+zero-I/O yields, cancellation/reset, retained chunks and eight independent workers.
+
+The separate single-threaded allocation test executable runs 388 failure/retry
 cases. It replaces the test process's Base heap with a fixed-size tracking allocator,
 refuses each allocation in observed traces in both one-shot and persistent-failure
 modes, and verifies exact frees and state-safe retries. It also exercises late
@@ -208,9 +227,8 @@ failures, or concurrent replacement of the process-global heap.
 
 ## Next commits
 
-1. Cooperative work budgets and bounded cancellation points.
-2. Measured peak memory/latency and further fuzzing. Full threaded Git-consumer
-   integration follows in M2a.
+1. Measured process/aggregate memory and latency under larger concurrent workloads.
+2. Further stress/fuzzing. Full threaded Git-consumer integration follows in M2a.
 
 M1a remains incomplete until those streaming/limit gates pass. The overall public
 plan is in [luce-pkg-server](https://github.com/dymokomi/luce-pkg-server).

@@ -1,13 +1,13 @@
 # Incremental codec contract
 
 The decoder and encoder implement this contract, including deterministic Base-heap
-failure/retry tests. Cooperative work limits remain follow-up work. The underlying formats are [RFC 1950](https://www.rfc-editor.org/info/rfc1950/)
+failure/retry tests and bounded cooperative work. The underlying formats are [RFC 1950](https://www.rfc-editor.org/info/rfc1950/)
 and [RFC 1951](https://www.rfc-editor.org/info/rfc1951/).
 
 One decoder owns a fixed 32 KiB history window and bounded Huffman/bit state. It
 borrows only the current, disjoint input/output spans; it never retains their pointers after
 a step. A step reports consumed input, produced output, and exactly one of
-`need_input`, `need_output`, `finished`. Empty spans are legal and cannot trigger
+`need_input`, `need_output`, `finished`, `yielded`. Empty spans are legal and cannot trigger
 null-pointer arithmetic. No chunk is replayed from the beginning to simulate
 streaming. The caller controls scheduling; there is no internal unbounded thread.
 
@@ -20,7 +20,8 @@ bytes. Raw-DEFLATE and zlib must have explicit framing modes, never autodetectio
 
 Total compressed and expanded budgets use checked arithmetic and are checked
 before consuming/emitting beyond the bound. A ratio alone is not a decompression
-limit. Errors poison the current stream; reset/close creates a clear ownership
+limit. Core parse/byte-budget/EOF errors poison the current stream; invalid per-call
+work limits reject before mutation and do not poison it. Reset/close creates a clear ownership
 boundary. Bytes produced before final checksum validation are untrusted: consumers
 must keep them quarantined until successful completion. No side effects may be
 published merely because a step produced output.
@@ -36,6 +37,61 @@ matches across the 32 KiB wrap, repeated blocks, final empty blocks, unfinished
 trailers, capacity/total-limit boundaries, multiple concatenated objects, and
 equivalence to an independent streaming oracle. Inspect total retained state and
 instrument sanitizer runs; a whole-buffer success is not streaming evidence.
+
+## Cooperative scheduling contract
+
+Native `step(input, output, final_input=false, work_limit=4096)` and owning
+`feed(input, capacity=65536, final_input=false, work_limit=4096)` accept **1–65,536**
+work units per call. `default_work_limit` and `maximum_work_limit` export these
+values. `Step.work_units` and `Data.work_units()` report the actual dispatch count;
+an already finished stream returns zero. Whole-buffer `Data.work_units()` is zero,
+meaning not step-budgeted, not that the one-shot operation did no work.
+
+One unit is one dispatch of the existing bounded state machine. Decoder dispatches
+read at most eight input bytes and emit at most 258 output bytes. Huffman symbol
+decoding takes at most 15 bits; tree construction visits bounded alphabets (at most
+288 literal and 32 distance lengths), repeats at most 138 lengths, and match copying
+emits at most 258 bytes. Encoder dispatches drain at most eight pending bytes,
+accept at most 258 input bytes, and choose/update one literal or at most one
+258-byte match. Match search has one candidate, not an input-dependent chain.
+Table initialization/build loops have fixed bounds. No native step allocates.
+
+Terminal completion takes precedence over yielding: a call that completes on its
+last permitted dispatch returns `finished`. Otherwise, budget exhaustion returns
+`yielded` **before** probing another dispatch, even if that next dispatch would
+discover input/output backpressure or an error. A successful nonterminal call uses
+at least one unit; `yielded` uses exactly its allowance. It may have zero consumed
+and zero produced bytes because useful internal state transitions need no I/O.
+This is not input starvation: requeue the owner, then reoffer its unconsumed suffix
+with fresh disjoint scratch spans and a positive allowance. Never replay consumed
+bytes, spin waiting for more input just because a yield emitted nothing, or publish
+unverified partial output. Sticky absolute EOF survives these yields unchanged.
+
+Validate a native call's closed/poisoned state first, then its work bound, then any
+new EOF declaration. Invalid work leaves counters, history, flags, pending bits,
+output memory and EOF unchanged, including after completion. The facade rejects
+closed handles and invalid work before allocating its output/carrier. Allocation
+refusal likewise does not spend native work or alter stream state. Resume/retry,
+reset or close only on the owning worker; concurrent close is not cancellation.
+
+This is a deterministic **operation bound, not a wall-clock deadline**. Units have
+different costs. OS scheduling, allocator/managed-byte copies, construction/reset,
+whole-buffer calls, caller I/O and aggregate concurrency are outside the counter.
+Fixed-state constructor/reset work is bounded separately by retained array sizes.
+Use worker admission, byte/memory bounds and deadlines alongside this API; a
+caller-selected large allowance is not a production latency policy. Account for
+even an empty owning chunk's carrier allocation, or use native spans on hot paths.
+Errors return no `Step`/owning chunk: a scheduler can charge the full granted
+allowance, but must not interpret the missing result as zero processing cost.
+
+Tests include one-unit and varying allowances, 4,096 empty stored blocks with zero
+expanded bytes, every split/truncation of representative fixed/dynamic fixtures,
+exact framing and output equality with independent zlib, per-call dispatch/I/O
+inequalities, completion on the last dispatch, EOF across zero-I/O yields,
+owner-side cancellation/reset with retained chunks, independent 512 KiB-stack
+workers and deterministic allocation failures before and after yielding. Budget
+values select work scheduling, not different compressed bytes. Measured process
+memory/latency, larger stress/fuzzing and server scheduling remain separate gates.
 
 ## Encoder-specific state and EOF
 

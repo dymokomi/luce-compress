@@ -8,6 +8,7 @@ from check_codecs import check
 from check_stream import check as check_stream
 from check_git import check as check_git
 from check_encode import check as check_encode
+from check_work import check as check_work
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,13 +27,14 @@ def main():
     for source, name in [(ROOT / "src/luce_compress/native_tests.lucb", "native"), (ROOT / "tests/driver.lucb", "driver"),
                          (ROOT / "src/luce_compress/stream_tests.lucb", "stream-tests"), (ROOT / "tests/stream_driver.lucb", "stream-driver"),
                          (ROOT / "src/luce_compress/encoder_tests.lucb", "encoder-tests"), (ROOT / "tests/encode_driver.lucb", "encode-driver"),
-                         (ROOT / "src/luce_compress/failure_tests.lucb", "failure-tests")]:
+                         (ROOT / "src/luce_compress/failure_tests.lucb", "failure-tests"),
+                         (ROOT / "src/luce_compress/work_tests.lucb", "work-tests")]:
         generated, executable = output / f"{name}.c", output / name
         run([args.base.resolve(), "build", source, "--emit=c", "-o", generated])
         run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-w", "-fno-strict-aliasing",
              "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", runtime,
              generated, runtime / "lucb_rt.c", "-pthread", "-lm", "-o", executable])
-        if name in ["native", "stream-tests", "encoder-tests", "failure-tests"]:
+        if name in ["native", "stream-tests", "encoder-tests", "failure-tests", "work-tests"]:
             run([executable])
         elif name == "driver":
             check(executable)
@@ -41,6 +43,7 @@ def main():
             check_git(executable)
         else:
             check_encode(executable)
+    check_work(output / "stream-driver", output / "encode-driver")
     print("PASS AddressSanitizer + UndefinedBehaviorSanitizer", flush=True)
 
 

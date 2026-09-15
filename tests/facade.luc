@@ -1,4 +1,4 @@
-from compress import encode, decode, crc32, Inflater, Deflater, finished, need_output
+from compress import encode, decode, crc32, Inflater, Deflater, finished, need_output, yielded
 
 pub func main(arguments: list[str]) -> int!:
     let encoded = encode(b"Luce package source")
@@ -32,5 +32,39 @@ pub func main(arguments: list[str]) -> int!:
     deflater.close()
     let roundtrip = decode(packed.bytes())
     assert(roundtrip.bytes() == b"small streaming result")
-    print("PASS Luce codec API, binary ownership and consumed-byte count")
+    let encoder = Deflater()
+    let decoder = Inflater()
+    let plain = b"small streaming result"
+    var input_at = 0
+    var output_at = 0
+    var steps = 0
+    while true:
+        let chunk = encoder.feed(plain[input_at..], capacity = 64, final_input = true, work_limit = 1)
+        assert(chunk.work_units() == 1)
+        assert(chunk.bytes() == source.bytes()[output_at..<output_at + chunk.bytes().length])
+        input_at += chunk.consumed()
+        output_at += chunk.bytes().length
+        steps += 1
+        assert(steps < 100)
+        if chunk.status() == finished: break
+        assert(chunk.status() == yielded)
+    assert(input_at == plain.length and output_at == source.bytes().length)
+    assert(encoder.feed(b"", work_limit = 1).work_units() == 0)
+    input_at = 0
+    output_at = 0
+    steps = 0
+    while true:
+        let chunk = decoder.feed(source.bytes()[input_at..], capacity = 64, final_input = true, work_limit = 1)
+        assert(chunk.work_units() == 1)
+        assert(chunk.bytes() == plain[output_at..<output_at + chunk.bytes().length])
+        input_at += chunk.consumed()
+        output_at += chunk.bytes().length
+        steps += 1
+        assert(steps < 100)
+        if chunk.status() == finished: break
+        assert(chunk.status() == yielded)
+    assert(input_at == source.bytes().length and output_at == plain.length)
+    decoder.close()
+    encoder.close()
+    print("PASS Luce codec API, binary ownership, consumed-byte count and one-operation cooperative yields")
     return 0

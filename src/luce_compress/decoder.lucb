@@ -5,11 +5,19 @@ from luce_compress.binary import invalid, corrupt, unsupported, limit, closed
 pub let need_input: i64 = 0
 pub let need_output: i64 = 1
 pub let finished: i64 = 2
+pub let yielded: i64 = 3
+pub let default_work_limit: i64 = 4096
+pub let maximum_work_limit: i64 = 65536
+
+pub func check_work_limit(work_limit: i64) -> !:
+    if work_limit < 1 or work_limit > maximum_work_limit:
+        error(invalid, "step work limit must be between 1 and 65536")
 
 pub struct Step:
     pub let consumed: i64
     pub let produced: i64
     pub let status: i64
+    pub let work_units: i64
 
 pub struct Statistics:
     pub let input_bytes: i64
@@ -26,6 +34,7 @@ pub func make_decoder(framing: str = "zlib", max_input: i64 = 1073741824, max_ou
 struct Input:
     var data: const u8[]
     var used: usize
+    var work_units: i64
 
 ## Explicit initialization is required. Copying an active decoder duplicates its
 ## stream state; callers must not mutate one instance concurrently across workers.
@@ -118,7 +127,7 @@ pub struct Decoder:
             error(corrupt, "truncated compressed stream at declared end of input")
         if self.total_in == self.max_in:
             error(limit, "compressed stream byte budget exhausted before completion")
-        return Step((i64)input.used, (i64)produced, need_input)
+        return Step((i64)input.used, (i64)produced, need_input, input.work_units)
 
     mutating func emit(output: u8[], used: usize*, value: u8) -> !:
         if self.total_out == self.max_out: error(limit, "expanded stream byte budget exceeded")
@@ -141,12 +150,14 @@ pub struct Decoder:
 
     ## final_input declares the end offset of the offered span; the declaration
     ## survives output backpressure. Reoffer any unconsumed suffix, not the prefix.
-    ## An error may have consumed/emitted bytes: diagnostics remain available, but
-    ## the stream is poisoned and its output must not be published.
-    pub mutating func step(data: const u8[], output: u8[], final_input: bool = false) -> Step!:
+    ## A core parse/byte-budget/EOF error may consume/emit bytes and poisons the
+    ## stream. Invalid per-call work rejects before mutation, without poisoning.
+    pub mutating func step(data: const u8[], output: u8[], final_input: bool = false,
+        work_limit: i64 = default_work_limit) -> Step!:
         if not self.ready: error(closed, "decoder is closed or uninitialized")
         if self.failed: error(corrupt, "decoder failed; reset before reuse")
-        if self.state == 20: return Step(0, 0, finished)
+        try check_work_limit(work_limit)
+        if self.state == 20: return Step(0, 0, finished, 0)
         errdefer self.poison()
         let ending = self.total_in +? (u64)data.length else error(invalid, "input end offset overflow")
         if self.final_known and (ending > self.final_at or (final_input and ending != self.final_at)):
@@ -157,6 +168,11 @@ pub struct Decoder:
         var input = Input(data = data)
         var used: usize
         while true:
+            if self.state == 20: return Step((i64)input.used, (i64)used, finished, input.work_units)
+            if input.work_units == work_limit: return Step((i64)input.used, (i64)used, yielded, input.work_units)
+            ## Every dispatch is bounded: <=15 symbol bits, <=320 tree lengths,
+            ## <=138 repeated lengths or <=258 match bytes. Never replay input.
+            input.work_units += 1
             match self.state:
                 0:
                     let header = try self.read(&input, 16) else return try self.starved(input, used)
@@ -196,7 +212,7 @@ pub struct Decoder:
                         self.end_block()
                         continue
                     if self.total_out == self.max_out: error(limit, "expanded stream byte budget exceeded")
-                    if used == output.length: return Step((i64)input.used, (i64)used, need_output)
+                    if used == output.length: return Step((i64)input.used, (i64)used, need_output, input.work_units)
                     let byte = try self.read(&input, 8) else return try self.starved(input, used)
                     try self.emit(output, &used, (u8)byte)
                     self.remaining -= 1
@@ -257,7 +273,7 @@ pub struct Decoder:
                         error(corrupt, "invalid deflate length symbol")
                 9:
                     if self.total_out == self.max_out: error(limit, "expanded stream byte budget exceeded")
-                    if used == output.length: return Step((i64)input.used, (i64)used, need_output)
+                    if used == output.length: return Step((i64)input.used, (i64)used, need_output, input.work_units)
                     try self.emit(output, &used, self.literal)
                     self.state = 8
                 10:
@@ -284,12 +300,10 @@ pub struct Decoder:
                 14:
                     while self.remaining > 0:
                         if self.total_out == self.max_out: error(limit, "expanded stream byte budget exceeded")
-                        if used == output.length: return Step((i64)input.used, (i64)used, need_output)
+                        if used == output.length: return Step((i64)input.used, (i64)used, need_output, input.work_units)
                         let value = self.history[(self.history_at + 32768 - self.distance) & 32767]
                         try self.emit(output, &used, value)
                         self.remaining -= 1
                     self.state = 8
-                20:
-                    return Step((i64)input.used, (i64)used, finished)
                 _:
                     trap("invalid decoder state")
