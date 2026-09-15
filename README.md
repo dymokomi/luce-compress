@@ -84,8 +84,8 @@ between them; there is no background worker or asynchronous cancellation.
 
 Parse/budget errors poison a decoder; reset or close it. The current failed call
 returns no chunk, but earlier chunks are **untrusted until final validation**. Keep
-them quarantined. Raw DEFLATE has no checksum at all and needs its enclosing Git or
-package integrity check. Successful zlib Adler32 is not cryptographic verification.
+them quarantined. Raw DEFLATE has no checksum at all and needs an integrity check
+from its enclosing format. Successful zlib Adler32 is not cryptographic verification.
 `statistics()` exposes processed input/output counts, `finished`, and `failed` for
 diagnostics, not authorization or proof that bytes were published.
 
@@ -158,8 +158,8 @@ present. This does not implement or validate a complete Git object/pack engine.
 
 1. Incremental encoding with raw-DEFLATE/zlib framing, backpressure and hostile
    input/output chunk-boundary tests.
-2. Allocator-failure injection, cooperative work budgets, threaded Git consumer
-   integration, measured peak memory/latency and further fuzzing.
+2. Allocator-failure injection, cooperative work budgets, measured peak memory/latency
+   and further fuzzing. Full threaded Git-consumer integration follows in M2a.
 
 M1a remains incomplete until those streaming/limit gates pass. The overall public
 plan is in [luce-pkg-server](https://github.com/dymokomi/luce-pkg-server).
