@@ -6,7 +6,7 @@ No zlib/C codec, foreign library or compression subprocess in the runtime.
 
 **Experimental M1a work: whole-buffer zlib encoding/decoding and incremental
 raw-DEFLATE/zlib encoding/decoding, with cooperative work budgets and deterministic
-allocation-failure tests.** Measured resource/stress gates remain;
+allocation-failure tests.** Resource, larger-stream and seeded fuzz tests are included;
 this is not yet the completed compression milestone or a full zlib replacement.
 
 ## API
@@ -233,10 +233,19 @@ files. It checks process peak RSS and records step-latency histograms and paired
 pipeline throughput. See [RESOURCES.md](docs/RESOURCES.md) for exact ceilings,
 measurement units, exclusions and commands; these are not production SLOs.
 
+Independent decoder fuzzing adds 4,096 seeded cases per mode, under ASan/UBSan and
+in the prebuilt suite. Independent larger-file tests add 24 exact-byte/budget cases
+at 1 MiB + 1 byte. Both CI hosts also run 65,536 mutations with a second seed and
+48 file-stream cases through 16 MiB + 3 bytes. Failures must be normal codec
+rejections, never signals or sanitizer findings. See [FUZZING.md](docs/FUZZING.md)
+for corpus identities, bounded oracle behavior, retained reproducers and exclusions.
+See [VALIDATION.md](docs/VALIDATION.md) for completed revision-specific evidence;
+test definitions alone are not a claim that every deployment gate has passed.
+
 ## Next commits
 
-1. Validate the measured resource profiles on supported hosts and isolated VPS.
-2. Independent large-stream fixtures and further fuzzing. Full threaded
+1. Finish hosted and isolated-VPS validation of the expanded test gates.
+2. Review M1a exit criteria alongside the still-open M0 contracts. Full threaded
    Git-consumer integration and aggregate server admission follow in M2a/M3a.
 
 M1a remains incomplete until those streaming/limit gates pass. The overall public

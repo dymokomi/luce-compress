@@ -12,6 +12,8 @@ from check_git import check as check_git
 from check_encode import check as check_encode
 from check_work import check as check_work
 from check_stress import check as check_stress
+from check_fuzz import check as check_fuzz
+from check_large import check as check_large
 
 ROOT = Path(__file__).resolve().parents[1]
 MODES = {f"native{i}": ["--native", "--opt", str(i)] for i in range(4)}
@@ -28,6 +30,7 @@ def main():
     def run(command):
         subprocess.run([str(arg) for arg in command], cwd=ROOT, env=environment, check=True, timeout=180)
     run([sys.executable, ROOT / "tests/test_stress.py"])
+    run([sys.executable, ROOT / "tests/test_oracles.py"])
     for mode, flags in MODES.items():
         if args.mode != "all" and args.mode != mode:
             continue
@@ -40,7 +43,9 @@ def main():
                              (ROOT / "src/luce_compress/encoder_tests.lucb", "encoder-tests"), (ROOT / "tests/encode_driver.lucb", "encode-driver"),
                              (ROOT / "src/luce_compress/failure_tests.lucb", "failure-tests"),
                              (ROOT / "src/luce_compress/work_tests.lucb", "work-tests"),
-                             (ROOT / "tests/stress_driver.lucb", "stress-driver")]:
+                             (ROOT / "tests/stress_driver.lucb", "stress-driver"),
+                             (ROOT / "src/luce_compress/fuzz_tests.lucb", "fuzz-driver"),
+                             (ROOT / "tests/file_driver.lucb", "file-driver")]:
             run([args.base.resolve(), "build", source, *flags, "-o", output / name])
         run([args.luce.resolve(), "build", ROOT / "tests/facade.luc", *flags, "-o", output / "facade"])
         run([output / "native"])
@@ -55,6 +60,8 @@ def main():
         check_encode(output / "encode-driver")
         check_work(output / "stream-driver", output / "encode-driver")
         check_stress(output / "stress-driver")
+        check_fuzz(output / "fuzz-driver")
+        check_large(output / "file-driver")
         print(f"PASS {mode} ({time.monotonic() - started:.1f}s)", flush=True)
 
 

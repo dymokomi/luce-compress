@@ -54,12 +54,20 @@ jobs:
         run: |
           set -o pipefail
           python3 tests/check_stress.py build/native3/stress-driver --full 2>&1 | tee build/resources.log
+      - name: Extended independent oracles
+        working-directory: luce-compress
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/check_large.py build/native3/file-driver --full 2>&1 | tee build/large-streams.log
+          python3 tests/check_fuzz.py build/native3/fuzz-driver --seed 19510002 --cases 65536 2>&1 | tee build/fuzz.log
       - name: Package Linux test binaries
         if: runner.os == 'Linux'
         working-directory: luce-compress
         run: python3 tools/test_bundle.py --output build/luce-compress-smoke-x86_64-linux.tar.gz
-      - uses: actions/upload-artifact@v4
+      - name: Upload Linux test binaries
         if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
         with:
           name: luce-compress-smoke-x86_64-linux
           path: luce-compress/build/luce-compress-smoke-x86_64-linux.tar.gz
@@ -71,3 +79,6 @@ jobs:
           path: |
             luce-compress/build/correctness.log
             luce-compress/build/resources.log
+            luce-compress/build/large-streams.log
+            luce-compress/build/fuzz.log
+            luce-compress/build/fuzz-failures/

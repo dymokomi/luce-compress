@@ -1,0 +1,75 @@
+## Test-only file adapter. Partial output remains in a disposable fixture directory.
+import compress_native as codec
+import files
+import io
+import strings
+import c
+
+pub func main(arguments: str[]) -> i32!:
+    assert(arguments.length == 7)
+    let encoding = arguments[1] == "encode"
+    assert(encoding or arguments[1] == "decode")
+    let input_limit = strings.parse_i64(arguments[5]) else trap("input budget")
+    let output_limit = strings.parse_i64(arguments[6]) else trap("output budget")
+    var source = try files.File.open((c.str)arguments[2])
+    defer source.destroy()
+    var target = try files.File.open((c.str)arguments[3], files.OpenMode.replace)
+    defer target.destroy()
+    var encoder: codec.Encoder
+    var decoder: codec.Decoder
+    if encoding: encoder = try codec.make_encoder(arguments[4], input_limit, output_limit)
+    else: decoder = try codec.make_decoder(arguments[4], input_limit, output_limit)
+    defer encoder.close()
+    defer decoder.close()
+    var input: u8[32768]
+    var output: u8[32769]
+    var size: usize
+    var offset: usize
+    var eof = false
+    var consumed: i64
+    var produced: i64
+    var calls: i64
+    while true:
+        if offset == size and not eof:
+            size = try source.read(input)
+            offset = 0
+            eof = size == 0
+        output[32768] = 173
+        var step: codec.Step
+        var rejected = false
+        if encoding:
+            step = encoder.step(input[offset..<size], output[..<32768], eof) catch failure:
+                print(f"REJECT {failure.message}")
+                rejected = true
+                recover codec.Step()
+        else:
+            step = decoder.step(input[offset..<size], output[..<32768], eof) catch failure:
+                print(f"REJECT {failure.message}")
+                rejected = true
+                recover codec.Step()
+        assert(output[32768] == 173)
+        if rejected: return 1
+        assert(step.consumed >= 0 and step.consumed <= (i64)(size - offset))
+        assert(step.produced >= 0 and step.produced <= 32768)
+        assert(step.work_units > 0 and step.work_units <= codec.default_work_limit)
+        for index in offset..<offset + (usize)step.consumed: input[index] = 221
+        offset += (usize)step.consumed
+        consumed += step.consumed
+        produced += step.produced
+        assert(consumed <= input_limit and produced <= output_limit)
+        try io.write_all(&target, output[..<(usize)step.produced])
+        for index in 0..<(usize)step.produced: output[index] = 222
+        calls += 1
+        assert(calls <= 64 * (input_limit + output_limit + 1024))
+        if step.status == codec.finished:
+            ## This adapter accepts exactly one complete stream, not a prefix.
+            if offset != size or (try source.read(input[..<1])) != 0:
+                print("REJECT trailing data")
+                return 1
+            try source.close()
+            try target.close()
+            print(f"OK {consumed} {produced}")
+            return 0
+        if step.status == codec.need_input: assert(offset == size and not eof)
+        elif step.status == codec.need_output: assert(step.produced == 32768)
+        else: assert(step.status == codec.yielded and step.work_units == codec.default_work_limit)

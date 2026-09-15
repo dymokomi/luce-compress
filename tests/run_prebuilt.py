@@ -9,6 +9,8 @@ from check_git import check as check_git
 from check_encode import check as check_encode
 from check_work import check as check_work
 from check_stress import check as check_stress
+from check_fuzz import check as check_fuzz
+from check_large import check as check_large
 
 
 def main():
@@ -16,7 +18,7 @@ def main():
     parser.add_argument("binaries", type=Path)
     args = parser.parse_args()
     binaries = args.binaries.resolve()
-    for name in ["native", "facade", "driver", "stream-tests", "stream-driver", "encoder-tests", "encode-driver", "failure-tests", "work-tests", "stress-driver"]:
+    for name in ["native", "facade", "driver", "stream-tests", "stream-driver", "encoder-tests", "encode-driver", "failure-tests", "work-tests", "stress-driver", "fuzz-driver", "file-driver"]:
         if not (binaries / name).is_file():
             raise SystemExit(f"missing {name}")
     for name in ["native", "facade", "stream-tests", "encoder-tests", "failure-tests", "work-tests"]:
@@ -27,6 +29,8 @@ def main():
     check_encode(binaries / "encode-driver")
     check_work(binaries / "stream-driver", binaries / "encode-driver")
     check_stress(binaries / "stress-driver")
+    check_fuzz(binaries / "fuzz-driver")
+    check_large(binaries / "file-driver")
     print("PASS prebuilt compression suite", flush=True)
 
 

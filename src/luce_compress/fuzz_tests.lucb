@@ -1,0 +1,98 @@
+## Test-only bounded batch format; Python/zlib supplies independent expectations.
+import compress_native as codec
+import compress
+import luce_compress.binary as binary
+import files
+import memory
+import c
+
+func check(reader: binary.Reader*) -> !:
+    let identity = try reader.uint(4)
+    let wrapped = try reader.uint(4)
+    let valid = try reader.uint(4)
+    let size = try reader.uint(4)
+    let expected_size = try reader.uint(4)
+    let expected_consumed = try reader.uint(4)
+    let max_input = try reader.uint(4)
+    let max_output = try reader.uint(4)
+    var seed = (u32)(try reader.uint(4))
+    assert(wrapped <= 1 and valid <= 1 and seed != 0)
+    assert(size <= 262144 and expected_size <= 65536 and max_input <= 262144 and max_output <= 65536)
+    assert(expected_consumed <= size)
+    let packed = try reader.take((usize)size)
+    let expected = try reader.take((usize)expected_size)
+    print(f"CASE {identity}")
+    var decoder = try codec.make_decoder("zlib" if wrapped == 1 else "raw", (i64)max_input, (i64)max_output)
+    defer decoder.close()
+    var input: u8[257]
+    var output: u8[258]
+    var consumed: usize
+    var produced: usize
+    var calls: u64
+    var units: u64
+    let late = seed % 2 == 1
+    while true:
+        assert(calls <= 64 * (size + max_output + 1024))
+        seed ^= seed << 13
+        seed ^= seed >> 17
+        seed ^= seed << 5
+        var count: usize = 0 if calls % 7 == 0 else 1 + (usize)(seed % 257)
+        if count > packed.length - consumed: count = packed.length - consumed
+        let capacity: usize = 0 if calls % 5 == 0 else 1 + (usize)((seed >> 8) % 257)
+        let allowance: i64 = 4096 if calls % 11 == 0 else 1 + (i64)((seed >> 16) % 31)
+        for index in 0..<count: input[index] = packed[consumed + index]
+        output[capacity] = 173
+        let last = consumed == packed.length if late else consumed + count == packed.length
+        var rejected = false
+        let step = decoder.step(input[..<count], output[..<capacity], last, allowance) catch failure:
+            assert(failure.code == compress.corrupt or failure.code == compress.unsupported or failure.code == compress.limit_exceeded)
+            if valid == 1: print(f"UNEXPECTED_REJECT {identity} {failure.message}")
+            assert(valid == 0 and decoder.statistics().failed)
+            rejected = true
+            recover codec.Step()
+        let stats = decoder.statistics()
+        assert(stats.input_bytes <= (i64)max_input and stats.output_bytes <= (i64)max_output)
+        assert(output[capacity] == 173)
+        if rejected:
+            var poisoned = false
+            discard(decoder.step(b"", output) catch failure:
+                assert(failure.code == compress.corrupt)
+                poisoned = true
+                recover codec.Step())
+            assert(poisoned)
+            try decoder.reset()
+            assert(not decoder.statistics().failed and decoder.statistics().input_bytes == 0 and decoder.statistics().output_bytes == 0)
+            return
+        assert(step.work_units > 0 and step.work_units <= allowance)
+        assert(step.consumed >= 0 and (usize)step.consumed <= count and step.consumed <= 8 * step.work_units)
+        assert(step.produced >= 0 and (usize)step.produced <= capacity and step.produced <= 258 * step.work_units)
+        units += (u64)step.work_units
+        assert(units <= 64 * (size + max_output + 1024))
+        if valid == 1:
+            assert(produced <= expected.length and (usize)step.produced <= expected.length - produced)
+            for index in 0..<(usize)step.produced: assert(output[index] == expected[produced + index])
+        for index in 0..<count: input[index] = 221
+        for index in 0..<(usize)step.produced: output[index] = 222
+        consumed += (usize)step.consumed
+        produced += (usize)step.produced
+        assert(stats.input_bytes == (i64)consumed and stats.output_bytes == (i64)produced and not stats.failed)
+        calls += 1
+        if step.status == codec.finished:
+            assert(valid == 1 and stats.finished and consumed == (usize)expected_consumed and produced == expected.length)
+            return
+        if step.status == codec.need_input: assert((usize)step.consumed == count)
+        elif step.status == codec.need_output: assert((usize)step.produced == capacity)
+        else: assert(step.status == codec.yielded and step.work_units == allowance)
+
+pub func main(arguments: str[]) -> i32!:
+    assert(arguments.length == 2)
+    let data = try files.read_limit((c.str)arguments[1], 16777216)
+    defer free(data) in memory.heap
+    var reader = binary.Reader(data = data)
+    assert((str)(try reader.take(8)) == "LCFZ01\0\0")
+    let count = try reader.uint(4)
+    assert(count > 0 and count <= 128)
+    for index in 0..<(usize)count: try check(&reader)
+    assert(reader.position == data.length)
+    print(f"PASS batch {count}")
+    return 0
