@@ -5,7 +5,8 @@ MIT OR Apache-2.0; see [provenance](NOTICE.md) for the retained MIT source notic
 No zlib/C codec, foreign library or compression subprocess in the runtime.
 
 **Experimental M1a work: whole-buffer zlib encoding/decoding and incremental
-raw-DEFLATE/zlib encoding/decoding.** Fault-injection and work/resource gates remain;
+raw-DEFLATE/zlib encoding/decoding, with deterministic allocation-failure tests.**
+Work/resource gates remain;
 this is not yet the completed compression milestone or a full zlib replacement.
 
 ## API
@@ -91,8 +92,9 @@ diagnostics, not authorization or proof that bytes were published.
 
 The facade allocates its output/carrier before stepping, so an allocation error
 cannot discard a successfully advanced step. Invalid facade chunk sizes likewise
-fail before advancing. Explicit allocation-failure injection is still a follow-up;
-sanitizer/lifetime tests are not evidence of every allocator failure path.
+fail before advancing. Deterministic Base-heap failure tests now sweep the actual
+construction/result/growth allocations, including the native reference shell;
+see [failure coverage and its limits](docs/ALLOCATION_FAILURES.md).
 See the [contract](docs/STREAMING_CONTRACT.md) and executable
 [Luce example](tests/facade.luc) / [native tests](src/luce_compress/stream_tests.lucb).
 
@@ -195,9 +197,18 @@ budgets, overwritten spans, canaries, reset/close and concurrent independent own
 Stock Git reads Base-encoded loose objects and validates/indexes a separately framed
 pack; a second empty repository verifies packed reads cannot fall back to loose data.
 
+The separate single-threaded allocation test executable runs 368 failure/retry
+cases. It replaces the test process's Base heap with a fixed-size tracking allocator,
+refuses each allocation in observed traces in both one-shot and persistent-failure
+modes, and verifies exact frees and state-safe retries. It also exercises late
+codec-error cleanup and proves native step/reset/close make no allocation attempts.
+The production library has no test hooks or new allocator dependency. This does
+not simulate process-wide OOM, Luce managed-runtime trap-on-exhaustion, OS resource
+failures, or concurrent replacement of the process-global heap.
+
 ## Next commits
 
-1. Allocator-failure injection and cooperative work budgets.
+1. Cooperative work budgets and bounded cancellation points.
 2. Measured peak memory/latency and further fuzzing. Full threaded Git-consumer
    integration follows in M2a.
 

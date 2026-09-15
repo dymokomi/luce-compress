@@ -33,12 +33,14 @@ def main():
         print(f"MODE {mode}", flush=True)
         for source, name in [(ROOT / "src/luce_compress/native_tests.lucb", "native"), (ROOT / "tests/driver.lucb", "driver"),
                              (ROOT / "src/luce_compress/stream_tests.lucb", "stream-tests"), (ROOT / "tests/stream_driver.lucb", "stream-driver"),
-                             (ROOT / "src/luce_compress/encoder_tests.lucb", "encoder-tests"), (ROOT / "tests/encode_driver.lucb", "encode-driver")]:
+                             (ROOT / "src/luce_compress/encoder_tests.lucb", "encoder-tests"), (ROOT / "tests/encode_driver.lucb", "encode-driver"),
+                             (ROOT / "src/luce_compress/failure_tests.lucb", "failure-tests")]:
             run([args.base.resolve(), "build", source, *flags, "-o", output / name])
         run([args.luce.resolve(), "build", ROOT / "tests/facade.luc", *flags, "-o", output / "facade"])
         run([output / "native"])
         run([output / "stream-tests"])
         run([output / "encoder-tests"])
+        run([output / "failure-tests"])
         run([output / "facade"])
         check(output / "driver")
         check_stream(output / "stream-driver")

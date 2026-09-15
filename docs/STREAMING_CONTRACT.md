@@ -1,7 +1,7 @@
 # Incremental codec contract
 
-The decoder and encoder implement this contract; explicit allocator-failure
-injection and cooperative work limits remain follow-up work. The underlying formats are [RFC 1950](https://www.rfc-editor.org/info/rfc1950/)
+The decoder and encoder implement this contract, including deterministic Base-heap
+failure/retry tests. Cooperative work limits remain follow-up work. The underlying formats are [RFC 1950](https://www.rfc-editor.org/info/rfc1950/)
 and [RFC 1951](https://www.rfc-editor.org/info/rfc1951/).
 
 One decoder owns a fixed 32 KiB history window and bounded Huffman/bit state. It
@@ -63,3 +63,19 @@ real stock-Git loose/packed consumers, progress before EOF, empty final input,
 lookahead/history wrap, output-limited finalization, source/output budgets, lifetime
 and explicit 512 KiB worker stacks. Compression ratio checks distinguish actual
 LZ77 matching from a stored-only implementation; they are not throughput claims.
+
+## Allocation failure and publication
+
+A failed native state allocation leaves no partially constructed public owner.
+For the owning facade, the output buffer, native `Data` and reference shell must
+all be acquired before calling the state machine. Refusal of any one leaves input
+and output counters, failed/finished flags, pending bits/history and declared EOF
+unchanged. The caller may retry that call; no hidden final-input declaration may
+constrain a shorter, nonfinal retry. A core parse/budget failure is different: it
+poisons the stream and the already-allocated result is released without publication.
+
+Native step/reset/close need no allocations, including after the allocator starts
+refusing all requests. Buffer growth refusal preserves the old pointer, capacity,
+used length and bytes. Earlier owning chunks remain valid after later allocation
+or parse errors and state close, but remain quarantined until stream validation.
+The exact tested fault model and exclusions are in [ALLOCATION_FAILURES.md](ALLOCATION_FAILURES.md).

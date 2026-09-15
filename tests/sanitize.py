@@ -25,13 +25,14 @@ def main():
         subprocess.run([str(arg) for arg in command], cwd=ROOT, check=True, timeout=180)
     for source, name in [(ROOT / "src/luce_compress/native_tests.lucb", "native"), (ROOT / "tests/driver.lucb", "driver"),
                          (ROOT / "src/luce_compress/stream_tests.lucb", "stream-tests"), (ROOT / "tests/stream_driver.lucb", "stream-driver"),
-                         (ROOT / "src/luce_compress/encoder_tests.lucb", "encoder-tests"), (ROOT / "tests/encode_driver.lucb", "encode-driver")]:
+                         (ROOT / "src/luce_compress/encoder_tests.lucb", "encoder-tests"), (ROOT / "tests/encode_driver.lucb", "encode-driver"),
+                         (ROOT / "src/luce_compress/failure_tests.lucb", "failure-tests")]:
         generated, executable = output / f"{name}.c", output / name
         run([args.base.resolve(), "build", source, "--emit=c", "-o", generated])
         run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-w", "-fno-strict-aliasing",
              "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", runtime,
              generated, runtime / "lucb_rt.c", "-pthread", "-lm", "-o", executable])
-        if name in ["native", "stream-tests", "encoder-tests"]:
+        if name in ["native", "stream-tests", "encoder-tests", "failure-tests"]:
             run([executable])
         elif name == "driver":
             check(executable)
