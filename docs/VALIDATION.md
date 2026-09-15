@@ -178,3 +178,58 @@ further fuzzing remain. There is no sync/full flush, dictionary, gzip wrapper,
 dynamic-Huffman encoder, tuning-level or asynchronous-cancellation claim. Full Git
 integration is M2a work; registration, hosting and real language CLI acceptance
 remain separate uncompleted gates.
+
+## Deterministic allocation failures — 2026-09-14 PDT / 2026-09-15 UTC
+
+Source/test revision: `bd1d0ec8928dcb527c15bd22d8102fb3efaae09d`.
+[CI run 34925982563](https://github.com/dymokomi/luce-compress/actions/runs/34925982563)
+passed all six compiler modes and AddressSanitizer/UndefinedBehaviorSanitizer on
+Ubuntu 24.04 x86-64 and macOS 15 arm64. The same complete gates passed locally,
+as did the local prebuilt runner. Production codec and language sources did not
+change; this checkpoint adds the failure suite, runner/bundle wiring and contracts.
+
+Each mode now runs **368 counted allocation-failure/retry cases**, in addition to
+the existing **5,072 codec fixtures**, native lifecycle/eight-worker suites and Luce
+consumer. The failure executable also runs under sanitizers and in the prebuilt
+bundle. It uses the existing Base allocator interface in its own single-threaded
+process; there are no production fault hooks or system allocator changes.
+
+Successful allocation traces are replayed with every observed allocation position
+refused once and persistently. A fixed ledger checks exact live pointers/sizes and
+complete cleanup, including the native ownership shell, buffer growth, both encoder
+constructor allocations and late codec-error cleanup. Raw/zlib facades cover initial,
+intermediate/final draining steps, zero-capacity results and finished streams. OOM
+before stepping preserves exact counters/flags and does not latch EOF; retrying
+produces the clean reference bytes. Previously returned chunks survive later errors,
+reset and close. Native step/reset/close make zero requests with an allocator armed
+to refuse its first request. See [ALLOCATION_FAILURES.md](ALLOCATION_FAILURES.md)
+for the precise model and covered paths.
+
+The audited peak of 590,720 requested live bytes matched on both hosts and the VPS.
+This is only the sum inside the test ledger, not RSS, stack/allocator overhead,
+outside fixtures or an aggregate server memory bound. These finite traces do not
+cover every input, OS/libc/startup allocation, managed Luce/GC exhaustion, concurrent
+heap replacement or real host RAM exhaustion. No production defect was found that
+required a codec patch; the separately documented compiler stack limitation remains
+unfixed, and its package workaround now has second-allocation failure evidence.
+
+The verified Linux native-opt-3 bundle has SHA256
+`d736a357cfdf6884dd2cd255bafbb911aba8a2659e3a617148ac44c751e5c28d`.
+Its eight executables and five scripts passed the full prebuilt suite on the existing
+Ubuntu 24.04 VPS after archive-member, revision and per-file hash checks. The same
+transient dynamic-user isolation/resource caps described above were used, without
+dependency installation or network/live-application access. Systemd reported success,
+74.498 seconds elapsed and 18.611 seconds CPU under the 25% quota. These are whole-suite
+smoke observations, not codec performance or production capacity claims.
+
+The exact staging directory was removed and its unit was absent/inactive. All 32
+running service names, Caddy PID/activation/configuration hash and the site's HTTPS
+200/ETag were unchanged. No live data, proxy, DNS or firewall changes occurred.
+Local and hosted logs plus the verified bundle are retained in the owner's ignored
+build directory; the public CI run is linked above.
+
+M1a remains incomplete: cooperative work limits, measured aggregate/peak process
+memory and latency, larger stress workloads and further fuzzing remain. Full Git
+integration, registration, registry deployment and language CLI acceptance are
+separate pending gates. This is not exhaustive OOM, thread-sanitizer or independent
+security-review evidence.
