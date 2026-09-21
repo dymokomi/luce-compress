@@ -23,6 +23,8 @@ def main():
     output = ROOT / "build/sanitize"
     output.mkdir(parents=True, exist_ok=True)
     runtime = ROOT.parent / "luce-base/runtime"
+    os.environ.setdefault("LUCE_STD", str(ROOT.parent / "luce-base/src/std"))
+    os.environ.setdefault("LUCE_CACHE", str(ROOT / "build/cache"))
     os.environ["ASAN_OPTIONS"] = "halt_on_error=1:abort_on_error=1"
     os.environ["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
     def run(command):
