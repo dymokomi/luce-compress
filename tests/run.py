@@ -26,7 +26,9 @@ def main():
     parser.add_argument("--base", type=Path, default=ROOT / "build/toolchain/luce-base")
     parser.add_argument("--luce", type=Path, default=ROOT / "build/toolchain/luce")
     args = parser.parse_args()
-    environment = dict(os.environ, LUCE_BASE=str(args.base.resolve()))
+    environment = dict(os.environ, LUCE_BASE=str(args.base.resolve()),
+                       LUCE_STD=str(ROOT.parent / "luce-base/src/std"),
+                       LUCE_CACHE=str(ROOT / "build/cache"))
     def run(command):
         subprocess.run([str(arg) for arg in command], cwd=ROOT, env=environment, check=True, timeout=180)
     run([sys.executable, ROOT / "tests/test_stress.py"])

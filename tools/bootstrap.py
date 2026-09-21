@@ -7,10 +7,13 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build" / "toolchain"
+ENV = dict(os.environ)
+ENV.setdefault("LUCE_STD", str(ROOT.parent / "luce-base/src/std"))
+ENV.setdefault("LUCE_CACHE", str(ROOT / "build/cache"))
 
 
 def run(args):
-    subprocess.run([str(arg) for arg in args], cwd=ROOT, check=True)
+    subprocess.run([str(arg) for arg in args], cwd=ROOT, env=ENV, check=True)
 
 
 def main():
