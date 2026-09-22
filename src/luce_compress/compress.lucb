@@ -72,6 +72,26 @@ pub func decode(data: const u8[], max_output: i64 = 67108864, allow_trailing: bo
         error(corrupt, "trailing bytes after zlib stream")
     return try owned(output, (i64)used)
 
+## Inflate a whole zlib stream into `output`, which must be exactly the
+## uncompressed size: what image codecs know from their headers. Base only.
+pub func inflate(data: const u8[], output: u8[]) -> !:
+    var buffer = binary.Buffer(maximum = output.length)
+    defer buffer.close()
+    let used = deflate.inflate(data, &buffer) catch failure:
+        error(corrupt if failure.code == limit_exceeded else failure.code, "the zlib stream does not fit its declared size" if failure.code == limit_exceeded else failure.message)
+    if used != data.length or buffer.used != output.length:
+        error(corrupt, "the zlib stream does not match its declared size")
+    memory.copy(output, buffer.view(), output.length)
+
+## Deflate `data` into a fresh zlib stream on the heap; the caller frees it. Base only.
+pub func compress(data: const u8[]) -> u8[]!:
+    var buffer = binary.Buffer(maximum = try binary.checked_limit(1073741824))
+    defer buffer.close()
+    try deflate.compress(data, &buffer)
+    let out = try alloc u8[buffer.used] in memory.heap
+    memory.copy(out, buffer.view(), buffer.used)
+    return out
+
 ## Checksums are corruption checks, not cryptographic integrity/authentication.
 pub func adler32(data: const u8[]) -> i64:
     return (i64)deflate.adler32(data)
@@ -161,3 +181,18 @@ pub struct Deflater:
         self.state.close()
 
 pub let deflater_type: interop.Type[Deflater] = interop.Type[Deflater]("Deflater", Deflater.close, closeable = true)
+
+test "whole-buffer inflate and compress round trip and reject a wrong size":
+    let raw = b"the quick brown fox jumps over the lazy dog, again and again and again"
+    let packed = try compress(raw)
+    defer free(packed) in memory.heap
+    let out = try alloc u8[raw.length] in memory.heap
+    defer free(out) in memory.heap
+    try inflate(packed, out)
+    assert((str)out == (str)raw)
+    var short: u8[10]
+    var rejected = false
+    inflate(packed, short) catch failure:
+        assert(failure.code == corrupt)
+        rejected = true
+    assert(rejected)
