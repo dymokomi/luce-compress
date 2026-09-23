@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-compress" {
     str owner = "dymokomi"
-    str version = "0.1.3"
+    str version = "0.1.4"
     str kind = "package"
     str language = "luce-base"
     str description = "Native Luce Base compression primitives with an owning Luce API. MIT OR Apache-2.0; see provenance for the retained MIT source notice. No zlib/C codec, foreign library or compression subprocess in the runtime."
@@ -13,5 +13,11 @@ def package "luce-compress" {
 
     def export "compress_native" {
         str module = "luce_compress.native"
+    }
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-std"
     }
 }
