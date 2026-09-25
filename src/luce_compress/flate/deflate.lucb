@@ -1,0 +1,279 @@
+#==============================================================================================
+#
+#   flate/deflate - The matcher and segment compressor
+#
+#   DESCRIPTION:
+#       zlib's algorithm and level table: 3-byte hash chains over a 32 KiB window, greedy
+#       matching at levels 1..3 and lazy matching (a match is kept only if the next
+#       position does not start a longer one) at 4..9. Matches compare eight bytes at a
+#       time. Blocks close every 16383 symbols.
+#
+#==============================================================================================
+
+## zlib's configuration table: good length, lazy length, nice length, chain length.
+let level_good: u16[10] = [0, 4, 4, 4, 4, 8, 8, 8, 32, 32]
+let level_lazy: u16[10] = [0, 4, 5, 6, 4, 16, 16, 32, 128, 258]
+let level_nice: u16[10] = [0, 8, 16, 32, 16, 32, 128, 128, 258, 258]
+let level_chain: u16[10] = [0, 4, 8, 32, 16, 32, 128, 256, 1024, 4096]
+
+let window: usize = 32768
+## Hash table size: 2^17 heads keep chains to true matches rather than collisions.
+let hash_bits: u32 = 17
+let block_symbols: usize = 16383
+
+## The most a segment of `n` bytes can take compressed (stored, with its headers).
+pub func deflate_bound(n: usize) -> usize:
+    return n + n // 2048 + 64
+
+## Compress `input` as one DEFLATE segment with a fresh window into `output` (at
+## least `deflate_bound` bytes) at `level` 0..9; the bytes written. The segment
+## ends in a final block when `last`, else in a sync flush (an empty stored block),
+## so segments concatenate into one stream.
+pub func deflate_raw(input: const u8[], level: i32, output: u8[], last: bool) -> usize!:
+    if level < 0 or level > 9:
+        error(invalid, "deflate level must be 0 through 9")
+    let n = input.length
+    if output.length < deflate_bound(n):
+        error(limit, "deflate output is smaller than deflate_bound")
+    var c = Compressor(symbols = Symbols.make(), w = Writer(out = output.data, pos = 0, acc = 0, bits = 0))
+    defer c.close()
+    try c.open(n, level)
+    let data = input.data
+    if level == 0:
+        write_stored(&c.w, data, 0, n, last)
+    elif level <= 3:
+        try c.greedy(data, n, last)
+    else:
+        try c.lazy(data, n, last)
+    if not last:
+        c.w.put(0, 3)
+        c.w.align()
+        for byte in [0, 0, 255, 255]:
+            c.w.out[c.w.pos] = (u8)byte
+            c.w.pos += 1
+    c.w.align()
+    return c.w.pos
+
+## A zlib stream of `input` at `level` into `output` (at least `deflate_bound`
+## plus 6 bytes): header, one segment and the Adler-32; the bytes written.
+pub func deflate_zlib(input: const u8[], level: i32, output: u8[]) -> usize!:
+    if output.length < deflate_bound(input.length) + 6:
+        error(limit, "deflate output is smaller than deflate_bound")
+    let header = zlib_header(level)
+    output[0] = header[0]
+    output[1] = header[1]
+    let used = 2 + try deflate_raw(input, level, output[2..], true)
+    let adler = adler32(input)
+    output[used] = (u8)(adler >> 24)
+    output[used + 1] = (u8)(adler >> 16)
+    output[used + 2] = (u8)(adler >> 8)
+    output[used + 3] = (u8)adler
+    return used + 4
+
+## A zlib stream's payload inflated into exactly `output`, header and Adler-32
+## checked; the bytes of `data` it used.
+pub func inflate_zlib(data: const u8[], output: u8[]) -> usize!:
+    if data.length < 6 or (data[0] & 15) != 8 or data[0] >> 4 > 7 or (((u32)data[0] << 8) | (u32)data[1]) % 31 != 0:
+        error(corrupt, "invalid zlib header")
+    if (data[1] & 32) != 0:
+        error(corrupt, "preset zlib dictionaries are not supported")
+    let used = try inflate_raw(data[2..], output)
+    let at = 2 + used
+    if data.length - at < 4:
+        error(corrupt, "truncated zlib stream")
+    let stored = ((u32)data[at] << 24) | ((u32)data[at + 1] << 16) | ((u32)data[at + 2] << 8) | (u32)data[at + 3]
+    if stored != adler32(output):
+        error(corrupt, "zlib Adler checksum mismatch")
+    return at + 4
+
+struct Compressor:
+    var symbols: Symbols
+    var head: i32[]
+    var prev: i32[]
+    var block: Block
+    var w: Writer
+    var level: usize
+    var chain: usize
+    var good: usize
+    var nice: usize
+    var lazy_limit: usize
+    ## Input the current block starts at.
+    var block_start: usize
+
+    mutating func open(n: usize, level: i32) -> !:
+        self.level = (usize)level
+        self.chain = (usize)level_chain[self.level]
+        self.good = (usize)level_good[self.level]
+        self.nice = (usize)level_nice[self.level]
+        self.lazy_limit = (usize)level_lazy[self.level]
+        self.block.litlen = try alloc u16[block_symbols + 1] in memory.heap
+        self.block.distance = try alloc u16[block_symbols + 1] in memory.heap
+        self.block.clear()
+        if level > 0:
+            self.head = try alloc i32[(usize)1 << hash_bits] in memory.heap
+            for i in 0..<self.head.length:
+                self.head[i] = -1
+            self.prev = try alloc i32[n + 1] in memory.heap
+
+    mutating func close():
+        if self.head.length > 0:
+            free(self.head) in memory.heap
+        if self.prev.length > 0:
+            free(self.prev) in memory.heap
+        if self.block.litlen.length > 0:
+            free(self.block.litlen) in memory.heap
+        if self.block.distance.length > 0:
+            free(self.block.distance) in memory.heap
+
+    ## Write the block of symbols so far, covering input up to `end`.
+    mutating func flush(data: const u8*, start: usize, end: usize, final_block: bool) -> !:
+        write_block(&self.w, &self.block, &self.symbols, data, start, end, final_block)
+        self.block.clear()
+        self.block_start = end
+
+    mutating func literal(value: u8):
+        let b = &self.block
+        b.litlen[b.count] = (u16)value
+        b.distance[b.count] = 0
+        b.count += 1
+        b.literal_freq[(usize)value] += 1
+
+    mutating func matched(length: usize, distance: usize):
+        let b = &self.block
+        b.litlen[b.count] = (u16)length
+        b.distance[b.count] = (u16)distance
+        b.count += 1
+        b.literal_freq[257 + (usize)self.symbols.length_code[length]] += 1
+        b.distance_freq[self.symbols.distance_code(distance)] += 1
+
+    ## Enter position `p` (with four bytes ahead) in the hash chains; the previous
+    ## position with the same hash, or -1. Four bytes, as zlib-ng hashes, make far
+    ## shorter chains than three on image data for a sliver of compression.
+    mutating func insert(data: const u8*, p: usize) -> i32:
+        let key = *(const u32*)(data + p)
+        let h = (usize)((key *% 2654435761) >> (32 - hash_bits))
+        let earlier = self.head[h]
+        self.prev[p] = earlier
+        self.head[h] = (i32)p
+        return earlier
+
+    ## The longest match at `p` among the chain from `candidate`, better than
+    ## `best` (else 0); its distance. A candidate must share the first four bytes
+    ## and the byte just past the best so far before it is measured.
+    func longest(data: const u8*, n: usize, p: usize, candidate: i32, best: usize) -> (usize, usize):
+        let most = n - p if n - p < 258 else 258
+        if most < 4:
+            return (0, 0)
+        var length = best if best >= 3 else 3
+        var distance: usize = 0
+        var chain = self.chain >> 2 if best >= self.good else self.chain
+        var cur = candidate
+        let here = data + p
+        let head4 = *(const u32*)here
+        let prev = self.prev.data
+        let nice = self.nice
+        # The byte just past the best length, which a longer match must share.
+        var want = here[length] if length < most else 0
+        let lowest = p - window if p > window else 0
+        while cur >= 0 and chain > 0:
+            let at = (usize)cur
+            if at < lowest:
+                break
+            let there = data + at
+            if there[length] == want and *(const u32*)there == head4 and length < most:
+                let found = match_length(there + 4, here + 4, most - 4) + 4
+                if found > length:
+                    length = found
+                    distance = p - at
+                    if found >= nice or found >= most:
+                        break
+                    want = here[length]
+            cur = prev[at]
+            chain = chain -% 1
+        return (length, distance) if distance > 0 else (0, 0)
+
+    mutating func greedy(data: const u8*, n: usize, last: bool) -> !:
+        var p: usize = 0
+        while p < n:
+            var length: usize = 0
+            var distance: usize = 0
+            if p + 4 <= n:
+                let candidate = self.insert(data, p)
+                if candidate >= 0:
+                    let (found, d) = self.longest(data, n, p, candidate, 2)
+                    length = found
+                    distance = d
+            if length >= 3 and not (length == 3 and distance > 4096):
+                self.matched(length, distance)
+                if length <= self.lazy_limit:
+                    for k in 1..<length:
+                        if p + k + 4 <= n:
+                            discard(self.insert(data, p + k))
+                p += length
+            else:
+                self.literal(data[p])
+                p += 1
+            if self.block.count >= block_symbols:
+                try self.flush(data, self.block_start, p, false)
+        try self.flush(data, self.block_start, n, last)
+
+    mutating func lazy(data: const u8*, n: usize, last: bool) -> !:
+        var p: usize = 0
+        var previous_length: usize = 2
+        var previous_distance: usize = 0
+        var pending = false
+        while p < n:
+            var length: usize = 2
+            var distance: usize = 0
+            if p + 4 <= n:
+                let candidate = self.insert(data, p)
+                if candidate >= 0 and previous_length < self.lazy_limit:
+                    let (found, d) = self.longest(data, n, p, candidate, previous_length)
+                    if found > 0:
+                        length = found
+                        distance = d
+                        if length == 3 and distance > 4096:
+                            length = 2
+            if previous_length >= 3 and length <= previous_length:
+                # The match at p - 1 wins: emit it and enter the positions it covers.
+                self.matched(previous_length, previous_distance)
+                let end = p - 1 + previous_length
+                var k = p + 1
+                while k < end:
+                    if k + 4 <= n:
+                        discard(self.insert(data, k))
+                    k += 1
+                p = end
+                pending = false
+                previous_length = 2
+            else:
+                if pending:
+                    self.literal(data[p - 1])
+                pending = true
+                previous_length = length
+                previous_distance = distance
+                p += 1
+            if self.block.count >= block_symbols:
+                let covered = p - 1 if pending else p
+                try self.flush(data, self.block_start, covered, false)
+        if pending:
+            self.literal(data[n - 1])
+        try self.flush(data, self.block_start, n, last)
+
+## Bytes equal at the start of `a` and `b`, at most `most`.
+func match_length(a: const u8*, b: const u8*, most: usize) -> usize:
+    var n: usize = 0
+    while n + 8 <= most:
+        let x = *(const u64*)(a + n) ^ *(const u64*)(b + n)
+        if x != 0:
+            return n + lowest_bit(x) // 8
+        n += 8
+    while n < most and a[n] == b[n]:
+        n += 1
+    return n
+
+## The index of the lowest set bit of a nonzero word.
+func lowest_bit(x: u64) -> usize:
+    return (usize)debruijn[(usize)(((x & -%x) *% 0x03F79D71B4CB0A89) >> 58)]
+
+let debruijn: u8[64] = [0, 1, 48, 2, 57, 49, 28, 3, 61, 58, 50, 42, 38, 29, 17, 4, 62, 55, 59, 36, 53, 51, 43, 22, 45, 39, 33, 30, 24, 18, 12, 5, 63, 47, 56, 27, 60, 41, 37, 16, 54, 35, 52, 21, 44, 32, 23, 11, 46, 26, 40, 15, 34, 20, 31, 10, 25, 14, 19, 9, 13, 8, 7, 6]

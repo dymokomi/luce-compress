@@ -145,6 +145,36 @@ No sync/full-flush operation, dictionary, dynamic-Huffman encoder or tuning leve
 is exposed. Git compatibility tests cover zlib loose objects and undeltified pack
 entries only, not a production Git engine.
 
+## Fast whole-buffer DEFLATE for codecs (`flate`)
+
+`import flate` (Base) is for callers that know their sizes and frame their own data,
+as PNG, TIFF and OpenEXR do:
+
+```luce
+import flate
+
+let out = try alloc u8[flate.deflate_bound(data.length) + 6] in memory.heap
+let used = try flate.deflate_zlib(data, 6, out)          # a zlib stream at level 0..9
+try flate.inflate_zlib(out[..<used], plain)              # into exactly the plain size
+
+# Independent segments (a fresh window each), joined into one stream as pigz does:
+var at = try flate.deflate_raw(first, 6, buffer, false)  # ends in a sync flush
+at += try flate.deflate_raw(second, 6, buffer[at..], true)
+let adler = flate.adler32_combine(flate.adler32(first), flate.adler32(second), second.length)
+```
+
+- `inflate_raw(data, output, progress = none, context = none) -> usize` decodes raw
+  DEFLATE into exactly `output` through 12-bit lookup tables and a 64-bit bit buffer,
+  returning the input it used; it stops after a final block or at the end of the
+  input (a segment). `progress(context, bytes)` hears of every 256 KiB, for callers
+  that work on the output as it arrives. `inflate_zlib` adds the header and Adler-32.
+- `deflate_raw(input, level, output, last) -> usize` is zlib's algorithm and level
+  table with four-byte hash chains: greedy matching at levels 1..3, lazy at 4..9,
+  and each block written dynamic, fixed or stored, whichever is smallest. Files come
+  out within a percent of zlib's at the same level (usually smaller) in less time.
+- `crc32(data, crc = 0)` (slicing by eight), `adler32(data, adler = 1)` and
+  `adler32_combine` run several bytes a step.
+
 ## Bounds and errors
 
 For the whole-buffer API, input is limited to 1 GiB; the output bound defaults to

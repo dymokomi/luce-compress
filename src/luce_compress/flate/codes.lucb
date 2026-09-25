@@ -1,0 +1,339 @@
+#==============================================================================================
+#
+#   flate/codes - Huffman code lengths and block writing
+#
+#   DESCRIPTION:
+#       A block's symbols become a dynamic Huffman block, a fixed one, or stored bytes,
+#       whichever is fewest bits. Code lengths come from a two-queue Huffman build over
+#       the sorted frequencies, limited to 15 (or 7) bits by moving leaf pairs up the
+#       tree as ITU T.81 Annex K.3 does, then given to symbols in frequency order.
+#
+#==============================================================================================
+
+## Output bits, least significant first, into bytes at `out` (room is the caller's).
+struct Writer:
+    var out: u8*
+    var pos: usize
+    var acc: u64
+    var bits: u32
+
+    ## `count` bits (at most 32) of `value`.
+    mutating func put(value: u64, count: u32):
+        self.acc |= value << (u64)self.bits
+        self.bits += count
+        if self.bits >= 32:
+            *(u32*)(self.out + self.pos) = (u32)self.acc
+            self.pos += 4
+            self.acc >>= 32
+            self.bits -= 32
+
+    ## Pad to a byte with zeros and write out what is pending.
+    mutating func align():
+        while self.bits > 0:
+            self.out[self.pos] = (u8)self.acc
+            self.pos += 1
+            self.acc >>= 8
+            self.bits = self.bits - 8 if self.bits > 8 else 0
+        self.acc = 0
+
+## Symbols of one block: a literal byte (distance 0), or a match length 3..258 and
+## its distance, with their frequencies.
+struct Block:
+    var litlen: u16[]
+    var distance: u16[]
+    var count: usize
+    var literal_freq: u32[286]
+    var distance_freq: u32[30]
+
+    mutating func clear():
+        self.count = 0
+        for i in 0..<(usize)286:
+            self.literal_freq[i] = 0
+        for i in 0..<(usize)30:
+            self.distance_freq[i] = 0
+
+## Length and distance symbols of every match length and distance.
+struct Symbols:
+    ## Length 0..258 to length symbol less 257.
+    var length_code: u8[259]
+    ## Distance-1 below 256, and (distance-1) >> 7 above, to distance symbol.
+    var near: u8[256]
+    var far: u8[256]
+
+    static func make() -> Symbols:
+        var s = Symbols()
+        for code in 0..<(usize)29:
+            let base = (usize)length_base[code]
+            let span = (usize)1 << (usize)length_extra[code]
+            for length in base..<base + span:
+                if length <= 258:
+                    s.length_code[length] = (u8)code
+        s.length_code[258] = 28
+        for code in 0..<(usize)30:
+            let base = (usize)distance_base[code]
+            let span = (usize)1 << (usize)distance_extra[code]
+            for d in base..<base + span:
+                if d <= 256:
+                    s.near[d - 1] = (u8)code
+                else:
+                    s.far[(d - 1) >> 7] = (u8)code
+        return s
+
+    func distance_code(d: usize) -> usize:
+        return (usize)self.near[d - 1] if d <= 256 else (usize)self.far[(d - 1) >> 7]
+
+## Code lengths of at most `most` bits for `freq[0..<n]` into `lengths`; with
+## fewer than two symbols used, two codes of one bit.
+func huffman_lengths(freq: const u32*, n: usize, most: usize, lengths: u8*):
+    var order: u16[320]
+    var count: usize = 0
+    for i in 0..<n:
+        lengths[i] = 0
+        if freq[i] > 0:
+            order[count] = (u16)i
+            count += 1
+    if count < 2:
+        let only = (usize)order[0] if count == 1 else 0
+        lengths[only] = 1
+        lengths[1 if only == 0 else 0] = 1
+        return
+    # Leaves by frequency, ties by symbol.
+    for i in 1..<count:
+        let symbol = order[i]
+        let weight = freq[(usize)symbol]
+        var j = i
+        while j > 0 and freq[(usize)order[j - 1]] > weight:
+            order[j] = order[j - 1]
+            j -= 1
+        order[j] = symbol
+    # Two queues: sorted leaves, and internal nodes made in increasing weight.
+    var weight: u64[640]
+    var parent: u16[640]
+    for i in 0..<count:
+        weight[i] = (u64)freq[(usize)order[i]]
+    var leaf: usize = 0
+    var inner = count
+    var made = count
+    while made < 2 * count - 1:
+        var pick: usize[2]
+        for k in 0..<(usize)2:
+            if leaf < count and (inner >= made or weight[leaf] <= weight[inner]):
+                pick[k] = leaf
+                leaf += 1
+            else:
+                pick[k] = inner
+                inner += 1
+        weight[made] = weight[pick[0]] + weight[pick[1]]
+        parent[pick[0]] = (u16)made
+        parent[pick[1]] = (u16)made
+        made += 1
+    var depth: u16[640]
+    let root = 2 * count - 2
+    depth[root] = 0
+    var node = root
+    var deepest: usize = 0
+    while node > 0:
+        node -= 1
+        depth[node] = depth[(usize)parent[node]] + 1
+        if node < count and (usize)depth[node] > deepest:
+            deepest = (usize)depth[node]
+    if deepest <= most:
+        for i in 0..<count:
+            lengths[(usize)order[i]] = (u8)depth[i]
+        return
+    # Too deep: move leaf pairs up (Annex K.3), then the shortest codes go to the
+    # most frequent symbols.
+    var bits: i32[320]
+    for i in 0..<count:
+        bits[(usize)depth[i]] += 1
+    var i = deepest
+    while i > most:
+        while bits[i] > 0:
+            var j = i - 2
+            while bits[j] == 0:
+                j -= 1
+            bits[i] -= 2
+            bits[i - 1] += 1
+            bits[j + 1] += 2
+            bits[j] -= 1
+        i -= 1
+    var next = count
+    for length in 1..<most + 1:
+        for k in 0..<(usize)bits[length]:
+            next -= 1
+            lengths[(usize)order[next]] = (u8)length
+
+## Canonical codes for `lengths[0..<n]`, bit-reversed for writing.
+func canonical_codes(lengths: const u8*, n: usize, codes: u16*):
+    var counts: u16[16]
+    for i in 0..<n:
+        counts[(usize)lengths[i]] += 1
+    counts[0] = 0
+    var next: u16[16]
+    var code: u16 = 0
+    for b in 1..<(usize)16:
+        code = (code + counts[b - 1]) << 1
+        next[b] = code
+    for i in 0..<n:
+        let length = (usize)lengths[i]
+        if length == 0:
+            continue
+        let c = next[length]
+        next[length] += 1
+        var reversed: u16 = 0
+        for b in 0..<length:
+            reversed = (reversed << 1) | ((c >> (u16)b) & 1)
+        codes[i] = reversed
+
+## `input[start..<end]` as stored blocks of at most 65535 bytes.
+func write_stored(w: Writer*, input: const u8*, start: usize, end: usize, final_block: bool):
+    let length = end - start
+    let chunks = (length + 65534) // 65535 if length > 0 else 1
+    var at = start
+    for c in 0..<chunks:
+        let piece = end - at if end - at < 65535 else 65535
+        w.put((u64)(1 if final_block and c + 1 == chunks else 0), 3)
+        w.align()
+        w.out[w.pos] = (u8)piece
+        w.out[w.pos + 1] = (u8)(piece >> 8)
+        w.out[w.pos + 2] = (u8)(~piece)
+        w.out[w.pos + 3] = (u8)(~piece >> 8)
+        w.pos += 4
+        memory.copy(u8[](w.out + w.pos, piece), u8[]((u8*)(input + at), piece), piece)
+        w.pos += piece
+        at += piece
+
+## Write `block`, whose symbols cover `input[start..<end]`, as the cheapest of a
+## dynamic, fixed or stored block.
+func write_block(w: Writer*, block: Block*, symbols: const Symbols*, input: const u8*, start: usize, end: usize, final_block: bool):
+    block.literal_freq[256] += 1
+    var literal_lengths: u8[288]
+    var distance_lengths: u8[30]
+    huffman_lengths(&block.literal_freq[0], 286, 15, &literal_lengths[0])
+    huffman_lengths(&block.distance_freq[0], 30, 15, &distance_lengths[0])
+    var nlit: usize = 286
+    while nlit > 257 and literal_lengths[nlit - 1] == 0:
+        nlit -= 1
+    var ndist: usize = 30
+    while ndist > 1 and distance_lengths[ndist - 1] == 0:
+        ndist -= 1
+    # The code lengths, run-length coded with symbols 16, 17 and 18.
+    var all: u8[316]
+    for i in 0..<nlit:
+        all[i] = literal_lengths[i]
+    for i in 0..<ndist:
+        all[nlit + i] = distance_lengths[i]
+    let total = nlit + ndist
+    var rle: u8[316]
+    var rle_extra: u8[316]
+    var runs: usize = 0
+    var code_freq: u32[19]
+    var i: usize = 0
+    while i < total:
+        let value = all[i]
+        var run: usize = 1
+        while i + run < total and all[i + run] == value:
+            run += 1
+        var left = run
+        if value == 0:
+            while left >= 11:
+                let take = left if left < 138 else 138
+                rle[runs] = 18
+                rle_extra[runs] = (u8)(take - 11)
+                runs += 1
+                left -= take
+            if left >= 3:
+                rle[runs] = 17
+                rle_extra[runs] = (u8)(left - 3)
+                runs += 1
+                left = 0
+        else:
+            rle[runs] = value
+            runs += 1
+            left -= 1
+            while left >= 3:
+                let take = left if left < 6 else 6
+                rle[runs] = 16
+                rle_extra[runs] = (u8)(take - 3)
+                runs += 1
+                left -= take
+        while left > 0:
+            rle[runs] = value
+            runs += 1
+            left -= 1
+        i += run
+    for r in 0..<runs:
+        code_freq[(usize)rle[r]] += 1
+    var code_lengths: u8[19]
+    huffman_lengths(&code_freq[0], 19, 7, &code_lengths[0])
+    var ncode: usize = 19
+    while ncode > 4 and code_lengths[code_order[ncode - 1]] == 0:
+        ncode -= 1
+    # Bits each way.
+    var data_bits: u64 = 0
+    var fixed_bits: u64 = 0
+    for s in 0..<(usize)286:
+        let f = (u64)block.literal_freq[s]
+        if f == 0:
+            continue
+        let extra = (u64)length_extra[s - 257] if s >= 257 else 0
+        data_bits += f * ((u64)literal_lengths[s] + extra)
+        let fixed = 8 if s < 144 else 9 if s < 256 else 7 if s < 280 else 8
+        fixed_bits += f * ((u64)fixed + extra)
+    for s in 0..<(usize)30:
+        let f = (u64)block.distance_freq[s]
+        data_bits += f * ((u64)distance_lengths[s] + (u64)distance_extra[s])
+        fixed_bits += f * (5 + (u64)distance_extra[s])
+    var header_bits: u64 = 17 + 3 * (u64)ncode
+    for r in 0..<runs:
+        let symbol = (usize)rle[r]
+        header_bits += (u64)code_lengths[symbol] + (2 if symbol == 16 else 3 if symbol == 17 else 7 if symbol == 18 else 0)
+    let dynamic = 3 + header_bits + data_bits
+    let fixed = 3 + fixed_bits
+    let length = end - start
+    let chunks = (length + 65534) // 65535 if length > 0 else 1
+    let stored = (u64)chunks * 40 + 8 * (u64)length + 7
+    if stored <= dynamic and stored <= fixed:
+        write_stored(w, input, start, end, final_block)
+        return
+    var literal_codes: u16[288]
+    var distance_codes: u16[30]
+    if fixed < dynamic:
+        w.put((u64)(1 if final_block else 0) | 2, 3)
+        # All 288 fixed codes count toward the canonical assignment.
+        for s in 0..<(usize)288:
+            literal_lengths[s] = (u8)(8 if s < 144 else 9 if s < 256 else 7 if s < 280 else 8)
+        for s in 0..<(usize)30:
+            distance_lengths[s] = 5
+    else:
+        w.put((u64)(1 if final_block else 0) | 4, 3)
+        w.put((u64)(nlit - 257), 5)
+        w.put((u64)(ndist - 1), 5)
+        w.put((u64)(ncode - 4), 4)
+        for k in 0..<ncode:
+            w.put((u64)code_lengths[code_order[k]], 3)
+        var cl_codes: u16[19]
+        canonical_codes(&code_lengths[0], 19, &cl_codes[0])
+        for r in 0..<runs:
+            let symbol = (usize)rle[r]
+            w.put((u64)cl_codes[symbol], (u32)code_lengths[symbol])
+            if symbol >= 16:
+                w.put((u64)rle_extra[r], 2 if symbol == 16 else 3 if symbol == 17 else 7)
+    canonical_codes(&literal_lengths[0], 288 if fixed < dynamic else 286, &literal_codes[0])
+    canonical_codes(&distance_lengths[0], 30, &distance_codes[0])
+    # The symbols, each with its extra bits in one write.
+    let litlen = block.litlen.data
+    let distances = block.distance.data
+    for k in 0..<block.count:
+        let value = (usize)litlen[k]
+        let d = (usize)distances[k]
+        if d == 0:
+            w.put((u64)literal_codes[value], (u32)literal_lengths[value])
+            continue
+        let lc = (usize)symbols.length_code[value]
+        let lextra = (u32)length_extra[lc]
+        w.put((u64)literal_codes[257 + lc] | ((u64)(value - (usize)length_base[lc]) << (u64)literal_lengths[257 + lc]), (u32)literal_lengths[257 + lc] + lextra)
+        let dc = symbols.distance_code(d)
+        let dextra = (u32)distance_extra[dc]
+        w.put((u64)distance_codes[dc] | ((u64)(d - (usize)distance_base[dc]) << (u64)distance_lengths[dc]), (u32)distance_lengths[dc] + dextra)
+    w.put((u64)literal_codes[256], (u32)literal_lengths[256])

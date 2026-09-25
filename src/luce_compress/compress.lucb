@@ -5,6 +5,7 @@ import luce_compress.binary as binary
 import luce_compress.deflate as deflate
 import luce_compress.decoder as decoder
 import luce_compress.encoder as encoder
+import luce_compress.flate as flate
 
 pub let invalid = binary.invalid
 pub let corrupt = binary.corrupt
@@ -73,15 +74,13 @@ pub func decode(data: const u8[], max_output: i64 = 67108864, allow_trailing: bo
     return try owned(output, (i64)used)
 
 ## Inflate a whole zlib stream into `output`, which must be exactly the
-## uncompressed size: what image codecs know from their headers. Base only.
+## uncompressed size: what image codecs know from their headers. Base only; the
+## table-driven decoder of `flate`.
 pub func inflate(data: const u8[], output: u8[]) -> !:
-    var buffer = binary.Buffer(maximum = output.length)
-    defer buffer.close()
-    let used = deflate.inflate(data, &buffer) catch failure:
-        error(corrupt if failure.code == limit_exceeded else failure.code, "the zlib stream does not fit its declared size" if failure.code == limit_exceeded else failure.message)
-    if used != data.length or buffer.used != output.length:
+    let used = flate.inflate_zlib(data, output) catch failure:
+        error(corrupt, failure.message)
+    if used != data.length:
         error(corrupt, "the zlib stream does not match its declared size")
-    memory.copy(output, buffer.view(), output.length)
 
 ## Deflate `data` into a fresh zlib stream on the heap; the caller frees it. Base only.
 pub func compress(data: const u8[]) -> u8[]!:

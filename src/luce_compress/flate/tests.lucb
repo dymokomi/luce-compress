@@ -1,0 +1,58 @@
+#==============================================================================================
+#
+#   flate/tests - The module's tests
+#
+#==============================================================================================
+
+test "checksums match their definitions":
+    assert(crc32(b"123456789") == 0xCBF43926)
+    assert(adler32(b"Wikipedia") == 0x11E60398)
+    assert(crc32(b"56789", crc32(b"1234")) == 0xCBF43926)
+    assert(adler32_combine(adler32(b"Wiki"), adler32(b"pedia"), 5) == 0x11E60398)
+
+test "every level round-trips, alone and in segments":
+    var input: u8[20000]
+    for i in 0..<input.length:
+        input[i] = (u8)((i * 7 + i // 300) % 251) if i % 1000 < 600 else (u8)(i % 3)
+    for level: i32 in 0..<10:
+        var out: u8[21000]
+        let used = try deflate_zlib(input, level, out)
+        var back: u8[20000]
+        assert(try inflate_zlib(out[..<used], back) == used)
+        for i in 0..<input.length:
+            assert(back[i] == input[i])
+        # Three independent segments make one stream.
+        var joined: u8[21000]
+        var at = try deflate_raw(input[..<5000], level, joined, false)
+        at += try deflate_raw(input[5000..<5000], level, joined[at..], false)
+        at += try deflate_raw(input[5000..], level, joined[at..], true)
+        var again: u8[20000]
+        assert(try inflate_raw(joined[..<at], again) == at)
+        for i in 0..<input.length:
+            assert(again[i] == input[i])
+
+test "damaged streams fail":
+    var input: u8[4000]
+    for i in 0..<input.length:
+        input[i] = (u8)(i * 13 % 256)
+    var out: u8[4200]
+    let used = try deflate_zlib(input, 6, out)
+    var back: u8[4000]
+    var failed = false
+    inflate_zlib(out[..<used - 9], back) catch:
+        failed = true
+        recover 0
+    assert(failed)
+    failed = false
+    out[used - 1] ^= 1
+    inflate_zlib(out[..<used], back) catch:
+        failed = true
+        recover 0
+    assert(failed)
+    failed = false
+    var short: u8[3999]
+    out[used - 1] ^= 1
+    inflate_zlib(out[..<used], short) catch:
+        failed = true
+        recover 0
+    assert(failed)

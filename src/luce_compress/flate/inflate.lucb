@@ -1,0 +1,347 @@
+#==============================================================================================
+#
+#   flate/inflate - The decoder
+#
+#   DESCRIPTION:
+#       Symbols decode through a 12-bit table on the next bits of a 64-bit buffer,
+#       refilled eight bytes at a time; an entry holds the code length, the kind
+#       (literal, length or distance, end of block), the base value and its extra
+#       bits. Longer codes, rare in practice,, walk the canonical code. Matches copy
+#       eight bytes at a time when they are eight or more back.
+#
+#==============================================================================================
+
+let length_base: u16[29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+let length_extra: u8[29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+let distance_base: u16[30] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+let distance_extra: u8[30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+let code_order: usize[19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+let literal_kind: u32 = 0
+let match_kind: u32 = 1
+let end_kind: u32 = 2
+let invalid_kind: u32 = 3
+
+## One alphabet's decoding table: (value << 16) | (extra << 8) | (kind << 4) | length
+## by the next 12 bits (length 0: a longer code), and the canonical code for those.
+struct Table:
+    var fast: u32[4096]
+    var counts: u16[16]
+    var symbols: u16[320]
+    ## 0 literal/length, 1 distance, 2 code lengths.
+    var alphabet: u32
+
+    ## The entry of `symbol`, the code length left out.
+    func entry(symbol: usize) -> u32:
+        if self.alphabet == 2:
+            return (u32)symbol << 16
+        if self.alphabet == 1:
+            if symbol >= 30:
+                return invalid_kind << 4
+            return ((u32)distance_base[symbol] << 16) | ((u32)distance_extra[symbol] << 8) | (match_kind << 4)
+        if symbol < 256:
+            return ((u32)symbol << 16) | (literal_kind << 4)
+        if symbol == 256:
+            return end_kind << 4
+        if symbol > 285:
+            return invalid_kind << 4
+        return ((u32)length_base[symbol - 257] << 16) | ((u32)length_extra[symbol - 257] << 8) | (match_kind << 4)
+
+    ## Build from code lengths. Only the code-length alphabet must be complete; a
+    ## lone one-bit code or no codes at all is accepted, as zlib does.
+    mutating func build(lengths: const u8[], alphabet: u32) -> !:
+        self.alphabet = alphabet
+        memory.set(u8[]((u8*)&self.fast[0], 16384), 0)
+        for n in 0..<(usize)16:
+            self.counts[n] = 0
+        for length in lengths:
+            if length > 15:
+                error(corrupt, "invalid Huffman code length")
+            self.counts[(usize)length] += 1
+        self.counts[0] = 0
+        var left: i32 = 1
+        var offsets: u16[16]
+        var next: u32[16]
+        var code: u32 = 0
+        for n in 1..<(usize)16:
+            left = left * 2 - (i32)self.counts[n]
+            if left < 0:
+                error(corrupt, "oversubscribed Huffman tree")
+            code = (code + (u32)self.counts[n - 1]) << 1
+            next[n] = code
+            if n < 15:
+                offsets[n + 1] = offsets[n] + self.counts[n]
+        var present: u32 = 0
+        for n in 1..<(usize)16:
+            present += (u32)self.counts[n]
+        if left > 0 and (alphabet == 2 or (present > 0 and (present != 1 or self.counts[1] != 1))):
+            error(corrupt, "incomplete Huffman tree")
+        for i in 0..<lengths.length:
+            let length = (usize)lengths[i]
+            if length == 0:
+                continue
+            self.symbols[(usize)offsets[length]] = (u16)i
+            offsets[length] += 1
+            let c = next[length]
+            next[length] += 1
+            if length <= 12:
+                # The table is indexed by the code's bits in stream order: reversed.
+                var reversed: u32 = 0
+                for b in 0..<length:
+                    reversed = (reversed << 1) | ((c >> (u32)b) & 1)
+                let e = self.entry(i) | (u32)length
+                var at = (usize)reversed
+                while at < 4096:
+                    self.fast[at] = e
+                    at += (usize)1 << length
+
+    ## The entry for a code longer than 12 bits at the bottom of `acc`, with its
+    ## length; length 0 when no code matches.
+    func slow(acc: u64) -> u32:
+        var code: i32 = 0
+        var first: i32 = 0
+        var index: i32 = 0
+        for length in 1..<(usize)16:
+            code |= (i32)((acc >> (u64)(length - 1)) & 1)
+            let count = (i32)self.counts[length]
+            if code - first < count:
+                return self.entry((usize)self.symbols[(usize)(index + code - first)]) | (u32)length
+            index += count
+            first = (first + count) << 1
+            code <<= 1
+        return 0
+
+## Input bits, least significant first, read eight bytes ahead; past the end the
+## buffer fills with zeros, counted in `padded`.
+struct Stream:
+    var data: const u8*
+    var length: usize
+    var pos: usize
+    var acc: u64
+    var bits: u32
+    var padded: u32
+
+    mutating func refill():
+        if self.pos + 8 <= self.length:
+            self.acc |= *(const u64*)(self.data + self.pos) << (u64)self.bits
+            self.pos += (usize)((63 - self.bits) >> 3)
+            self.bits |= 56
+            return
+        while self.bits <= 56:
+            if self.pos < self.length:
+                self.acc |= (u64)self.data[self.pos] << (u64)self.bits
+                self.pos += 1
+            else:
+                self.padded += 8
+            self.bits += 8
+
+    mutating func take(count: u32) -> u32:
+        if self.bits < count:
+            self.refill()
+        let value = (u32)(self.acc & (((u64)1 << (u64)count) - 1))
+        self.acc >>= (u64)count
+        self.bits -= count
+        return value
+
+    ## Whether decoding read past the input.
+    func overrun() -> bool:
+        return self.bits < self.padded
+
+    ## Input bytes consumed: whole bytes still in the buffer go back.
+    func consumed() -> usize:
+        return self.pos - (usize)((self.bits - self.padded) >> 3) if self.bits >= self.padded else self.pos
+
+## Inflate the raw DEFLATE stream in `data` into exactly `output`, returning the
+## input bytes it used. It stops after a final block, or after a block that ends
+## with the input (a segment ending in a sync flush). `progress`, when given, hears
+## of every 256 KiB of output and of the end.
+pub func inflate_raw(data: const u8[], output: u8[], progress: Progress? = none, context: void*? = none) -> usize!:
+    let tables = try new Table[3] in memory.heap
+    defer free(tables) in memory.heap
+    var s = Stream(data = data.data, length = data.length, pos = 0, acc = 0, bits = 0, padded = 0)
+    var o: usize = 0
+    var next_report: usize = 262144
+    while true:
+        let final_block = s.take(1)
+        let kind = s.take(2)
+        if kind == 0:
+            # Stored: to a byte boundary, then LEN, NLEN and the bytes.
+            discard(s.take(s.bits & 7))
+            if s.overrun():
+                error(corrupt, "truncated deflate stream")
+            s.pos = s.consumed()
+            s.acc = 0
+            s.bits = 0
+            s.padded = 0
+            if s.pos + 4 > s.length:
+                error(corrupt, "truncated deflate stream")
+            let count = (usize)data[s.pos] | ((usize)data[s.pos + 1] << 8)
+            let check = (usize)data[s.pos + 2] | ((usize)data[s.pos + 3] << 8)
+            if check != (count ^ 65535):
+                error(corrupt, "invalid stored deflate block")
+            s.pos += 4
+            if count > s.length - s.pos or count > output.length - o:
+                error(corrupt, "stored deflate block overruns its buffers")
+            memory.copy(output[o..], data[s.pos..], count)
+            s.pos += count
+            o += count
+        elif kind == 3:
+            error(corrupt, "reserved deflate block type")
+        else:
+            if kind == 1:
+                try fixed_tables(&tables[0], &tables[1])
+            else:
+                try dynamic_tables(&s, &tables[0], &tables[1], &tables[2])
+            o = try decode_block(&s, &tables[0], &tables[1], output, o, progress, context, &next_report)
+        if s.overrun():
+            error(corrupt, "truncated deflate stream")
+        if final_block == 1 or s.consumed() >= s.length:
+            break
+    if o != output.length:
+        error(corrupt, "deflate stream is shorter than its output")
+    if let report = progress:
+        report(context, o)
+    return s.consumed()
+
+func fixed_tables(literals: Table*, distances: Table*) -> !:
+    var lengths: u8[288]
+    for i in 0..<(usize)288:
+        lengths[i] = 8 if i < 144 else 9 if i < 256 else 7 if i < 280 else 8
+    try literals.build(lengths, 0)
+    # All 32 five-bit codes, though 30 and 31 never occur.
+    var short: u8[32]
+    for i in 0..<(usize)32:
+        short[i] = 5
+    try distances.build(short, 1)
+
+func dynamic_tables(s: Stream*, literals: Table*, distances: Table*, codes: Table*) -> !:
+    let nlit = (usize)s.take(5) + 257
+    let ndist = (usize)s.take(5) + 1
+    let ncode = (usize)s.take(4) + 4
+    if nlit > 286 or ndist > 30:
+        error(corrupt, "too many deflate codes")
+    var code_lengths: u8[19]
+    for i in 0..<ncode:
+        code_lengths[code_order[i]] = (u8)s.take(3)
+    try codes.build(code_lengths, 2)
+    var lengths: u8[320]
+    var n: usize = 0
+    while n < nlit + ndist:
+        if s.bits < 16:
+            s.refill()
+        var e = codes.fast[(usize)(s.acc & 2047)]
+        if e & 15 == 0:
+            e = codes.slow(s.acc)
+            if e & 15 == 0:
+                error(corrupt, "invalid Huffman symbol")
+        s.acc >>= (u64)(e & 15)
+        s.bits -= e & 15
+        let symbol = e >> 16
+        if symbol < 16:
+            lengths[n] = (u8)symbol
+            n += 1
+            continue
+        if symbol == 16 and n == 0:
+            error(corrupt, "deflate repeat has no previous length")
+        let count = (usize)s.take(2 if symbol == 16 else 3 if symbol == 17 else 7) + (11 if symbol == 18 else 3)
+        if count > nlit + ndist - n:
+            error(corrupt, "deflate code repeat exceeds table")
+        let value = lengths[n - 1] if symbol == 16 else 0
+        for i in 0..<count:
+            lengths[n + i] = value
+        n += count
+    if lengths[256] == 0:
+        error(corrupt, "deflate tree lacks end marker")
+    try literals.build(lengths[..<nlit], 0)
+    try distances.build(lengths[nlit..<nlit + ndist], 1)
+
+## Decode one Huffman block into `output` from `o`; the new output position.
+func decode_block(s: Stream*, literals: const Table*, distances: const Table*, output: u8[], start: usize, progress: Progress?, context: void*?, next_report: usize*) -> usize!:
+    let out = output.data
+    let size = output.length
+    let lit = &literals.fast[0]
+    let dist = &distances.fast[0]
+    var o = start
+    var acc = s.acc
+    var bits = s.bits
+    let input = s.data
+    let input_end = s.length
+    while true:
+        if bits < 48:
+            # Eight bytes at once while the input has them.
+            if s.pos + 8 <= input_end:
+                acc |= *(const u64*)(input + s.pos) << (u64)bits
+                s.pos += (usize)((63 - bits) >> 3)
+                bits |= 56
+            else:
+                s.acc = acc
+                s.bits = bits
+                s.refill()
+                acc = s.acc
+                bits = s.bits
+        var e = lit[(usize)(acc & 4095)]
+        if e & 15 == 0:
+            e = literals.slow(acc)
+            if e & 15 == 0:
+                error(corrupt, "invalid Huffman symbol")
+        acc >>= (u64)(e & 15)
+        bits = bits -% (e & 15)
+        let kind = (e >> 4) & 3
+        if kind == literal_kind:
+            if o >= size:
+                error(corrupt, "deflate stream is longer than its output")
+            out[o] = (u8)(e >> 16)
+            o += 1
+            # A second literal without refilling: at least 33 bits remain.
+            let next = lit[(usize)(acc & 4095)]
+            if next & 15 != 0 and (next >> 4) & 3 == literal_kind and o < size:
+                acc >>= (u64)(next & 15)
+                bits = bits -% (next & 15)
+                out[o] = (u8)(next >> 16)
+                o += 1
+            continue
+        if kind == end_kind:
+            break
+        if kind == invalid_kind:
+            error(corrupt, "invalid deflate length symbol")
+        let extra = (e >> 8) & 15
+        let length = (usize)(e >> 16) + (usize)(acc & (((u64)1 << (u64)extra) - 1))
+        acc >>= (u64)extra
+        bits -= extra
+        var d = dist[(usize)(acc & 4095)]
+        if d & 15 == 0:
+            d = distances.slow(acc)
+            if d & 15 == 0:
+                error(corrupt, "invalid Huffman symbol")
+        acc >>= (u64)(d & 15)
+        bits -= d & 15
+        if (d >> 4) & 3 != match_kind:
+            error(corrupt, "invalid deflate distance symbol")
+        let dextra = (d >> 8) & 15
+        let distance = (usize)(d >> 16) + (usize)(acc & (((u64)1 << (u64)dextra) - 1))
+        acc >>= (u64)dextra
+        bits -= dextra
+        if distance > o or distance > 32768:
+            error(corrupt, "invalid deflate back reference")
+        if length > size - o:
+            error(corrupt, "deflate stream is longer than its output")
+        let to = out + o
+        let back = out + (o - distance)
+        if distance >= 8 and o + length + 8 <= size:
+            var n: usize = 0
+            while n < length:
+                *(u64*)(to + n) = *(const u64*)(back + n)
+                n += 8
+        elif distance == 1:
+            memory.set(u8[](to, length), *back)
+        else:
+            for n in 0..<length:
+                to[n] = back[n]
+        o += length
+        if o >= *next_report:
+            if let report = progress:
+                report(context, o)
+            *next_report = o + 262144
+    s.acc = acc
+    s.bits = bits
+    return o

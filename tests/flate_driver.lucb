@@ -1,0 +1,52 @@
+## The flate driver: `flate_driver deflate <in> <out> <level>` (a zlib stream),
+## `inflate <in.zlib> <out> <size>`, `segments <in> <out> <level> [parts]` (raw
+## DEFLATE in independent segments) or `time <in.zlib> - <size>`.
+import files
+import c
+import memory
+import strings
+import time
+import flate
+
+pub func main(arguments: str[]) -> i32!:
+    let input = try files.read((c.str)arguments[2])
+    let number = (usize)(strings.parse_u64(arguments[4]) else 6)
+    if arguments[1] == "time":
+        let out = try alloc u8[number] in memory.heap
+        var best: u64 = 0
+        var best_adler: u64 = 0
+        for r in 0..<5:
+            let start = time.now()
+            discard(try flate.inflate_raw(input[2..], out))
+            let spent = time.since(start)
+            best = spent if r == 0 or spent < best else best
+            let again = time.now()
+            discard(flate.adler32(out))
+            let adler = time.since(again)
+            best_adler = adler if r == 0 or adler < best_adler else best_adler
+        print(f"inflate_raw {best // 1000} us, adler32 {best_adler // 1000} us")
+        return 0
+    if arguments[1] == "inflate":
+        let out = try alloc u8[number] in memory.heap
+        let start = time.now()
+        discard(try flate.inflate_zlib(input, out))
+        print(f"inflated in {time.since(start) // 1000} us")
+        try files.write((c.str)arguments[3], out)
+        return 0
+    if arguments[1] == "segments":
+        let out = try alloc u8[flate.deflate_bound(input.length) * 2] in memory.heap
+        let cut = input.length // 4
+        let parts = (usize)(strings.parse_u64(arguments[5]) else 3) if arguments.length > 5 else 3
+        var at = try flate.deflate_raw(input[..<cut], (i32)number, out, parts == 1)
+        if parts > 1:
+            at += try flate.deflate_raw(input[cut..<cut], (i32)number, out[at..], false)
+        if parts > 2:
+            at += try flate.deflate_raw(input[cut..], (i32)number, out[at..], true)
+        try files.write((c.str)arguments[3], out[..<at])
+        return 0
+    let out = try alloc u8[flate.deflate_bound(input.length) + 6] in memory.heap
+    let start = time.now()
+    let used = try flate.deflate_zlib(input, (i32)number, out)
+    print(f"deflated in {time.since(start) // 1000} us")
+    try files.write((c.str)arguments[3], out[..<used])
+    return 0
