@@ -329,7 +329,8 @@ func write_block(w: Writer*, block: Block*, symbols: const Symbols*, input: cons
 
 ## The block's symbols, each with its extra bits in one write, through a local
 ## 64-bit accumulator: at most 31 bits wait in it and a symbol adds at most 28,
-## so it never overflows. Every table index is in range by construction.
+## so it never overflows. Every table index is in range by construction, and
+## shift counts are masked, as they are below 64 anyway, so none is checked.
 func write_symbols(w: Writer*, block: const Block*, symbols: const Symbols*, literal_codes: const u16*, literal_lengths: const u8*,
                    distance_codes: const u16*, distance_lengths: const u8*):
     let litlen = block.litlen.data
@@ -349,13 +350,13 @@ func write_symbols(w: Writer*, block: const Block*, symbols: const Symbols*, lit
         let value = (usize)litlen[k]
         let d = (usize)distances[k]
         if d == 0:
-            acc = acc | ((u64)literal_codes[value] << (u64)bits)
+            acc = acc | ((u64)literal_codes[value] << (u64)(bits & 63))
             bits = bits +% (u32)literal_lengths[value]
         else:
             let lc = (usize)length_codes[value]
             let ls = 257 +% lc
             let llen = (u32)literal_lengths[ls]
-            acc = acc | (((u64)literal_codes[ls] | ((u64)(value -% (usize)lengths_base[lc]) << (u64)llen)) << (u64)bits)
+            acc = acc | (((u64)literal_codes[ls] | ((u64)(value -% (usize)lengths_base[lc]) << (u64)(llen & 63))) << (u64)(bits & 63))
             bits = bits +% llen +% (u32)lengths_extra[lc]
             if bits >= 32:
                 *(u32*)(out + pos) = (u32)acc
@@ -364,7 +365,7 @@ func write_symbols(w: Writer*, block: const Block*, symbols: const Symbols*, lit
                 bits = bits -% 32
             let dc = symbols.distance_code(d)
             let dlen = (u32)distance_lengths[dc]
-            acc = acc | (((u64)distance_codes[dc] | ((u64)(d -% (usize)distances_base[dc]) << (u64)dlen)) << (u64)bits)
+            acc = acc | (((u64)distance_codes[dc] | ((u64)(d -% (usize)distances_base[dc]) << (u64)(dlen & 63))) << (u64)(bits & 63))
             bits = bits +% dlen +% (u32)distances_extra[dc]
         if bits >= 32:
             *(u32*)(out + pos) = (u32)acc

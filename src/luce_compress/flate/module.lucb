@@ -7,9 +7,9 @@
 #       Whole-buffer primitives for callers that know their sizes and do their own
 #       framing, as PNG, TIFF and OpenEXR do. Inflate decodes a raw DEFLATE stream into
 #       an exact-size buffer through 11-bit lookup tables and a 64-bit bit buffer.
-#       Deflate compresses one segment with a fresh 32 KiB window (hash chains, lazy
-#       matching at levels 4..9, dynamic, fixed or stored blocks, whichever is
-#       smallest) and ends it with a sync flush, or a final block for the last one.
+#       Deflate compresses one segment with a fresh 32 KiB window (hash buckets at
+#       level 1, greedy hash chains at 2..9; dynamic, fixed or stored blocks, whichever
+#       is smallest) and ends it with a sync flush, or a final block for the last one.
 #       Segments are independent, so a caller can compress them on many threads and
 #       concatenate them into one valid stream, as pigz does; `adler32_combine` then
 #       gives the zlib checksum of the whole.

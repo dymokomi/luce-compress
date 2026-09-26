@@ -3,20 +3,22 @@
 #   flate/deflate - The matcher and segment compressor
 #
 #   DESCRIPTION:
-#       libdeflate's parsers and level table: 4-byte hash chains over a 32 KiB window,
-#       searched `depth` deep and stopped at a `nice` length; greedy matching at levels
-#       1..4 and lazy matching at 5..9, where the position after a match is searched half
-#       as deep and wins only if longer by more than its greater distance costs. Matches compare eight bytes at a
+#       libdeflate's level table: 4-byte hash chains over a 32 KiB window, searched
+#       `depth` deep and stopped at a `nice` length, and greedy matching at every level
+#       (level 1 has its own chainless parser, fastest.lucb). Lazy matching, which helps
+#       text by a few percent, made filtered image rows larger as well as slower (a
+#       photo's noise makes the literal it spends dear), and images are what this
+#       module is for; general data goes through `compress`. Matches compare eight bytes at a
 #       time. Blocks close every 16383 symbols. The chains live in a ring of one window's
 #       positions (libdeflate's layout), so a chain walk stays in cache however large
 #       the segment is.
 #
 #==============================================================================================
 
-## libdeflate's levels: how many chain entries a search visits, and the length
-## that ends it at once.
-let level_depth: u16[10] = [0, 4, 6, 12, 16, 16, 35, 100, 300, 600]
-let level_nice: u16[10] = [0, 32, 10, 14, 30, 30, 65, 130, 258, 258]
+## How many chain entries a search visits, and the length that ends it at once:
+## libdeflate's levels, with 5 between its 4 and 6 (its 5 is 4's search, lazily).
+let level_depth: u16[10] = [0, 4, 6, 12, 16, 24, 35, 100, 300, 600]
+let level_nice: u16[10] = [0, 32, 10, 14, 30, 48, 65, 130, 258, 258]
 
 let window: usize = 32768
 let window_mask: usize = 32767
@@ -46,10 +48,8 @@ pub func deflate_raw(input: const u8[], level: i32, output: u8[], last: bool) ->
         write_stored(&c.w, data, 0, n, last)
     elif level == 1:
         try compress_fastest(&c, data, n, last)
-    elif level <= 4:
-        try c.greedy(data, n, last)
     else:
-        try c.lazy(data, n, last)
+        try c.greedy(data, n, last)
     if not last:
         c.w.put(0, 3)
         c.w.align()
@@ -107,10 +107,10 @@ struct Compressor:
         self.level = (usize)level
         self.depth = (usize)level_depth[self.level]
         self.nice = (usize)level_nice[self.level]
-        # A lazy run of ever longer matches may add up to 258 literals past the
-        # count at which a block closes.
-        self.block.litlen = try alloc u16[block_symbols + 260] in memory.heap
-        self.block.distance = try alloc u16[block_symbols + 260] in memory.heap
+        # A parser checks the count before each symbol, so one slot past the
+        # count at which a block closes is enough.
+        self.block.litlen = try alloc u16[block_symbols + 1] in memory.heap
+        self.block.distance = try alloc u16[block_symbols + 1] in memory.heap
         self.block.clear()
         if level > 0:
             self.head = try alloc i32[(usize)1 << hash_bits] in memory.heap
@@ -211,12 +211,17 @@ struct Compressor:
             cur = prev[at & window_mask]
         return (length, distance) if distance > 0 else (0, 0)
 
-    ## Enter positions `first..<stop` in the hash chains, as a match covers them.
+    ## Enter positions `first..<stop` in the hash chains, as a match covers them
+    ## (as `insert` does, with the tables in hand).
     mutating func skip(data: const u8*, n: usize, first: usize, stop: usize):
-        var k = first
         let end = stop if stop +% 4 <= n else (n - 3 if n > 3 else 0)
+        let heads = self.head.data
+        let prev = self.prev.data
+        var k = first
         while k < end:
-            discard(self.insert(data, k))
+            let h = (usize)((*(const u32*)(data + k) *% 2654435761) >> (32 - hash_bits))
+            prev[k & window_mask] = heads[h]
+            heads[h] = (i32)k
             k = k +% 1
 
     mutating func greedy(data: const u8*, n: usize, last: bool) -> !:
@@ -239,67 +244,6 @@ struct Compressor:
             self.skip(data, n, p + 1, p + length)
             p += length
         try self.flush(data, self.block_start, n, last)
-
-    ## libdeflate's lazy parse: a match found at `p` is compared with one at
-    ## `p + 1` (searched half as deep), which replaces it, the byte at `p` going
-    ## out as a literal, when longer by more than its distance costs.
-    mutating func lazy(data: const u8*, n: usize, last: bool) -> !:
-        var p: usize = 0
-        let depth = self.depth
-        let nice = self.nice
-        while p < n:
-            if self.block.count >= block_symbols:
-                try self.flush(data, self.block_start, p, false)
-            var length: usize = 0
-            var distance: usize = 0
-            if p + 4 <= n:
-                let candidate = self.insert(data, p)
-                let (found, d) = self.longest(data, n, p, candidate, 2, depth)
-                length = found
-                distance = d
-            if length < 3 or (length == 3 and distance > 8192):
-                self.literal(data[p])
-                p += 1
-                continue
-            # The match starts at `start`; `p` is the position after it looked at.
-            var start = p
-            p += 1
-            while true:
-                if length >= nice or p + 4 > n:
-                    break
-                let candidate = self.insert(data, p)
-                let (next, next_distance) = self.longest(data, n, p, candidate, length, depth >> 1)
-                p += 1
-                if next == 0 or 4 * (i64)(next - length) + (i64)highest_bit(distance) - (i64)highest_bit(next_distance) <= 2:
-                    break
-                self.literal(data[start])
-                start = start + 1
-                length = next
-                distance = next_distance
-            self.matched(length, distance)
-            self.skip(data, n, p, start + length)
-            p = start + length
-        try self.flush(data, self.block_start, n, last)
-
-## The index of the highest set bit of a nonzero value.
-func highest_bit(x: usize) -> usize:
-    var v = x
-    var bit: usize = 0
-    if v >= 65536:
-        v = v >> 16
-        bit = 16
-    if v >= 256:
-        v = v >> 8
-        bit = bit +% 8
-    if v >= 16:
-        v = v >> 4
-        bit = bit +% 4
-    if v >= 4:
-        v = v >> 2
-        bit = bit +% 2
-    if v >= 2:
-        bit = bit +% 1
-    return bit
 
 ## Follow the chain from `cur` for at most `*steps` entries, not below `lowest`,
 ## to the first position whose four bytes at `offset` are `tail` and whose first
