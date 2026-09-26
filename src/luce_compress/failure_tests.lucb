@@ -73,9 +73,6 @@ struct Heap: memory.Allocator:
         assert(self.live == 0 and self.bytes == 0, "audited allocations leaked")
         for block in self.blocks: assert(block.address == none)
 
-func restore(heap: memory.Allocator):
-    memory.heap = heap
-
 func equal(actual: const u8[], expected: const u8[]):
     assert(actual.length == expected.length)
     for i in 0..<actual.length: assert(actual[i] == expected[i])
@@ -542,7 +539,7 @@ pub func main(arguments: str[]) -> i32!:
     let original = memory.heap
     var heap = Heap(parent = original)
     memory.heap = &heap
-    defer restore(original)
+    defer memory.heap = original
     var checks = try constructors(&heap)
     checks += try one_shot(&heap, plain, packed, true, 16384, none, 10)
     checks += try one_shot(&heap, packed, plain, false, 8192, none, 8)
@@ -577,6 +574,6 @@ pub func main(arguments: str[]) -> i32!:
     try poisoned_cleanup(&heap, false, "zlib", damaged[..<packed.length])
     checks += 3
     heap.clean()
-    restore(original)
+    memory.heap = original
     print(f"PASS {checks} deterministic allocation-failure/retry cases; exact live-byte ledger, native allocation-free steps/reset/close; audited peak={heap.peak}")
     return 0
