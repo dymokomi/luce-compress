@@ -56,3 +56,90 @@ test "damaged streams fail":
         failed = true
         recover 0
     assert(failed)
+
+## What a windowed inflate handed on, checked against the input as it comes.
+struct Received:
+    var expected: const u8[]
+    var at: usize
+    var calls: usize
+    var wrong: bool
+
+func receive(context: void*?, bytes: const u8[]) -> !:
+    let received = (Received*)(context else return)
+    for byte in bytes:
+        if received.at >= received.expected.length or received.expected[received.at] != byte:
+            received.wrong = true
+        received.at += 1
+    received.calls += 1
+
+test "a windowed inflate hands on the same bytes a window at a time":
+    let size: usize = 400000
+    let input = try alloc u8[size] in memory.heap
+    defer free(input) in memory.heap
+    for i in 0..<size:
+        input[i] = (u8)((i * 7 + i // 300) % 251) if i % 1000 < 600 else (u8)(i % 3)
+    let packed = try alloc u8[size + 1000] in memory.heap
+    defer free(packed) in memory.heap
+    let through = try alloc u8[70000] in memory.heap
+    defer free(through) in memory.heap
+    # Level 0 is stored blocks; 1 and 6 matches reaching back across slides.
+    for level in [(i32)0, 1, 6]:
+        let used = try deflate_raw(input, level, packed, true)
+        var received = Received(expected = input, at = 0, calls = 0, wrong = false)
+        assert(try inflate_raw_windowed(packed[..<used], through, size, receive, (void*)&received) == used)
+        assert(received.at == size and not received.wrong and received.calls > 5)
+        # A stream longer or shorter than promised fails.
+        var failed = false
+        received = Received(expected = input, at = 0, calls = 0, wrong = false)
+        inflate_raw_windowed(packed[..<used], through, size - 1, receive, (void*)&received) catch:
+            failed = true
+            recover 0
+        assert(failed)
+        failed = false
+        received = Received(expected = input, at = 0, calls = 0, wrong = false)
+        inflate_raw_windowed(packed[..<used], through, size + 1, receive, (void*)&received) catch:
+            failed = true
+            recover 0
+        assert(failed)
+
+## Input handed over in pieces of `size` bytes.
+struct Pieces:
+    var data: const u8[]
+    var at: usize
+    var size: usize
+    var received: Received
+
+func next_piece(context: void*?) -> const u8[]:
+    let pieces = (Pieces*)(context else trap("pieces"))
+    let end = pieces.at + pieces.size if pieces.at + pieces.size < pieces.data.length else pieces.data.length
+    let piece = pieces.data[pieces.at..<end]
+    pieces.at = end
+    return piece
+
+func receive_pieces(context: void*?, bytes: const u8[]) -> !:
+    let pieces = (Pieces*)(context else return)
+    try receive((void*)&pieces.received, bytes)
+
+test "a windowed inflate takes its input in pieces of any size":
+    let size: usize = 300000
+    let input = try alloc u8[size] in memory.heap
+    defer free(input) in memory.heap
+    for i in 0..<size:
+        input[i] = (u8)((i * 7 + i // 300) % 251) if i % 1000 < 600 else (u8)(i % 3)
+    let packed = try alloc u8[size + 1000] in memory.heap
+    defer free(packed) in memory.heap
+    let through = try alloc u8[70000] in memory.heap
+    defer free(through) in memory.heap
+    for level in [(i32)0, 1, 6]:
+        let used = try deflate_raw(input, level, packed, true)
+        for piece in [(usize)1, 7, 4096, 100000]:
+            var pieces = Pieces(data = packed[..<used], at = piece, size = piece, received = Received(expected = input, at = 0, calls = 0, wrong = false))
+            let consumed = try inflate_raw_windowed(packed[..<piece], through, size, receive_pieces, (void*)&pieces, next_piece)
+            assert(consumed == used and pieces.received.at == size and not pieces.received.wrong)
+        # Cut short, it fails.
+        var short = Pieces(data = packed[..<used - 5], at = 100, size = 100, received = Received(expected = input, at = 0, calls = 0, wrong = false))
+        var failed = false
+        inflate_raw_windowed(packed[..<100], through, size, receive_pieces, (void*)&short, next_piece) catch:
+            failed = true
+            recover 0
+        assert(failed)

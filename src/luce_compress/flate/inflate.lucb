@@ -120,6 +120,10 @@ struct Stream:
     var acc: u64
     var bits: u32
     var padded: u32
+    ## Where the input goes on once `data` is read, and the bytes read before it.
+    var more: More?
+    var context: void*?
+    var base: usize
 
     mutating func refill():
         if self.pos + 8 <= self.length:
@@ -128,7 +132,7 @@ struct Stream:
             self.bits |= 56
             return
         while self.bits <= 56:
-            if self.pos < self.length:
+            if self.pos < self.length or self.next_piece():
                 self.acc |= (u64)self.data[self.pos] << (u64)self.bits
                 self.pos += 1
             else:
@@ -147,18 +151,104 @@ struct Stream:
     func overrun() -> bool:
         return self.bits < self.padded
 
-    ## Input bytes consumed: whole bytes still in the buffer go back.
+    ## Input bytes consumed, over every piece: whole bytes still in the buffer go back.
     func consumed() -> usize:
-        return self.pos - (usize)((self.bits - self.padded) >> 3) if self.bits >= self.padded else self.pos
+        return self.base + self.pos - (usize)((self.bits - self.padded) >> 3) if self.bits >= self.padded else self.base + self.pos
+
+    ## The next piece of input, if `more` has one.
+    mutating func next_piece() -> bool:
+        let more = self.more else return false
+        let piece = more(self.context)
+        if piece.length == 0:
+            self.more = none
+            return false
+        self.base += self.length
+        self.data = piece.data
+        self.length = piece.length
+        self.pos = 0
+        return true
+
+    ## Whether every byte of input has been read.
+    func ended() -> bool:
+        return self.more == none and self.consumed() >= self.base + self.length
 
 ## Inflate the raw DEFLATE stream in `data` into exactly `output`, returning the
 ## input bytes it used. It stops after a final block, or after a block that ends
 ## with the input (a segment ending in a sync flush). `progress`, when given, hears
 ## of every 256 KiB of output and of the end.
 pub func inflate_raw(data: const u8[], output: u8[], progress: Progress? = none, context: void*? = none) -> usize!:
+    var slide = Slide(deliver = none, context = none, base = 0, total = output.length, start = 0)
+    return try inflate_through(data, none, output, &slide, progress, context)
+
+## Inflate the raw DEFLATE stream in `data`, `total` bytes of output, through
+## `through` rather than one buffer the size of it all: each time it
+## fills, the bytes not yet handed on go to `deliver`, and the last 32 KiB (all a
+## match can reach back) move to its start. The last bytes go at the end. So a
+## decoder of a large stream holds a window, not the whole output. It
+## takes at least 64 KiB; a few hundred KiB keeps the calls few. The input
+## can come in pieces too: once `data` is read, `more` gives the next (empty
+## at the end), as a PNG's IDAT chunks, without joining them. Returns the
+## input bytes used, over every piece.
+pub func inflate_raw_windowed(data: const u8[], through: u8[], total: usize, deliver: Deliver, context: void*?, more: More? = none) -> usize!:
+    if through.length < minimum_window:
+        error(invalid, "an inflate window takes at least 64 KiB")
+    var slide = Slide(deliver = deliver, context = context, base = 0, total = total, start = 0)
+    return try inflate_through(data, more, through, &slide, none, context)
+
+## Gives a windowed inflate its next piece of input; an empty one at the end.
+pub type More = func(void*?) -> const u8[]
+
+## Hears of a windowed inflate's output: the context and bytes that are valid
+## only during the call.
+pub type Deliver = func(void*?, const u8[]) -> unit!
+
+## The smallest window: the 32 KiB kept, and room past it for more than a match.
+let minimum_window: usize = 65536 + 2 * slack
+
+## Room a decode step may need past the check before it: two literals or a
+## match of 258, with an 8-byte copy's overshoot.
+let slack: usize = 274
+
+## Where a windowed inflate's output goes; `deliver` none for one whole buffer.
+struct Slide:
+    var deliver: Deliver?
+    var context: void*?
+    ## Output bytes made before the window's start; the whole stream's output.
+    var base: usize
+    var total: usize
+    ## The first byte in the window not yet delivered.
+    var start: usize
+
+    ## The window's end the decoder stops short of to slide it.
+    func edge(size: usize) -> usize:
+        return size if self.deliver == none else size - slack
+
+    ## Hand on what is new in `through[..<o]` and keep its last 32 KiB at its
+    ## start; the new output position.
+    mutating func advance(through: u8[], o: usize) -> usize!:
+        let deliver = self.deliver else error(corrupt, "deflate stream is longer than its output")
+        try deliver(self.context, through[self.start..<o])
+        let keep = window if o > window else o
+        memory.copy(through, through[o - keep..<o], keep)
+        self.base += o - keep
+        self.start = keep
+        if self.base + keep > self.total:
+            error(corrupt, "deflate stream is longer than its output")
+        return keep
+
+    ## The end: the rest handed on, and the output its promised length.
+    mutating func finish(through: u8[], o: usize) -> !:
+        if self.base + o != self.total:
+            error(corrupt, "deflate stream is shorter than its output")
+        if let deliver = self.deliver:
+            try deliver(self.context, through[self.start..<o])
+
+## Inflate into `output`, whole or as the window `slide` says.
+func inflate_through(data: const u8[], more: More?, output: u8[], slide: Slide*, progress: Progress?, context: void*?) -> usize!:
     let tables = try new Table[3] in memory.heap
     defer free(tables) in memory.heap
-    var s = Stream(data = data.data, length = data.length, pos = 0, acc = 0, bits = 0, padded = 0)
+    var s = Stream(data = data.data, length = data.length, pos = 0, acc = 0, bits = 0, padded = 0, more = more, context = context, base = 0)
+    let edge = slide.edge(output.length)
     var o: usize = 0
     var next_report: usize = 262144
     while true:
@@ -167,24 +257,34 @@ pub func inflate_raw(data: const u8[], output: u8[], progress: Progress? = none,
         if kind == 0:
             # Stored: to a byte boundary, then LEN, NLEN and the bytes.
             discard(s.take(s.bits & 7))
+            var count = (usize)s.take(16)
+            let check = (usize)s.take(16)
             if s.overrun():
                 error(corrupt, "truncated deflate stream")
-            s.pos = s.consumed()
-            s.acc = 0
-            s.bits = 0
-            s.padded = 0
-            if s.pos + 4 > s.length:
-                error(corrupt, "truncated deflate stream")
-            let count = (usize)data[s.pos] | ((usize)data[s.pos + 1] << 8)
-            let check = (usize)data[s.pos + 2] | ((usize)data[s.pos + 3] << 8)
             if check != (count ^ 65535):
                 error(corrupt, "invalid stored deflate block")
-            s.pos += 4
-            if count > s.length - s.pos or count > output.length - o:
-                error(corrupt, "stored deflate block overruns its buffers")
-            memory.copy(output[o..], data[s.pos..], count)
-            s.pos += count
-            o += count
+            while count > 0:
+                if o >= edge:
+                    o = try slide.advance(output, o)
+                let room = output.length - o
+                if room == 0:
+                    error(corrupt, "stored deflate block overruns its buffers")
+                if s.bits > s.padded:
+                    # Bytes the bit buffer read ahead come first.
+                    output[o] = (u8)s.take(8)
+                    o += 1
+                    count -= 1
+                    continue
+                if s.padded > 0 or (s.pos >= s.length and not s.next_piece()):
+                    error(corrupt, "truncated deflate stream")
+                # The buffer is empty; what a refill read ahead past it is read again.
+                s.acc = 0
+                var part = count if count < room else room
+                part = part if part < s.length - s.pos else s.length - s.pos
+                memory.copy(output[o..], u8[]((u8*)(s.data + s.pos), part), part)
+                s.pos += part
+                o += part
+                count -= part
         elif kind == 3:
             error(corrupt, "reserved deflate block type")
         else:
@@ -192,13 +292,12 @@ pub func inflate_raw(data: const u8[], output: u8[], progress: Progress? = none,
                 try fixed_tables(&tables[0], &tables[1])
             else:
                 try dynamic_tables(&s, &tables[0], &tables[1], &tables[2])
-            o = try decode_block(&s, &tables[0], &tables[1], output, o, progress, context, &next_report)
+            o = try decode_block(&s, &tables[0], &tables[1], output, o, edge, slide, progress, context, &next_report)
         if s.overrun():
             error(corrupt, "truncated deflate stream")
-        if final_block == 1 or s.consumed() >= s.length:
+        if final_block == 1 or s.ended():
             break
-    if o != output.length:
-        error(corrupt, "deflate stream is shorter than its output")
+    try slide.finish(output, o)
     if let report = progress:
         report(context, o)
     return s.consumed()
@@ -256,7 +355,8 @@ func dynamic_tables(s: Stream*, literals: Table*, distances: Table*, codes: Tabl
     try distances.build(lengths[nlit..<nlit + ndist], 1)
 
 ## Decode one Huffman block into `output` from `o`; the new output position.
-func decode_block(s: Stream*, literals: const Table*, distances: const Table*, output: u8[], start: usize, progress: Progress?, context: void*?, next_report: usize*) -> usize!:
+## Past `edge` the window slides first (a whole buffer's limit is its end).
+func decode_block(s: Stream*, literals: const Table*, distances: const Table*, output: u8[], start: usize, edge: usize, slide: Slide*, progress: Progress?, context: void*?, next_report: usize*) -> usize!:
     let out = output.data
     let size = output.length
     let lit = &literals.fast[0]
@@ -264,9 +364,11 @@ func decode_block(s: Stream*, literals: const Table*, distances: const Table*, o
     var o = start
     var acc = s.acc
     var bits = s.bits
-    let input = s.data
-    let input_end = s.length
+    var input = s.data
+    var input_end = s.length
     while true:
+        if o > edge:
+            o = try slide.advance(output, o)
         if bits < 48:
             # Eight bytes at once while the input has them.
             if s.pos + 8 <= input_end:
@@ -279,6 +381,9 @@ func decode_block(s: Stream*, literals: const Table*, distances: const Table*, o
                 s.refill()
                 acc = s.acc
                 bits = s.bits
+                # The refill may have gone on to the next piece of input.
+                input = s.data
+                input_end = s.length
         var e = lit[(usize)(acc & 4095)]
         if e & 15 == 0:
             e = literals.slow(acc)
