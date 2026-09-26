@@ -1,0 +1,86 @@
+## Deflate throughput, one thread: `deflate_bench <kind> <levels...> [--write <path>]`.
+## `kind` is `photo` (a 6000x4000 RGBA8 gradient with noise 0..15, as a PNG's
+## Sub-filtered rows: 96 MB) or `flat` (the same size of flat-colored art with
+## hard edges), or a path to a file of bytes. Each level deflates the data in
+## independent 1 MiB segments, as luce-png's bands do, and prints MB/s and the
+## compressed size. `--write` saves the generated data for other tools.
+import c
+import files
+import memory
+import strings
+import time
+import flate
+
+let width: usize = 6000
+let height: usize = 4000
+let segment: usize = 1048576
+
+## Rows of `width` RGBA8 pixels, each led by PNG's Sub filter byte.
+func generate(kind: str) -> u8[]!:
+    let stride = width * 4 + 1
+    let data = try alloc u8[stride * height] in memory.heap
+    var seed: u32 = 2463534242
+    for y in 0..<height:
+        let row = y * stride
+        data[row] = 1
+        var previous: u8[4] = [0, 0, 0, 0]
+        for x in 0..<width:
+            var pixel: u8[4] = [0, 0, 0, 255]
+            if kind == "photo":
+                seed ^= seed << 13
+                seed ^= seed >> 17
+                seed ^= seed << 5
+                let noise = seed & 15
+                pixel[0] = (u8)((x * 200 // width + noise) & 255)
+                pixel[1] = (u8)((y * 200 // height + (noise >> 1)) & 255)
+                pixel[2] = (u8)(((x + y) * 100 // (width + height) + (noise >> 2)) & 255)
+            else:
+                # Flat art: bands and blocks of solid color with hard edges.
+                let block = (x // 373 + y // 211 * 3) % 7
+                pixel[0] = (u8)(block * 36)
+                pixel[1] = (u8)(255 - block * 30)
+                pixel[2] = (u8)((block * 91) & 255)
+                if (x // 50 + y // 50) % 11 == 0:
+                    pixel[3] = 0
+            for channel in 0..<(usize)4:
+                data[row + 1 + x * 4 + channel] = pixel[channel] -% previous[channel]
+                previous[channel] = pixel[channel]
+    return data
+
+pub func main(arguments: str[]) -> i32!:
+    if arguments.length < 3:
+        print("usage: deflate_bench <photo|flat|path> <levels...> [--write <path>]")
+        return 2
+    let kind = arguments[1]
+    var data: u8[]
+    if kind == "photo" or kind == "flat":
+        data = try generate(kind)
+    else:
+        data = try files.read((c.str)kind)
+    let out = try alloc u8[flate.deflate_bound(segment) + 64] in memory.heap
+    var index: usize = 2
+    while index < arguments.length:
+        if arguments[index] == "--write":
+            try files.write((c.str)arguments[index + 1], data)
+            index += 2
+            continue
+        let level = (i32)(strings.parse_u64(arguments[index]) else 6)
+        var best: u64 = 0
+        var total: usize = 0
+        for round in 0..<(usize)2:
+            let start = time.now()
+            var size: usize = 0
+            var at: usize = 0
+            while at < data.length:
+                let end = at + segment if at + segment < data.length else data.length
+                size += try flate.deflate_raw(data[at..<end], level, out, end == data.length)
+                at = end
+            let spent = time.since(start)
+            if round == 0 or spent < best:
+                best = spent
+            total = size
+        let mb = (f64)data.length / 1000000.0
+        let seconds = (f64)best / 1000000000.0
+        print(f"level {level}: {(i64)(mb / seconds)} MB/s, {best // 1000000} ms, {total} bytes ({(i64)((f64)total * 1000.0 / (f64)data.length) } per mille)")
+        index += 1
+    return 0

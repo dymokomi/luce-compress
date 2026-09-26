@@ -79,8 +79,11 @@ struct Symbols:
                     s.far[(d - 1) >> 7] = (u8)code
         return s
 
+    ## The distance symbol of `d` (1..32768), from tables whose indices stay in range.
     func distance_code(d: usize) -> usize:
-        return (usize)self.near[d - 1] if d <= 256 else (usize)self.far[(d - 1) >> 7]
+        if d <= 256:
+            return (usize)((const u8*)&self.near[0])[d -% 1]
+        return (usize)((const u8*)&self.far[0])[(d -% 1) >> 7]
 
 ## Code lengths of at most `most` bits for `freq[0..<n]` into `lengths`; with
 ## fewer than two symbols used, two codes of one bit.
@@ -321,19 +324,54 @@ func write_block(w: Writer*, block: Block*, symbols: const Symbols*, input: cons
                 w.put((u64)rle_extra[r], 2 if symbol == 16 else 3 if symbol == 17 else 7)
     canonical_codes(&literal_lengths[0], 288 if fixed < dynamic else 286, &literal_codes[0])
     canonical_codes(&distance_lengths[0], 30, &distance_codes[0])
-    # The symbols, each with its extra bits in one write.
+    write_symbols(w, block, symbols, &literal_codes[0], &literal_lengths[0], &distance_codes[0], &distance_lengths[0])
+    w.put((u64)literal_codes[256], (u32)literal_lengths[256])
+
+## The block's symbols, each with its extra bits in one write, through a local
+## 64-bit accumulator: at most 31 bits wait in it and a symbol adds at most 28,
+## so it never overflows. Every table index is in range by construction.
+func write_symbols(w: Writer*, block: const Block*, symbols: const Symbols*, literal_codes: const u16*, literal_lengths: const u8*,
+                   distance_codes: const u16*, distance_lengths: const u8*):
     let litlen = block.litlen.data
     let distances = block.distance.data
-    for k in 0..<block.count:
+    let length_codes = (const u8*)&symbols.length_code[0]
+    let lengths_extra = (const u8*)&length_extra[0]
+    let lengths_base = (const u16*)&length_base[0]
+    let distances_extra = (const u8*)&distance_extra[0]
+    let distances_base = (const u16*)&distance_base[0]
+    let out = w.out
+    var pos = w.pos
+    var acc = w.acc
+    var bits = w.bits
+    let count = block.count
+    var k: usize = 0
+    while k < count:
         let value = (usize)litlen[k]
         let d = (usize)distances[k]
         if d == 0:
-            w.put((u64)literal_codes[value], (u32)literal_lengths[value])
-            continue
-        let lc = (usize)symbols.length_code[value]
-        let lextra = (u32)length_extra[lc]
-        w.put((u64)literal_codes[257 + lc] | ((u64)(value - (usize)length_base[lc]) << (u64)literal_lengths[257 + lc]), (u32)literal_lengths[257 + lc] + lextra)
-        let dc = symbols.distance_code(d)
-        let dextra = (u32)distance_extra[dc]
-        w.put((u64)distance_codes[dc] | ((u64)(d - (usize)distance_base[dc]) << (u64)distance_lengths[dc]), (u32)distance_lengths[dc] + dextra)
-    w.put((u64)literal_codes[256], (u32)literal_lengths[256])
+            acc = acc | ((u64)literal_codes[value] << (u64)bits)
+            bits = bits +% (u32)literal_lengths[value]
+        else:
+            let lc = (usize)length_codes[value]
+            let ls = 257 +% lc
+            let llen = (u32)literal_lengths[ls]
+            acc = acc | (((u64)literal_codes[ls] | ((u64)(value -% (usize)lengths_base[lc]) << (u64)llen)) << (u64)bits)
+            bits = bits +% llen +% (u32)lengths_extra[lc]
+            if bits >= 32:
+                *(u32*)(out + pos) = (u32)acc
+                pos = pos +% 4
+                acc = acc >> 32
+                bits = bits -% 32
+            let dc = symbols.distance_code(d)
+            let dlen = (u32)distance_lengths[dc]
+            acc = acc | (((u64)distance_codes[dc] | ((u64)(d -% (usize)distances_base[dc]) << (u64)dlen)) << (u64)bits)
+            bits = bits +% dlen +% (u32)distances_extra[dc]
+        if bits >= 32:
+            *(u32*)(out + pos) = (u32)acc
+            pos = pos +% 4
+            acc = acc >> 32
+            bits = bits -% 32
+        k = k +% 1
+    w.pos = pos
+    w.acc = acc
+    w.bits = bits

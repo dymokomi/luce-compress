@@ -1,5 +1,6 @@
 module.lucb
 inflate.lucb
 deflate.lucb
+fastest.lucb
 codes.lucb
 tests.lucb

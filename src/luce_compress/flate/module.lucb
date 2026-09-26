@@ -19,6 +19,7 @@
 #       module.lucb    the API, CRC-32 (slicing by eight) and Adler-32
 #       inflate.lucb   the decoder
 #       deflate.lucb   the matcher and segment compressor
+#       fastest.lucb   level 1's chainless parser
 #       codes.lucb     Huffman code lengths and block writing
 #       tests.lucb     the module's tests
 #

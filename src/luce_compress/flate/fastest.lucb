@@ -1,0 +1,67 @@
+#==============================================================================================
+#
+#   flate/fastest - Level 1: libdeflate's fastest parser
+#
+#   DESCRIPTION:
+#       No hash chains: each 4-byte hash names a bucket of the two most recent positions
+#       with it, and a position takes the longer of their matches (four bytes at least),
+#       greedily. A match's covered positions still enter the buckets, so later text
+#       finds them. About three times the speed of the chained greedy parser for a few
+#       percent of size.
+#
+#==============================================================================================
+
+## Bucket hash table size: 2^15 buckets of two positions.
+let fastest_bits: u32 = 15
+## A match this long ends the search at once.
+let fastest_nice: usize = 32
+
+## Compress `data[0..<n]` into `c`'s writer at level 1.
+func compress_fastest(c: Compressor*, data: const u8*, n: usize, last: bool) -> !:
+    let buckets = try alloc i32[(usize)2 << fastest_bits] in memory.heap
+    defer free(buckets) in memory.heap
+    memory.set(u8[]((u8*)buckets.data, buckets.length * 4), 255)
+    let table = buckets.data
+    var p: usize = 0
+    while p < n:
+        if c.block.count >= block_symbols:
+            try c.flush(data, c.block_start, p, false)
+        if p +% 5 > n:
+            c.literal(data[p])
+            p = p +% 1
+            continue
+        let here = data + p
+        let seq = *(const u32*)here
+        let h = (usize)((seq *% 2654435761) >> (32 - fastest_bits)) << 1
+        let first = table[h]
+        let second = table[h + 1]
+        table[h] = (i32)p
+        table[h + 1] = first
+        let most = n - p if n - p < 258 else 258
+        let lowest = (i32)(p - window if p > window else 0)
+        var length: usize = 0
+        var distance: usize = 0
+        if first >= lowest and *(const u32*)(data + (usize)first) == seq:
+            length = match_length(data + (usize)first + 4, here + 4, most -% 4) +% 4
+            distance = p -% (usize)first
+        if length < fastest_nice and second >= lowest and *(const u32*)(data + (usize)second) == seq:
+            let other = match_length(data + (usize)second + 4, here + 4, most -% 4) +% 4
+            if other > length:
+                length = other
+                distance = p -% (usize)second
+        if length < 4:
+            c.literal(data[p])
+            p = p +% 1
+            continue
+        c.matched(length, distance)
+        # The covered positions enter their buckets too.
+        let end = p + length
+        let stop = end if end +% 5 <= n else (n - 4 if n > 4 else 0)
+        var k = p +% 1
+        while k < stop:
+            let kh = (usize)((*(const u32*)(data + k) *% 2654435761) >> (32 - fastest_bits)) << 1
+            table[kh + 1] = table[kh]
+            table[kh] = (i32)k
+            k = k +% 1
+        p = end
+    try c.flush(data, c.block_start, n, last)
