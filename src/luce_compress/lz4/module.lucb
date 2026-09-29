@@ -1,0 +1,188 @@
+#==============================================================================================
+#
+#   lz4 - LZ4 block compression
+#
+#   DESCRIPTION:
+#       The LZ4 block format (lz4_Block_format.md): sequences of a token, literal bytes and a
+#       match copied from earlier output at a 16-bit offset. `decompress` checks every length
+#       and offset against its buffers, so damaged input fails with `corrupt` rather than
+#       reading or writing out of bounds. `compress` is LZ4's fast greedy compressor (a hash
+#       table of four-byte sequences, 12-bit hashes over the last 64 KiB), and keeps the
+#       format's end rules: the last five bytes are literals and no match starts in the last
+#       twelve, so any LZ4 decoder reads its output. Its bytes need not equal the reference
+#       compressor's, only decode to the same data.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb    the compressor and the decompressor
+#       tests.lucb     round trips and damaged blocks
+#
+#==============================================================================================
+import memory
+import luce_compress.binary as binary
+
+## The block is damaged, or longer than the output it must fill.
+pub let corrupt = binary.corrupt
+## An input larger than a block may hold.
+pub let limit = binary.limit
+
+## The largest input one block holds (LZ4_MAX_INPUT_SIZE).
+pub let most_input: usize = 0x7E000000
+
+let min_match: usize = 4
+## No match starts in the last twelve bytes; the last five are literals.
+let match_limit: usize = 12
+let last_literals: usize = 5
+let hash_bits: u32 = 12
+let max_distance: usize = 65535
+
+## The most bytes compressing `size` input bytes can take (LZ4_compressBound).
+pub func bound(size: usize) -> usize:
+    return size + size // 255 + 16
+
+## Compress `input` into `output` (at least `bound(input.length)` bytes); the
+## compressed length.
+pub func compress(input: const u8[], output: u8[]) -> usize!:
+    if input.length > most_input: error(limit, "an LZ4 block holds at most 2,113,929,216 bytes")
+    if output.length < bound(input.length): error(limit, "the LZ4 output buffer is smaller than the bound")
+    var table: u32[4096]
+    let size = input.length
+    var out: usize = 0
+    var anchor: usize = 0
+    if size >= match_limit + 1:
+        let search_end = size - match_limit
+        let extend_end = size - last_literals
+        var at: usize = 1
+        table[hash_of(memory.read[u32]((void*)&input[0]))] = 0
+        var misses: u32 = 1 << 6
+        while at < search_end:
+            let sequence = memory.read[u32]((void*)&input[at])
+            let slot = hash_of(sequence)
+            let candidate = (usize)table[slot]
+            table[slot] = (u32)at
+            if candidate < at and at - candidate <= max_distance and memory.read[u32]((void*)&input[candidate]) == sequence:
+                var start = at
+                var reference = candidate
+                # Extend the match backwards over equal literals.
+                while start > anchor and reference > 0 and input[start - 1] == input[reference - 1]:
+                    start -= 1
+                    reference -= 1
+                var length = min_match + (at - start)
+                while start + length < extend_end and input[start + length] == input[reference + length]: length += 1
+                out = write_sequence(input, output, out, anchor, start, start - reference, length)
+                at = start + length
+                anchor = at
+                misses = 1 << 6
+                # Index the positions the match covered at its end.
+                if at - 2 < search_end: table[hash_of(memory.read[u32]((void*)&input[at - 2]))] = (u32)(at - 2)
+            else:
+                at += (usize)(misses >> 6)
+                misses += 1
+    # The remaining literals.
+    let literals = size - anchor
+    out = write_length(output, out, literals, 0)
+    if literals > 0: memory.copy(output[out..], input[anchor..], literals)
+    return out + literals
+
+## Decompress the block `input` into `output`; the decompressed length.
+pub func decompress(input: const u8[], output: u8[]) -> usize!:
+    var at: usize = 0
+    var out: usize = 0
+    while at < input.length:
+        let token = input[at]
+        at += 1
+        var literals = (usize)(token >> 4)
+        if literals == 15:
+            while true:
+                if at >= input.length: error(corrupt, "a truncated LZ4 literal length")
+                let extra = input[at]
+                at += 1
+                literals += (usize)extra
+                if extra != 255: break
+        if literals > input.length - at or literals > output.length - out: error(corrupt, "LZ4 literals run past a buffer")
+        if literals > 0: memory.copy(output[out..], input[at..], literals)
+        at += literals
+        out += literals
+        # The last sequence has literals only.
+        if at == input.length: break
+        if input.length - at < 2: error(corrupt, "a truncated LZ4 match offset")
+        let offset = (usize)input[at] | ((usize)input[at + 1] << 8)
+        at += 2
+        if offset == 0 or offset > out: error(corrupt, "an LZ4 match offset outside the output")
+        var length = (usize)(token & 15)
+        if length == 15:
+            while true:
+                if at >= input.length: error(corrupt, "a truncated LZ4 match length")
+                let extra = input[at]
+                at += 1
+                length += (usize)extra
+                if extra != 255: break
+        length += min_match
+        if length > output.length - out: error(corrupt, "an LZ4 match runs past the output")
+        let source = out - offset
+        if offset >= length:
+            memory.copy(output[out..], output[source..], length)
+        else:
+            # An overlapping match repeats the bytes it copies.
+            for index in 0..<length: output[out + index] = output[source + index]
+        out += length
+    return out
+
+inline func hash_of(sequence: u32) -> usize:
+    return (usize)((sequence *% 2654435761) >> (32 - hash_bits))
+
+## A token's length nibble and its extension bytes, at `out`; `shift` is 4
+## for a literal length (the token is written) or 0 for a match length.
+func write_length(output: u8[], at: usize, length: usize, shift: u32) -> usize:
+    var out = at
+    if length >= 15:
+        output[out] = (u8)(15 << 4)
+        out += 1
+        var rest = length - 15
+        while rest >= 255:
+            output[out] = 255
+            out += 1
+            rest -= 255
+        output[out] = (u8)rest
+        return out + 1
+    output[out] = (u8)(length << 4)
+    return out + 1
+
+## One sequence: the literals anchor..<start, then a match of `length`
+## bytes at `distance`. Returns the output position after it.
+func write_sequence(input: const u8[], output: u8[], at: usize, anchor: usize, start: usize, distance: usize, length: usize) -> usize:
+    let literals = start - anchor
+    let token = at
+    var out = at + 1
+    output[token] = 0
+    var token_bits: u8 = 0
+    if literals >= 15:
+        token_bits = 15 << 4
+        var rest = literals - 15
+        while rest >= 255:
+            output[out] = 255
+            out += 1
+            rest -= 255
+        output[out] = (u8)rest
+        out += 1
+    else:
+        token_bits = (u8)(literals << 4)
+    if literals > 0: memory.copy(output[out..], input[anchor..], literals)
+    out += literals
+    output[out] = (u8)(distance & 255)
+    output[out + 1] = (u8)(distance >> 8)
+    out += 2
+    let match_length = length - min_match
+    if match_length >= 15:
+        token_bits |= 15
+        var rest = match_length - 15
+        while rest >= 255:
+            output[out] = 255
+            out += 1
+            rest -= 255
+        output[out] = (u8)rest
+        out += 1
+    else:
+        token_bits |= (u8)match_length
+    output[token] = token_bits
+    return out

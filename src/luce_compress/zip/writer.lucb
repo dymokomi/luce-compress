@@ -1,0 +1,129 @@
+## Writing stored archives: every entry kept uncompressed, its data aligned
+## to a multiple of `alignment` bytes from the archive's start by padding in
+## the local header's extra field (header id 0x1986, as OpenUSD's
+## SdfZipFileWriter pads for usdz packages, whose layers are read in place).
+## `stored_size` gives the exact length; `write_stored` fills a buffer of it.
+
+## One file for `write_stored`: its name ('/'-separated) and bytes.
+pub struct StoredFile:
+    pub var name: str
+    pub var data: const u8[]
+
+## The extra-field id of padding records.
+let padding_id: u32 = 0x1986
+## A padding record needs at least its id and length.
+let padding_header: usize = 4
+
+## The padding before data that would start at `offset`.
+func padding(offset: usize, alignment: usize) -> usize:
+    if alignment <= 1: return 0
+    var needed = alignment - offset % alignment
+    if needed == alignment: return 0
+    if needed < padding_header: needed += alignment
+    return needed
+
+## The archive length `write_stored` needs for `files`.
+pub func stored_size(files: const StoredFile[], alignment: usize) -> usize:
+    var at: usize = 0
+    var directory: usize = 0
+    for file in files:
+        let start = at + local_size + file.name.length
+        let gap = padding(start, alignment)
+        at = start + gap + file.data.length
+        directory += central_size + file.name.length + gap
+    return at + directory + end_size
+
+## Write an archive of `files`, each stored, its data aligned to `alignment`
+## bytes, into `output` (at least `stored_size` bytes); the length written.
+## Fails with `limit` past the non-ZIP64 limits (65535 entries, 4 GiB).
+pub func write_stored(files: const StoredFile[], alignment: usize, output: u8[]) -> usize!:
+    if files.length > maximum_entries: error(limit, "a ZIP archive holds at most 65535 entries")
+    let size = stored_size(files, alignment)
+    if size > 0xFFFFFFFF: error(limit, "a ZIP archive without ZIP64 holds at most 4 GiB")
+    if output.length < size: error(limit, "the ZIP output buffer is smaller than the archive")
+    let offsets = try alloc usize[files.length] in memory.heap
+    defer free(offsets) in memory.heap
+    let crcs = try alloc u32[files.length] in memory.heap
+    defer free(crcs) in memory.heap
+    var at: usize = 0
+    for index in 0..<files.length:
+        let file = files[index]
+        let gap = padding(at + local_size + file.name.length, alignment)
+        offsets[index] = at
+        crcs[index] = flate.crc32(file.data)
+        write32(output, at, local_signature)
+        write16(output, at + 4, 10)
+        write16(output, at + 6, 0)
+        write16(output, at + 8, (u32)method_stored)
+        write16(output, at + 10, 0)
+        write16(output, at + 12, 0x21)
+        write32(output, at + 14, crcs[index])
+        write32(output, at + 18, (u32)file.data.length)
+        write32(output, at + 22, (u32)file.data.length)
+        write16(output, at + 26, (u32)file.name.length)
+        write16(output, at + 28, (u32)gap)
+        at += local_size
+        memory.copy(output[at..], file.name.bytes, file.name.length)
+        at += file.name.length
+        write_padding(output, at, gap)
+        at += gap
+        if file.data.length > 0: memory.copy(output[at..], file.data, file.data.length)
+        at += file.data.length
+    let directory_start = at
+    for index in 0..<files.length:
+        let file = files[index]
+        let gap = padding(offsets[index] + local_size + file.name.length, alignment)
+        write32(output, at, central_signature)
+        write16(output, at + 4, 0)
+        write16(output, at + 6, 10)
+        write16(output, at + 8, 0)
+        write16(output, at + 10, (u32)method_stored)
+        write16(output, at + 12, 0)
+        write16(output, at + 14, 0x21)
+        write32(output, at + 16, crcs[index])
+        write32(output, at + 20, (u32)file.data.length)
+        write32(output, at + 24, (u32)file.data.length)
+        write16(output, at + 28, (u32)file.name.length)
+        write16(output, at + 30, (u32)gap)
+        write16(output, at + 32, 0)
+        write16(output, at + 34, 0)
+        write16(output, at + 36, 0)
+        write32(output, at + 38, 0)
+        write32(output, at + 42, (u32)offsets[index])
+        at += central_size
+        memory.copy(output[at..], file.name.bytes, file.name.length)
+        at += file.name.length
+        write_padding(output, at, gap)
+        at += gap
+    write32(output, at, end_signature)
+    write16(output, at + 4, 0)
+    write16(output, at + 6, 0)
+    write16(output, at + 8, (u32)files.length)
+    write16(output, at + 10, (u32)files.length)
+    write32(output, at + 12, (u32)(at - directory_start))
+    write32(output, at + 16, (u32)directory_start)
+    write16(output, at + 20, 0)
+    return at + end_size
+
+func write_padding(output: u8[], at: usize, gap: usize):
+    if gap == 0: return
+    write16(output, at, padding_id)
+    write16(output, at + 2, (u32)(gap - padding_header))
+    for index in padding_header..<gap: output[at + index] = 0
+
+func write16(output: u8[], at: usize, value: u32):
+    output[at] = (u8)value
+    output[at + 1] = (u8)(value >> 8)
+
+func write32(output: u8[], at: usize, value: u32):
+    write16(output, at, value & 0xFFFF)
+    write16(output, at + 2, value >> 16)
+
+extend Archive:
+    ## A stored entry's bytes, in place in the archive (no copy, no CRC
+    ## check); fails with `unsupported` for a compressed entry.
+    pub func stored_bytes(entry: Entry) -> const u8[]!:
+        if entry.method != method_stored: error(unsupported, "the ZIP entry is compressed")
+        let packed = try self.packed(entry)
+        if packed.length != entry.size: error(corrupt, "a stored ZIP entry's sizes disagree")
+        return packed

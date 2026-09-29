@@ -202,7 +202,24 @@ defer free(settings) in memory.heap                      # CRC-32 checked
   encrypted entries and other methods. `invalid`: no end record; `corrupt`: records
   outside the bytes or contradicting each other, a bad DEFLATE stream or CRC-32;
   `limit_exceeded`: more entries than `max_entries` or an entry over `max_size`;
-  `missing`: no entry by that name. Read-only: no writer yet.
+  `missing`: no entry by that name.
+- `Archive.stored_bytes(entry)` returns a stored entry's bytes in place, without a copy
+  or a CRC check (usdz layers are read this way).
+- Writing: `stored_size(files, alignment)` and `write_stored(files, alignment, output)`
+  write an archive of `StoredFile(name, data)` entries, all stored, each entry's data
+  starting at a multiple of `alignment` bytes (padding in the local header's extra field,
+  id 0x1986, as usdz packages require: alignment 64). No compression, no ZIP64.
+
+## LZ4 blocks (`lz4`)
+
+`import lz4` (Base) compresses and decompresses the LZ4 block format, the one USD crate
+files use through `TfFastCompression`:
+
+- `bound(size)` is the most bytes compressing `size` bytes can take.
+- `compress(input, output) -> usize` is LZ4's fast greedy compressor (12-bit hashes over a
+  64 KiB window) and keeps the format's end rules, so any LZ4 decoder reads its output.
+- `decompress(input, output) -> usize` checks every length and offset; damaged blocks and
+  an output that is too small fail with `corrupt`.
 
 ## Bounds and errors
 

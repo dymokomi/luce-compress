@@ -1,0 +1,67 @@
+#==============================================================================================
+#
+#   lz4/tests - Round trips over repetitive and random data, and damaged blocks
+#
+#==============================================================================================
+
+## Compress then decompress `data`; the round trip must be exact.
+func round_trip(data: const u8[]) -> usize!:
+    let packed = try alloc u8[bound(data.length)] in memory.heap
+    defer free(packed) in memory.heap
+    let length = try compress(data, packed)
+    let back = try alloc u8[data.length + 1] in memory.heap
+    defer free(back) in memory.heap
+    let restored = try decompress(packed[..<length], back)
+    assert(restored == data.length)
+    for index in 0..<data.length: assert(back[index] == data[index])
+    return length
+
+test "empty, short and incompressible inputs round-trip":
+    discard(try round_trip(b""))
+    discard(try round_trip(b"a"))
+    discard(try round_trip(b"twelve bytes"))
+    var noise: u8[4096]
+    var state: u32 = 12345
+    for index in 0..<noise.length:
+        state = state *% 1103515245 +% 12345
+        noise[index] = (u8)(state >> 16)
+    discard(try round_trip(noise))
+
+test "repetitive inputs compress, overlapping matches included":
+    var runs: u8[100000]
+    for index in 0..<runs.length: runs[index] = (u8)((index // 1000) % 7)
+    let packed = try round_trip(runs)
+    assert(packed < runs.length // 20)
+    var pattern: u8[5000]
+    let letters = b"abc"
+    for index in 0..<pattern.length: pattern[index] = letters[index % 3]
+    discard(try round_trip(pattern))
+    # Integer arrays, the data crate files hold.
+    var ints: u8[40000]
+    for index: usize in 0..<10000: memory.write[u32]((void*)&ints[index * 4], (u32)(index * 4 % 997))
+    discard(try round_trip(ints))
+
+test "damaged blocks fail with corrupt":
+    var out: u8[64]
+    # A match before the start of the output.
+    let bad_offset: u8[4] = [0x10, 0x41, 0x05, 0x00]
+    let failed = decompress(bad_offset, out) catch failure:
+        assert(failure.code == corrupt)
+        recover 0
+    assert(failed == 0)
+    # Literals past the end of the input.
+    let short: u8[2] = [0xF0, 0x20]
+    let truncated = decompress(short, out) catch failure:
+        assert(failure.code == corrupt)
+        recover 0
+    assert(truncated == 0)
+    # Output too small.
+    var runs: u8[1000]
+    let packed = try alloc u8[bound(runs.length)] in memory.heap
+    defer free(packed) in memory.heap
+    let length = try compress(runs, packed)
+    var small: u8[100]
+    let overflow = decompress(packed[..<length], small) catch failure:
+        assert(failure.code == corrupt)
+        recover 0
+    assert(overflow == 0)

@@ -222,3 +222,26 @@ test "truncated and foreign bytes fail cleanly":
             continue
         archive.close()
         assert(false)
+
+test "stored archives align their data and read back":
+    let files: StoredFile[3] = [
+        StoredFile(name = "root.usdc", data = b"PXR-USDC and some bytes"),
+        StoredFile(name = "textures/a.png", data = b"\x89PNG"),
+        StoredFile(name = "empty.txt", data = b""),
+    ]
+    let size = stored_size(files, 64)
+    let output = try alloc u8[size] in memory.heap
+    defer free(output) in memory.heap
+    let written = try write_stored(files, 64, output)
+    assert(written == size)
+    var archive = try open(output[..<written])
+    defer archive.close()
+    assert(archive.count == 3)
+    for index in 0..<3:
+        let entry = archive.find(files[index].name) else trap("missing entry")
+        let data = try archive.stored_bytes(entry)
+        assert(data.length == files[index].data.length)
+        if data.length > 0: assert(((usize)data.data - (usize)output.data) % 64 == 0)
+        let copy = try archive.extract(entry)
+        defer free(copy) in memory.heap
+        for at in 0..<copy.length: assert(copy[at] == files[index].data[at])
