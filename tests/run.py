@@ -37,6 +37,7 @@ def main():
     for flags in (["--native"], ["--backend=c"]):
         if args.mode == "all" or (args.mode == "c") == (flags[0] == "--backend=c"):
             run([args.base.resolve(), "test", ROOT / "src/luce_compress/flate", *flags])
+            run([args.base.resolve(), "test", ROOT / "src/luce_compress/zip", *flags])
     for mode, flags in MODES.items():
         if args.mode != "all" and args.mode != mode:
             continue

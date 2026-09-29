@@ -5,6 +5,8 @@ pub let corrupt: ErrorCode = ErrorCode.package(2)
 pub let limit: ErrorCode = ErrorCode.package(3)
 pub let unsupported: ErrorCode = ErrorCode.package(4)
 pub let closed: ErrorCode = ErrorCode.package(5)
+## A named entry is not in the archive (zip).
+pub let missing: ErrorCode = ErrorCode.package(6)
 pub let maximum: usize = 1073741824
 
 pub func checked_limit(value: i64) -> usize!:

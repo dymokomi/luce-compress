@@ -1,0 +1,226 @@
+#==============================================================================================
+#
+#   zip - Read-only ZIP archives: the central directory, and one entry at a time
+#
+#   DESCRIPTION:
+#       What a format packed in a ZIP needs (Procreate brushes, OpenDocument, EPUB):
+#       `open` finds the end-of-central-directory record, reads the central directory
+#       into a list of entries (name, method, sizes, CRC-32, local header offset), and
+#       `read` inflates one entry into a heap buffer and checks its CRC-32. Entries are
+#       stored (method 0) or DEFLATE (method 8, through flate's table-driven inflater).
+#       ZIP64, multi-disk archives, encryption and other methods are refused with
+#       their own errors rather than misread. Sizes come from the central directory,
+#       so entries written with a data descriptor read too. Every offset is checked
+#       against the bytes; an entry's size is capped by the caller's limit.
+#
+#       Base only: the archive borrows the caller's bytes and its entry names borrow
+#       them too, so keep the bytes alive while the archive is used.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb    the reader
+#       tests.lucb     the module's tests, over archives built in memory
+#
+#==============================================================================================
+import memory
+import luce_compress.flate as flate
+import luce_compress.binary as binary
+
+## The bytes are not a ZIP archive.
+pub let invalid = binary.invalid
+## The archive's records are damaged, or an entry fails its CRC-32.
+pub let corrupt = binary.corrupt
+## Too many entries, or an entry larger than the caller's limit.
+pub let limit = binary.limit
+## ZIP64, multi-disk, encryption or a compression method this reader lacks.
+pub let unsupported = binary.unsupported
+## No entry by the name asked for.
+pub let missing = binary.missing
+
+## Most entries an archive may list (a non-ZIP64 archive's own ceiling).
+pub let maximum_entries: usize = 65535
+## The default cap on one entry's uncompressed size: 256 MiB.
+pub let default_entry_limit: usize = 268435456
+## Method 0: the entry's bytes are stored as they are.
+pub let method_stored: u16 = 0
+## Method 8: the entry is a raw DEFLATE stream.
+pub let method_deflated: u16 = 8
+
+let end_signature: u32 = 0x06054b50
+let end_size: usize = 22
+let zip64_locator_signature: u32 = 0x07064b50
+let central_signature: u32 = 0x02014b50
+let central_size: usize = 46
+let local_signature: u32 = 0x04034b50
+let local_size: usize = 30
+
+## One file an archive lists, from its central directory record.
+pub struct Entry:
+    ## The name as stored (UTF-8 or code page 437, '/'-separated); borrows the archive's bytes.
+    pub var name: str
+    ## How the bytes are packed: `method_stored`, `method_deflated`, or another the reader refuses.
+    pub var method: u16
+    ## The general-purpose flags; bit 0 marks an encrypted entry.
+    pub var flags: u16
+    ## The CRC-32 of the uncompressed bytes.
+    pub var crc: u32
+    pub var compressed_size: usize
+    ## The uncompressed size.
+    pub var size: usize
+    ## Where the entry's local header starts in the archive.
+    pub var offset: usize
+
+    ## Whether the entry names a directory (its name ends in '/') rather than a file.
+    pub func is_directory() -> bool:
+        return self.name.length > 0 and self.name.bytes[self.name.length - 1] == 47
+
+## An archive's directory over bytes the caller keeps alive. `close` frees the list.
+pub struct Archive:
+    ## The whole archive, borrowed.
+    pub var data: const u8[]
+    ## The entries in central-directory order; the first `count` are used.
+    pub var entries: Entry[]
+    pub var count: usize
+
+    ## The entry called `name` (exactly, case and all), if there is one.
+    pub func find(name: str) -> Entry?:
+        for index in 0..<self.count:
+            if self.entries[index].name == name:
+                return self.entries[index]
+        return none
+
+    ## Whether the archive lists an entry called `name`.
+    pub func has(name: str) -> bool:
+        if let entry = self.find(name):
+            return true
+        return false
+
+    ## The entry called `name`, uncompressed into a heap buffer the caller frees
+    ## (`free(bytes) in memory.heap`). Fails with `missing` when there is none, and
+    ## with `limit` when its size is over `max_size`.
+    pub func read(name: str, max_size: usize = default_entry_limit) -> u8[]!:
+        let entry = self.find(name) else error(missing, "the archive has no such entry")
+        return try self.extract(entry, max_size)
+
+    ## `entry`'s bytes, uncompressed into a heap buffer the caller frees, their
+    ## CRC-32 checked. An empty entry is a zero-length heap allocation.
+    pub func extract(entry: Entry, max_size: usize = default_entry_limit) -> u8[]!:
+        if (entry.flags & 1) != 0 or (entry.flags & 64) != 0:
+            error(unsupported, "encrypted ZIP entries are not supported")
+        if entry.method != method_stored and entry.method != method_deflated:
+            error(unsupported, "the ZIP entry's compression method is not supported")
+        if entry.size > max_size:
+            error(limit, "the ZIP entry is larger than the limit")
+        let packed = try self.packed(entry)
+        if entry.method == method_stored and packed.length != entry.size:
+            error(corrupt, "a stored ZIP entry's sizes disagree")
+        let output = try alloc u8[entry.size] in memory.heap
+        errdefer free(output) in memory.heap
+        if entry.method == method_stored:
+            if entry.size > 0:
+                memory.copy(output, packed, entry.size)
+        else:
+            let used = flate.inflate_raw(packed, output) catch failure:
+                error(corrupt, failure.message)
+            discard(used)
+        if flate.crc32(output) != entry.crc:
+            error(corrupt, "the ZIP entry's CRC-32 does not match")
+        return output
+
+    ## The compressed bytes of `entry`, after its local header.
+    func packed(entry: Entry) -> const u8[]!:
+        let data = self.data
+        if entry.offset > data.length or data.length - entry.offset < local_size:
+            error(corrupt, "a ZIP local header lies outside the archive")
+        if read32(data, entry.offset) != local_signature:
+            error(corrupt, "a ZIP local header is missing")
+        let start = entry.offset + local_size + (usize)read16(data, entry.offset + 26) + (usize)read16(data, entry.offset + 28)
+        if start > data.length or data.length - start < entry.compressed_size:
+            error(corrupt, "a ZIP entry runs past the end of the archive")
+        if entry.compressed_size == 0:
+            return b""
+        return data[start..<start + entry.compressed_size]
+
+    ## Free the entry list; the borrowed bytes stay the caller's.
+    pub mutating func close():
+        if self.entries.length > 0:
+            free(self.entries) in memory.heap
+        var empty: Entry[]
+        self.entries = empty
+        self.count = 0
+
+## The archive in `data`: its central directory read and checked. Fails with
+## `invalid` when `data` is not a ZIP, `unsupported` for ZIP64 or a multi-disk
+## archive, `corrupt` for records that contradict each other, and `limit` for
+## more than `max_entries` entries. Close the result.
+pub func open(data: const u8[], max_entries: usize = maximum_entries) -> Archive!:
+    let end = try find_end(data)
+    if read16(data, end + 4) != 0 or read16(data, end + 6) != 0 or read16(data, end + 8) != read16(data, end + 10):
+        error(unsupported, "multi-disk ZIP archives are not supported")
+    let total = (usize)read16(data, end + 10)
+    let directory_size = (usize)read32(data, end + 12)
+    let directory_offset = (usize)read32(data, end + 16)
+    if total == 65535 or read32(data, end + 12) == 0xFFFFFFFF or read32(data, end + 16) == 0xFFFFFFFF:
+        error(unsupported, "ZIP64 archives are not supported")
+    if end >= 20 and read32(data, end - 20) == zip64_locator_signature:
+        error(unsupported, "ZIP64 archives are not supported")
+    if total > max_entries:
+        error(limit, "the ZIP archive lists more entries than the limit")
+    if directory_offset > end or end - directory_offset < directory_size:
+        error(corrupt, "the ZIP central directory lies outside the archive")
+    var archive = Archive(data = data, count = 0)
+    if total == 0:
+        return archive
+    archive.entries = try alloc Entry[total] in memory.heap
+    errdefer archive.close()
+    var at = directory_offset
+    let stop = directory_offset + directory_size
+    for index in 0..<total:
+        archive.entries[index] = try central_entry(data, at, stop)
+        archive.count = index + 1
+        at += central_size + (usize)read16(data, at + 28) + (usize)read16(data, at + 30) + (usize)read16(data, at + 32)
+    return archive
+
+## The end-of-central-directory record's offset: searched back from the end over
+## the longest comment it can carry.
+func find_end(data: const u8[]) -> usize!:
+    if data.length < end_size:
+        error(invalid, "the data is too short to be a ZIP archive")
+    let last = data.length - end_size
+    let first = last - 65535 if last > 65535 else 0
+    var at = last
+    while true:
+        if read32(data, at) == end_signature and at + end_size + (usize)read16(data, at + 20) <= data.length:
+            return at
+        if at == first:
+            break
+        at -= 1
+    error(invalid, "no ZIP end-of-central-directory record")
+
+## The central directory record at `at`, which must end by `stop`.
+func central_entry(data: const u8[], at: usize, stop: usize) -> Entry!:
+    if at > stop or stop - at < central_size:
+        error(corrupt, "the ZIP central directory ends early")
+    if read32(data, at) != central_signature:
+        error(corrupt, "a ZIP central directory record is missing")
+    let name_length = (usize)read16(data, at + 28)
+    let record = central_size + name_length + (usize)read16(data, at + 30) + (usize)read16(data, at + 32)
+    if stop - at < record:
+        error(corrupt, "a ZIP central directory record runs past the directory")
+    let compressed = read32(data, at + 20)
+    let size = read32(data, at + 24)
+    let offset = read32(data, at + 42)
+    if compressed == 0xFFFFFFFF or size == 0xFFFFFFFF or offset == 0xFFFFFFFF:
+        error(unsupported, "ZIP64 entries are not supported")
+    let name_start = at + central_size
+    let name: str = (str)data[name_start..<name_start + name_length] if name_length > 0 else ""
+    return Entry(name = name, method = read16(data, at + 10), flags = read16(data, at + 8), crc = read32(data, at + 16),
+                 compressed_size = (usize)compressed, size = (usize)size, offset = (usize)offset)
+
+## The little-endian 16-bit value at `at`; the caller has checked the bounds.
+func read16(data: const u8[], at: usize) -> u16:
+    return (u16)data[at] | ((u16)data[at + 1] << 8)
+
+## The little-endian 32-bit value at `at`; the caller has checked the bounds.
+func read32(data: const u8[], at: usize) -> u32:
+    return (u32)data[at] | ((u32)data[at + 1] << 8) | ((u32)data[at + 2] << 16) | ((u32)data[at + 3] << 24)

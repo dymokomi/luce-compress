@@ -1,0 +1,224 @@
+#==============================================================================================
+#
+#   zip/tests - The module's tests, over archives built in memory
+#
+#   DESCRIPTION:
+#       A small writer lays out local headers, data and a central directory the way
+#       zip tools do, so each test can build an archive, then damage one field of it.
+#
+#==============================================================================================
+
+## One entry for `build`: its name, its bytes, and whether to deflate them.
+struct Item:
+    var name: str
+    var data: const u8[]
+    var deflate: bool
+
+## Appends little-endian fields to a caller's buffer.
+struct Writer:
+    var out: u8[]
+    var at: usize
+
+    mutating func put16(value: u32):
+        self.out[self.at] = (u8)value
+        self.out[self.at + 1] = (u8)(value >> 8)
+        self.at += 2
+
+    mutating func put32(value: u32):
+        self.put16(value & 65535)
+        self.put16(value >> 16)
+
+    mutating func put(data: const u8[]):
+        if data.length > 0:
+            memory.copy(self.out[self.at..], data, data.length)
+        self.at += data.length
+
+## The archive of `items` written into `out`, with `comment` after its end record;
+## returns its length.
+func build(out: u8[], items: const Item[], comment: str = "") -> usize!:
+    var w = Writer(out = out, at = 0)
+    var offsets: usize[8]
+    var packed_sizes: usize[8]
+    var packed: u8[4096]
+    for index in 0..<items.length:
+        let item = items[index]
+        offsets[index] = w.at
+        var size = item.data.length
+        if item.deflate:
+            size = try flate.deflate_raw(item.data, 6, packed, true)
+        packed_sizes[index] = size
+        w.put32(0x04034b50)
+        w.put16(20)
+        w.put16(0)
+        w.put16(8 if item.deflate else 0)
+        w.put32(0)
+        w.put32(flate.crc32(item.data))
+        w.put32((u32)size)
+        w.put32((u32)item.data.length)
+        w.put16((u32)item.name.length)
+        w.put16(0)
+        w.put(item.name.bytes)
+        w.put(packed[..<size] if item.deflate else item.data)
+    let directory = w.at
+    for index in 0..<items.length:
+        let item = items[index]
+        w.put32(0x02014b50)
+        w.put16(20)
+        w.put16(20)
+        w.put16(0)
+        w.put16(8 if item.deflate else 0)
+        w.put32(0)
+        w.put32(flate.crc32(item.data))
+        w.put32((u32)packed_sizes[index])
+        w.put32((u32)item.data.length)
+        w.put16((u32)item.name.length)
+        w.put16(0)
+        w.put16(0)
+        w.put16(0)
+        w.put16(0)
+        w.put32(0)
+        w.put32((u32)offsets[index])
+        w.put(item.name.bytes)
+    let directory_size = w.at - directory
+    w.put32(0x06054b50)
+    w.put16(0)
+    w.put16(0)
+    w.put16((u32)items.length)
+    w.put16((u32)items.length)
+    w.put32((u32)directory_size)
+    w.put32((u32)directory)
+    w.put16((u32)comment.length)
+    w.put(comment.bytes)
+    return w.at
+
+let text: str = "brush settings, brush settings, brush settings and a shape and a grain"
+
+## Whether opening `data` fails with `code`.
+func open_fails(data: const u8[], code: ErrorCode) -> bool:
+    var archive = open(data) catch failure:
+        return failure.code == code
+    archive.close()
+    return false
+
+## Whether reading `name` from `data` fails with `code`.
+func read_fails(data: const u8[], name: str, code: ErrorCode, max_size: usize = default_entry_limit) -> bool:
+    var archive = open(data) catch failure:
+        return false
+    defer archive.close()
+    let bytes = archive.read(name, max_size) catch failure:
+        return failure.code == code
+    free(bytes) in memory.heap
+    return false
+
+## The central directory's offset in the archive `data`.
+func directory_of(data: const u8[]) -> usize:
+    return (usize)read32(data, data.length - 22 + 16)
+
+test "stored and deflated entries list and read back, with a comment after the end":
+    let items: Item[3] = [Item(name = "Brush.archive", data = text.bytes, deflate = true),
+                          Item(name = "QuickLook/", data = b"", deflate = false),
+                          Item(name = "Shape.png", data = b"PNG stored bytes", deflate = false)]
+    var buffer: u8[4096]
+    let length = try build(buffer, items, "a comment")
+    var archive = try open(buffer[..<length])
+    defer archive.close()
+    assert(archive.count == 3)
+    assert(archive.entries[0].name == "Brush.archive" and archive.entries[0].method == method_deflated)
+    assert(archive.entries[0].size == text.length and archive.entries[0].compressed_size < text.length)
+    assert(archive.entries[1].is_directory() and not archive.entries[2].is_directory())
+    assert(archive.has("Shape.png") and not archive.has("shape.png"))
+    let settings = try archive.read("Brush.archive")
+    defer free(settings) in memory.heap
+    assert((str)settings == text)
+    let shape = try archive.read("Shape.png")
+    defer free(shape) in memory.heap
+    assert((str)shape == "PNG stored bytes")
+    let folder = try archive.read("QuickLook/")
+    defer free(folder) in memory.heap
+    assert(folder.length == 0)
+
+test "an empty archive has no entries":
+    let items: Item[1] = [Item(name = "unused", data = b"", deflate = false)]
+    var buffer: u8[64]
+    let length = try build(buffer, items[..<0])
+    var archive = try open(buffer[..<length])
+    assert(archive.count == 0 and not archive.has("x"))
+    archive.close()
+
+test "missing entries, limits and a damaged CRC fail with their codes":
+    let items: Item[2] = [Item(name = "a", data = text.bytes, deflate = true), Item(name = "b", data = b"stored", deflate = false)]
+    var buffer: u8[4096]
+    let length = try build(buffer, items)
+    let data = buffer[..<length]
+    assert(read_fails(data, "c", missing))
+    assert(read_fails(data, "a", limit, 10))
+    var refused = false
+    var limited = open(data, 1) catch failure:
+        refused = failure.code == limit
+        recover Archive(data = data, count = 0)
+    limited.close()
+    assert(refused)
+    # Flip a stored byte: the CRC no longer matches.
+    let stored_at = (usize)read32(data, directory_of(data) + 46 + 1 + 42) + 30 + 1
+    buffer[stored_at] ^= 1
+    assert(read_fails(data, "b", corrupt))
+    buffer[stored_at] ^= 1
+    # Damage the deflate stream's block type (reserved type 3).
+    let deflated_at = (usize)read32(data, directory_of(data) + 42) + 30 + 1
+    buffer[deflated_at] = 0xFF
+    assert(read_fails(data, "a", corrupt))
+
+test "encryption, other methods, ZIP64 and multi-disk archives are refused":
+    let items: Item[1] = [Item(name = "a", data = b"stored", deflate = false)]
+    var buffer: u8[4096]
+    let length = try build(buffer, items)
+    let data = buffer[..<length]
+    let central = directory_of(data)
+    buffer[central + 8] = 1
+    assert(read_fails(data, "a", unsupported))
+    buffer[central + 8] = 0
+    buffer[central + 10] = 12
+    assert(read_fails(data, "a", unsupported))
+    buffer[central + 10] = 0
+    for i in 0..<(usize)4:
+        buffer[central + 24 + i] = 0xFF
+    assert(open_fails(data, unsupported))
+    for i in 0..<(usize)4:
+        buffer[central + 24 + i] = 0
+    buffer[central + 24] = 6
+    let end = length - 22
+    buffer[end + 8] = 0xFF
+    buffer[end + 9] = 0xFF
+    buffer[end + 10] = 0xFF
+    buffer[end + 11] = 0xFF
+    assert(open_fails(data, unsupported))
+    buffer[end + 8] = 1
+    buffer[end + 9] = 0
+    buffer[end + 10] = 1
+    buffer[end + 11] = 0
+    buffer[end + 4] = 1
+    assert(open_fails(data, unsupported))
+    buffer[end + 4] = 0
+    var archive = try open(data)
+    assert(archive.count == 1)
+    archive.close()
+
+test "truncated and foreign bytes fail cleanly":
+    let items: Item[1] = [Item(name = "a", data = text.bytes, deflate = true)]
+    var buffer: u8[4096]
+    let length = try build(buffer, items)
+    assert(open_fails(b"", invalid))
+    assert(open_fails(b"PK not really an archive at all", invalid))
+    assert(open_fails(buffer[..<length - 1], invalid))
+    # The directory claims to start past its end record.
+    let end = length - 22
+    buffer[end + 16] = (u8)(length & 255)
+    buffer[end + 17] = (u8)(length >> 8)
+    assert(open_fails(buffer[..<length], corrupt))
+    # Every shorter prefix of a valid archive fails without reading past it.
+    let fresh = try build(buffer, items)
+    for cut in 0..<fresh:
+        var archive = open(buffer[..<cut]) catch failure:
+            continue
+        archive.close()
+        assert(false)

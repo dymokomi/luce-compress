@@ -175,6 +175,35 @@ let adler = flate.adler32_combine(flate.adler32(first), flate.adler32(second), s
 - `crc32(data, crc = 0)` (slicing by eight), `adler32(data, adler = 1)` and
   `adler32_combine` run several bytes a step.
 
+## Reading ZIP archives (`zip`)
+
+`import luce_compress.zip as zip` (Base) reads an archive held in memory, one entry at
+a time, for formats packed in a ZIP (Procreate brushes, OpenDocument, EPUB):
+
+```luce
+import luce_compress.zip as zip
+
+var archive = try zip.open(bytes)                        # finds the end record, reads the directory
+defer archive.close()                                    # frees the entry list; `bytes` stay yours
+for index in 0..<archive.count:
+    let entry = archive.entries[index]                   # name, method, flags, crc, sizes, offset
+let settings = try archive.read("Brush.archive", max_size = 1048576)
+defer free(settings) in memory.heap                      # CRC-32 checked
+```
+
+- `open(data, max_entries = 65535) -> Archive` searches back over the longest comment
+  for the end-of-central-directory record and reads every central record. The archive
+  and its entry names borrow `data`.
+- `Archive.find(name) -> Entry?`, `has(name)`, `read(name, max_size = 256 MiB)` and
+  `extract(entry, max_size)`; the result is a heap buffer of exactly the entry's size.
+  Stored (0) and DEFLATE (8) entries read, the latter through `flate.inflate_raw`.
+  Sizes come from the central directory, so data-descriptor entries read too.
+- Refused with `unsupported`: ZIP64 (records or `0xFFFF…` fields), multi-disk archives,
+  encrypted entries and other methods. `invalid`: no end record; `corrupt`: records
+  outside the bytes or contradicting each other, a bad DEFLATE stream or CRC-32;
+  `limit_exceeded`: more entries than `max_entries` or an entry over `max_size`;
+  `missing`: no entry by that name. Read-only: no writer yet.
+
 ## Bounds and errors
 
 For the whole-buffer API, input is limited to 1 GiB; the output bound defaults to
@@ -222,6 +251,10 @@ seeded mutations, native ownership, Luce byte copies and eight independent worke
 AddressSanitizer/UndefinedBehaviorSanitizer run the native API and the full oracle.
 Negative tests reject crashes/sanitizer reports rather than counting them as valid
 parse failures. This is not a proof of complete coverage or a security review.
+
+ZIP tests build archives in memory (stored, deflated, empty, commented) and damage
+one field at a time: CRC-32, DEFLATE block type, encryption flag, method, ZIP64
+sizes and counts, disk numbers, directory offset, and every truncated prefix.
 
 Incremental tests add every first split and truncated prefix of short fixtures,
 one-byte and varying input/output, overwritten borrowed buffers, end-marker
