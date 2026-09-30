@@ -91,6 +91,39 @@ pub func inflate_zlib(data: const u8[], output: u8[]) -> usize!:
         error(corrupt, "zlib Adler checksum mismatch")
     return at + 4
 
+## A zlib stream of unknown length inflated through a 256 KiB window: each
+## run of output goes to `deliver` (valid during the call), at most
+## `maximum` bytes in all; the header and Adler-32 are checked. The bytes of
+## `data` it used.
+pub func inflate_zlib_streamed(data: const u8[], maximum: usize, deliver: Deliver, context: void*?) -> usize!:
+    if data.length < 6 or (data[0] & 15) != 8 or data[0] >> 4 > 7 or (((u32)data[0] << 8) | (u32)data[1]) % 31 != 0:
+        error(corrupt, "invalid zlib header")
+    if (data[1] & 32) != 0:
+        error(corrupt, "preset zlib dictionaries are not supported")
+    let through = try alloc u8[262144] in memory.heap
+    defer free(through) in memory.heap
+    var check = Checked(deliver = deliver, context = context, adler = 1)
+    var slide = Slide(deliver = checked_deliver, context = (void*)&check, base = 0, total = maximum, start = 0, open = true)
+    let used = try inflate_through(data[2..], none, through, &slide, none, none)
+    let at = 2 + used
+    if data.length - at < 4:
+        error(corrupt, "truncated zlib stream")
+    let stored = ((u32)data[at] << 24) | ((u32)data[at + 1] << 16) | ((u32)data[at + 2] << 8) | (u32)data[at + 3]
+    if stored != check.adler:
+        error(corrupt, "zlib Adler checksum mismatch")
+    return at + 4
+
+## A streamed inflate's receiver: the caller's, and the Adler-32 so far.
+struct Checked:
+    var deliver: Deliver
+    var context: void*?
+    var adler: u32
+
+func checked_deliver(context: void*?, bytes: const u8[]) -> !:
+    let check = (Checked*)(context else return)
+    check.adler = adler32(bytes, check.adler)
+    try check.deliver(check.context, bytes)
+
 struct Compressor:
     var symbols: Symbols
     var head: i32[]

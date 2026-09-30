@@ -218,6 +218,8 @@ struct Slide:
     var total: usize
     ## The first byte in the window not yet delivered.
     var start: usize
+    ## `total` is a limit rather than the exact length.
+    var open: bool = false
 
     ## The window's end the decoder stops short of to slide it.
     func edge(size: usize) -> usize:
@@ -238,7 +240,7 @@ struct Slide:
 
     ## The end: the rest handed on, and the output its promised length.
     mutating func finish(through: u8[], o: usize) -> !:
-        if self.base + o != self.total:
+        if self.base + o != self.total and not self.open:
             error(corrupt, "deflate stream is shorter than its output")
         if let deliver = self.deliver:
             try deliver(self.context, through[self.start..<o])
@@ -366,6 +368,96 @@ func decode_block(s: Stream*, literals: const Table*, distances: const Table*, o
     var bits = s.bits
     var input = s.data
     var input_end = s.length
+    # The fast loop, while 16 bytes of input and a match's worth of output
+    # (before the slide's edge) are left: one branchless refill a symbol,
+    # no output checks, and copies free to run over by a word. Its
+    # arithmetic wraps and its shift counts are masked: the loop's bounds
+    # already keep every value in range, so no check is needed.
+    var pos = s.pos
+    let fast_end = (edge if edge < size else size) -| slack
+    let fast_input = input_end -| 16
+    while o < fast_end and pos <= fast_input:
+        acc |= *(const u64*)(input + pos) << (u64)(bits & 63)
+        pos = pos +% (usize)((63 -% bits) >> 3)
+        bits |= 56
+        var e = lit[(usize)(acc & 4095)]
+        if e & 15 == 0:
+            e = literals.slow(acc)
+            if e & 15 == 0:
+                error(corrupt, "invalid Huffman symbol")
+        acc >>= (u64)(e & 15)
+        bits = bits -% (e & 15)
+        let kind = (e >> 4) & 3
+        if kind == literal_kind:
+            out[o] = (u8)(e >> 16)
+            o = o +% 1
+            # Two more literals without refilling: at least 41 bits remain.
+            let second = lit[(usize)(acc & 4095)]
+            if second & 15 == 0 or (second >> 4) & 3 != literal_kind: continue
+            acc >>= (u64)(second & 15)
+            bits = bits -% (second & 15)
+            out[o] = (u8)(second >> 16)
+            o = o +% 1
+            let third = lit[(usize)(acc & 4095)]
+            if third & 15 == 0 or (third >> 4) & 3 != literal_kind: continue
+            acc >>= (u64)(third & 15)
+            bits = bits -% (third & 15)
+            out[o] = (u8)(third >> 16)
+            o = o +% 1
+            continue
+        if kind == end_kind:
+            s.acc = acc
+            s.bits = bits
+            s.pos = pos
+            return o
+        if kind == invalid_kind:
+            error(corrupt, "invalid deflate length symbol")
+        # A match: its extra bits, distance code and extra bits fit the 41 left.
+        let extra = (e >> 8) & 15
+        let length = (usize)(e >> 16) +% (usize)(acc & ((((u64)1) << (u64)extra) -% 1))
+        acc >>= (u64)extra
+        bits = bits -% extra
+        var d = dist[(usize)(acc & 4095)]
+        if d & 15 == 0:
+            d = distances.slow(acc)
+            if d & 15 == 0:
+                error(corrupt, "invalid Huffman symbol")
+        acc >>= (u64)(d & 15)
+        bits = bits -% (d & 15)
+        if (d >> 4) & 3 != match_kind:
+            error(corrupt, "invalid deflate distance symbol")
+        let dextra = (d >> 8) & 15
+        let distance = (usize)(d >> 16) +% (usize)(acc & ((((u64)1) << (u64)dextra) -% 1))
+        acc >>= (u64)dextra
+        bits = bits -% dextra
+        if distance > o or distance > 32768:
+            error(corrupt, "invalid deflate back reference")
+        let to = out + o
+        let back = out + (o -% distance)
+        if distance >= 8:
+            var n: usize = 0
+            while n < length:
+                *(u64*)(to + n) = *(const u64*)(back + n)
+                n = n +% 8
+        elif distance == 1:
+            memory.set(u8[](to, length), *back)
+        else:
+            # A short period: its first eight-or-more bytes one by one, then
+            # words from that far back (a multiple of the period).
+            let period = distance * ((8 + distance - 1) // distance)
+            var n: usize = 0
+            while n < period and n < length:
+                to[n] = back[n]
+                n = n +% 1
+            while n < length:
+                *(u64*)(to + n) = *(const u64*)(to + (n -% period))
+                n = n +% 8
+        o = o +% length
+        if o >= *next_report:
+            if let report = progress:
+                report(context, o)
+            *next_report = o + 262144
+    s.pos = pos
     while true:
         if o > edge:
             o = try slide.advance(output, o)

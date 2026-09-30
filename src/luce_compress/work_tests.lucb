@@ -8,9 +8,16 @@ func equal(actual: const u8[], expected: const u8[]):
     assert(actual.length == expected.length)
     for i in 0..<actual.length: assert(actual[i] == expected[i])
 
+## The incremental encoder's own zlib stream of `plain` (the whole-buffer
+## encoder, flate, writes different bytes).
+func stream_of(plain: const u8[]) -> interop.Reference[compress.Data]!:
+    var deflater = try compress.Deflater()
+    defer deflater.close()
+    return try deflater.feed(plain, 65536, true, codec.maximum_work_limit)
+
 func native_validation(framing: str) -> !:
     let plain = b"cooperative cooperative cooperative"
-    let source = try compress.encode(plain)
+    let source = try stream_of(plain)
     defer source.release()
     let wrapped = try source.value().bytes()
     let packed = wrapped if framing == "zlib" else wrapped[2..<wrapped.length - 4]
@@ -106,7 +113,9 @@ func facade_and_cancellation(framing: str) -> !:
     let original = try compress.encode(plain)
     defer original.release()
     assert(try original.value().work_units() == 0)  ## whole-buffer API is not step-budgeted
-    let wrapped = try original.value().bytes()
+    let reference = try stream_of(plain)
+    defer reference.release()
+    let wrapped = try reference.value().bytes()
     let packed = wrapped if framing == "zlib" else wrapped[2..<wrapped.length - 4]
     ## Stop at several internal yield points. There is no concurrent cross-worker
     ## close: cancellation is simply owner-side reset/close between bounded calls.

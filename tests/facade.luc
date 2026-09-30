@@ -41,14 +41,15 @@ pub func main(arguments: list[str]) -> int!:
     while true:
         let chunk = encoder.feed(plain[input_at..], capacity = 64, final_input = true, work_limit = 1)
         assert(chunk.work_units() == 1)
-        assert(chunk.bytes() == source.bytes()[output_at..<output_at + chunk.bytes().length])
+        # The incremental encoder's stream (packed above), not the whole-buffer one.
+        assert(chunk.bytes() == packed.bytes()[output_at..<output_at + chunk.bytes().length])
         input_at += chunk.consumed()
         output_at += chunk.bytes().length
         steps += 1
         assert(steps < 100)
         if chunk.status() == finished: break
         assert(chunk.status() == yielded)
-    assert(input_at == plain.length and output_at == source.bytes().length)
+    assert(input_at == plain.length and output_at == packed.bytes().length)
     assert(encoder.feed(b"", work_limit = 1).work_units() == 0)
     input_at = 0
     output_at = 0

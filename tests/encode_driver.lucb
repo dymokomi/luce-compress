@@ -75,14 +75,15 @@ pub func main(arguments: str[]) -> i32!:
             assert(statistics.finished and consumed == plain.length)
             let done = try encoder.step(b"a different stream", output, true)
             assert(done.status == codec.finished and done.consumed == 0 and done.produced == 0 and done.work_units == 0)
-            ## Additional deterministic-policy regression; Python independently
-            ## validates the wire output, so this isn't the sole correctness oracle.
-            let reference = try compress.encode(plain, 2097152)
-            defer reference.release()
-            let wrapped = try reference.value().bytes()
-            let expected = wrapped if arguments[3] == "zlib" else wrapped[2..<wrapped.length - 4]
-            assert(expected.length == packed_size)
-            for i in 0..<expected.length: assert(expected[i] == packed[i])
+            ## The whole-buffer encoder (flate) writes other bytes, so a zlib
+            ## stream is checked by decoding it back; Python independently
+            ## validates the wire output of both framings.
+            if arguments[3] == "zlib":
+                let decoded = try compress.decode(packed[..<packed_size], 2097152)
+                defer decoded.release()
+                let back = try decoded.value().bytes()
+                assert(back.length == plain.length)
+                for i in 0..<back.length: assert(back[i] == plain[i])
             try files.write((c.str)arguments[2], packed[..<packed_size])
             print(f"OK {consumed} {packed_size} {steps + 1} {yields} {empty_yields} {total_work}")
             return 0

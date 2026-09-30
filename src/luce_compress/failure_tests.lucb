@@ -526,6 +526,24 @@ func cooperative_failures(heap: Heap*, encoding: bool, input: const u8[], expect
     heap.clean()
     return checks
 
+## `input` through the incremental encoder in one pass: its own stream,
+## which the whole-buffer encoder (flate) no longer matches byte for byte.
+func streamed(input: const u8[]) -> u8[]!:
+    var encoder = try codec.make_encoder()
+    defer encoder.close()
+    let out = try alloc u8[input.length + input.length // 8 + 1024] in memory.heap
+    var used: usize = 0
+    var at: usize = 0
+    while true:
+        let step = try encoder.step(input[at..], out[used..], true, codec.maximum_work_limit)
+        at += (usize)step.consumed
+        used += (usize)step.produced
+        if step.status == codec.finished: break
+    let exact = try alloc u8[used] in memory.heap
+    memory.copy(exact, out[..<used], used)
+    free(out) in memory.heap
+    return exact
+
 pub func main(arguments: str[]) -> i32!:
     discard(arguments)
     ## Inputs and clean expected bytes belong to the original allocator. They are
@@ -547,6 +565,11 @@ pub func main(arguments: str[]) -> i32!:
     let short_encoded = try compress.encode(short_plain)
     defer short_encoded.release()
     let short_packed = try short_encoded.value().bytes()
+    # The incremental encoder's streams, what its failure cases expect.
+    let stream_packed = try streamed(plain)
+    defer free(stream_packed) in memory.heap
+    let stream_short = try streamed(short_plain)
+    defer free(stream_short) in memory.heap
     let oversized = try alloc u8[1048577] in memory.heap
     defer free(oversized) in memory.heap
     var damaged: u8[10000]
@@ -557,19 +580,19 @@ pub func main(arguments: str[]) -> i32!:
     memory.heap = &heap
     defer memory.heap = original
     var checks = try constructors(&heap)
-    checks += try one_shot(&heap, plain, packed, true, 16384, none, 10)
-    checks += try one_shot(&heap, packed, plain, false, 8192, none, 8)
-    checks += try one_shot(&heap, b"", empty_packed, true, 8, none, 4)
-    checks += try one_shot(&heap, empty_packed, b"", false, 0, none, 2)
-    checks += try one_shot(&heap, plain, b"", true, 513, compress.limit_exceeded, 4)
-    checks += try one_shot(&heap, packed, b"", false, 513, compress.limit_exceeded, 3)
-    checks += try one_shot(&heap, damaged[..<packed.length], b"", false, 8192, compress.corrupt, 6)
+    checks += try one_shot(&heap, plain, packed, true, 16384, none, 9)
+    checks += try one_shot(&heap, packed, plain, false, 8192, none, 5)
+    checks += try one_shot(&heap, b"", empty_packed, true, 8, none, 9)
+    checks += try one_shot(&heap, empty_packed, b"", false, 0, none, 4)
+    checks += try one_shot(&heap, plain, b"", true, 513, compress.limit_exceeded, 6)
+    checks += try one_shot(&heap, packed, b"", false, 513, compress.limit_exceeded, 2)
+    checks += try one_shot(&heap, damaged[..<packed.length], b"", false, 8192, compress.corrupt, 3)
     try buffer_retry(&heap)
     try inflate_exhaustion(&heap, plain, packed)
-    try native_without_allocations(&heap, plain, packed)
+    try native_without_allocations(&heap, plain, stream_packed)
     for encoding in [false, true]:
         for framing in ["zlib", "raw"]:
-            let framed = packed if framing == "zlib" else packed[2..<packed.length - 4]
+            let framed = stream_packed if framing == "zlib" else stream_packed[2..<stream_packed.length - 4]
             let input = plain if encoding else framed
             let expected = framed if encoding else plain
             let traced = try feed_attempt(&heap, encoding, framing, input, expected, 31, 0, 0, false)
@@ -583,8 +606,8 @@ pub func main(arguments: str[]) -> i32!:
                             discard(try feed_attempt(&heap, encoding, framing, input, expected, capacity, target, at, persistent))
                             checks += 1
         checks += try validation_and_finished(&heap, encoding, plain if encoding else packed, oversized)
-        checks += try cooperative_failures(&heap, encoding, short_plain if encoding else short_packed, short_packed if encoding else short_plain)
-        try retry_without_eof(&heap, encoding, plain if encoding else packed, packed if encoding else plain)
+        checks += try cooperative_failures(&heap, encoding, short_plain if encoding else stream_short, stream_short if encoding else short_plain)
+        try retry_without_eof(&heap, encoding, plain if encoding else stream_packed, stream_packed if encoding else plain)
         checks += 1
     try poisoned_cleanup(&heap, true, "zlib", plain)
     try poisoned_cleanup(&heap, true, "raw", plain)

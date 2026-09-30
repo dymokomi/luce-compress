@@ -2,7 +2,6 @@
 import interop
 import memory
 import luce_compress.binary as binary
-import luce_compress.deflate as deflate
 import luce_compress.decoder as decoder
 import luce_compress.encoder as encoder
 import luce_compress.flate as flate
@@ -56,22 +55,42 @@ func owned(buffer: binary.Buffer, consumed: i64) -> interop.Reference[Data]!:
         error(failure.code, failure.message)
     return try interop.Reference[Data].adopt(native, data_type, memory.heap)
 
-pub func encode(data: const u8[], max_output: i64 = 67108864) -> interop.Reference[Data]!:
-    var output = binary.Buffer(maximum = try binary.checked_limit(max_output))
-    deflate.compress(data, &output) catch failure:
+## zlib compression levels: 0 stores, 1 is fastest, 9 smallest (flate's
+## libdeflate-style matchers); 6, zlib's default, balances them.
+pub let default_level: i64 = 6
+
+## `data` as a zlib stream at `level`, at most `max_output` bytes.
+pub func encode(data: const u8[], max_output: i64 = 67108864, level: i64 = default_level) -> interop.Reference[Data]!:
+    let most = try binary.checked_limit(max_output)
+    if level < 0 or level > 9: error(invalid, "compression level must be 0 through 9")
+    let packed = try compress(data, level)
+    defer free(packed) in memory.heap
+    if packed.length > most: error(limit_exceeded, "compressed or expanded byte limit exceeded")
+    var output = binary.Buffer(maximum = most)
+    output.put(packed) catch failure:
         output.close()
         error(failure.code, failure.message)
     return try owned(output, (i64)data.length)
 
+## The zlib stream at the start of `data` inflated, at most `max_output`
+## bytes; bytes after it fail unless `allow_trailing`.
 pub func decode(data: const u8[], max_output: i64 = 67108864, allow_trailing: bool = false) -> interop.Reference[Data]!:
     var output = binary.Buffer(maximum = try binary.checked_limit(max_output))
-    let used = deflate.inflate(data, &output) catch failure:
+    if data.length > binary.maximum:
+        error(limit_exceeded, "compressed input exceeds 1 GiB")
+    # One byte past the limit reaches the buffer, which reports the limit.
+    let used = flate.inflate_zlib_streamed(data, output.maximum + 1, append_output, (void*)&output) catch failure:
         output.close()
-        error(failure.code, failure.message)
+        if failure.code == memory.exhausted or failure.code == limit_exceeded: error(failure.code, failure.message)
+        error(corrupt, failure.message)
     if not allow_trailing and used != data.length:
         output.close()
         error(corrupt, "trailing bytes after zlib stream")
     return try owned(output, (i64)used)
+
+func append_output(context: void*?, bytes: const u8[]) -> !:
+    let output = (binary.Buffer*)(context else return)
+    try output.put(bytes)
 
 ## Inflate a whole zlib stream into `output`, which must be exactly the
 ## uncompressed size: what image codecs know from their headers. Base only; the
@@ -84,21 +103,24 @@ pub func inflate(data: const u8[], output: u8[]) -> !:
     if used != data.length:
         error(corrupt, "the zlib stream does not match its declared size")
 
-## Deflate `data` into a fresh zlib stream on the heap; the caller frees it. Base only.
-pub func compress(data: const u8[]) -> u8[]!:
-    var buffer = binary.Buffer(maximum = try binary.checked_limit(1073741824))
-    defer buffer.close()
-    try deflate.compress(data, &buffer)
-    let out = try alloc u8[buffer.used] in memory.heap
-    memory.copy(out, buffer.view(), buffer.used)
+## Deflate `data` at `level` (0 through 9, zlib's) into a fresh zlib stream
+## on the heap; the caller frees it. Base only.
+pub func compress(data: const u8[], level: i64 = default_level) -> u8[]!:
+    if level < 0 or level > 9: error(invalid, "compression level must be 0 through 9")
+    if data.length > binary.maximum: error(limit_exceeded, "input exceeds 1 GiB")
+    let scratch = try alloc u8[flate.deflate_bound(data.length) + 6] in memory.heap
+    defer free(scratch) in memory.heap
+    let used = try flate.deflate_zlib(data, (i32)level, scratch)
+    let out = try alloc u8[used] in memory.heap
+    memory.copy(out, scratch[..<used], used)
     return out
 
 ## Checksums are corruption checks, not cryptographic integrity/authentication.
 pub func adler32(data: const u8[]) -> i64:
-    return (i64)deflate.adler32(data)
+    return (i64)flate.adler32(data)
 
 pub func crc32(data: const u8[]) -> i64:
-    return (i64)deflate.crc32(data)
+    return (i64)flate.crc32(data)
 
 ## Chunk-owning facade. Native zero-copy callers use compress_native.Decoder.
 pub struct Inflater:

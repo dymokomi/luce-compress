@@ -30,11 +30,15 @@ pub func main(arguments: list[str]) -> int!:
     return 0
 ```
 
-- `encode(data, max_output=67108864)`: deterministic zlib stream using a bounded
-  32 KiB LZ77 match window and fixed Huffman codes.
+- `encode(data, max_output=67108864, level=6)`: a deterministic zlib stream at
+  zlib's levels 0-9 (0 stores, 1 is fastest, 9 smallest; 6 by default), made
+  by `flate`'s libdeflate-style matchers with dynamic, fixed or stored blocks.
+  Base callers use `compress(data, level=6)` for the bytes alone.
 - `decode(data, max_output=67108864, allow_trailing=false)`: stored/fixed/dynamic
-  DEFLATE blocks in one zlib stream; validates header, trees, backreferences and
-  Adler32. Trailing bytes, including another stream, are rejected by default.
+  DEFLATE blocks in one zlib stream, through `flate`'s table-driven decoder (a
+  256 KiB window, output grown to at most `max_output`); validates header,
+  trees, backreferences and Adler32. Trailing bytes, including another stream,
+  are rejected by default.
 - Results own their bytes. `bytes()` borrows them in Base; the Luce bridge copies
   them. `consumed()` is the input-byte count, including zlib header/checksum. With
   `allow_trailing=true`, it stops at the first stream so a caller can frame the next
@@ -119,6 +123,10 @@ Native consumers use `compress_native.make_encoder(...)`, returning an owning
 `Encoder` handle with `step(input, output, final_input=false, work_limit=4096)`. Do not copy this handle or
 share it across workers; its `close()` releases its two native allocations and is
 idempotent on that handle. The decoder remains a fixed-state value, not a handle.
+
+The incremental encoder is its own fixed-Huffman stream codec (work budgets, bounded
+state); its bytes differ from the whole-buffer `encode`, which is `flate`'s. Both are
+valid zlib and decode alike.
 
 The encoder retains a 65,536-entry match table, 32 KiB history, 258-byte circular
 lookahead and bounded pending bits. `encoder_storage_bytes()` is 557,448 bytes on

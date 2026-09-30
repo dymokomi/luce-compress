@@ -1,0 +1,45 @@
+## Inflate throughput, one thread: `inflate_bench <raw> [<zlib> ...]`. The raw
+## file is deflated whole at levels 1 and 6 and inflated back; each zlib
+## file (for instance zlib's own output of the same bytes, from Python's
+## zlib.compress) is inflated to the raw file's size. Prints the best of five
+## as MB/s of output, and checks every result against the raw bytes.
+import c
+import files
+import memory
+import time
+import flate
+
+func best_inflate(stream: const u8[], out: u8[], raw: const u8[], what: str) -> !:
+    var best: u64 = 0
+    for round in 0..<(usize)5:
+        let start = time.now()
+        discard(try flate.inflate_zlib(stream, out))
+        let spent = time.since(start)
+        if round == 0 or spent < best: best = spent
+    assert((str)out == (str)raw)
+    let mb = (f64)raw.length / 1000000.0
+    let seconds = (f64)best / 1000000000.0
+    print(f"{what}: inflate {(i64)(mb / seconds)} MB/s, {(f64)best / 1000000.0} ms ({stream.length} bytes in)")
+
+pub func main(arguments: str[]) -> i32!:
+    if arguments.length < 2:
+        print("usage: inflate_bench <raw> [<zlib> ...]")
+        return 2
+    let raw = try files.read((c.str)arguments[1])
+    defer free(raw) in memory.heap
+    let out = try alloc u8[raw.length] in memory.heap
+    defer free(out) in memory.heap
+    let packed = try alloc u8[flate.deflate_bound(raw.length) + 6] in memory.heap
+    defer free(packed) in memory.heap
+    for level in [1, 6]:
+        let start = time.now()
+        let size = try flate.deflate_zlib(raw, (i32)level, packed)
+        let spent = time.since(start)
+        print(f"flate level {level}: deflate {(i64)((f64)raw.length / 1000.0 / (f64)spent * 1000000.0 / 1000.0)} MB/s, {(f64)spent / 1000000.0} ms")
+        var label: u8[64] = ---
+        try best_inflate(packed[..<size], out, raw, try format(label, f"flate level {level}"))
+    for at in 2..<arguments.length:
+        let stream = try files.read((c.str)arguments[at])
+        defer free(stream) in memory.heap
+        try best_inflate(stream, out, raw, arguments[at])
+    return 0
