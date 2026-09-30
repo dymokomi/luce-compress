@@ -180,6 +180,13 @@ pub func inflate_raw(data: const u8[], output: u8[], progress: Progress? = none,
     var slide = Slide(deliver = none, context = none, base = 0, total = output.length, start = 0)
     return try inflate_through(data, none, output, &slide, progress, context)
 
+## Inflate the raw DEFLATE stream in `data` into `output`, at most its
+## length: the input bytes used and the output bytes made.
+pub func inflate_raw_bounded(data: const u8[], output: u8[]) -> (usize, usize)!:
+    var slide = Slide(deliver = none, context = none, base = 0, total = output.length, start = 0, open = true)
+    let used = try inflate_through(data, none, output, &slide, none, none)
+    return (used, slide.produced)
+
 ## Inflate the raw DEFLATE stream in `data`, `total` bytes of output, through
 ## `through` rather than one buffer the size of it all: each time it
 ## fills, the bytes not yet handed on go to `deliver`, and the last 32 KiB (all a
@@ -220,6 +227,8 @@ struct Slide:
     var start: usize
     ## `total` is a limit rather than the exact length.
     var open: bool = false
+    ## The whole stream's output, once finished.
+    var produced: usize = 0
 
     ## The window's end the decoder stops short of to slide it.
     func edge(size: usize) -> usize:
@@ -242,6 +251,7 @@ struct Slide:
     mutating func finish(through: u8[], o: usize) -> !:
         if self.base + o != self.total and not self.open:
             error(corrupt, "deflate stream is shorter than its output")
+        self.produced = self.base + o
         if let deliver = self.deliver:
             try deliver(self.context, through[self.start..<o])
 

@@ -33,12 +33,19 @@ pub func main(arguments: list[str]) -> int!:
 - `encode(data, max_output=67108864, level=6)`: a deterministic zlib stream at
   zlib's levels 0-9 (0 stores, 1 is fastest, 9 smallest; 6 by default), made
   by `flate`'s libdeflate-style matchers with dynamic, fixed or stored blocks.
-  Base callers use `compress(data, level=6)` for the bytes alone.
+  Base callers use `compress(data, level=6)` for the bytes alone. Over
+  2 MiB, both deflate 1 MiB segments on several threads (each with a fresh
+  window, joined by sync flushes into one stream any inflater reads, the
+  segments' Adler-32s combined), as pigz does; the bytes do not depend on
+  the machine.
 - `decode(data, max_output=67108864, allow_trailing=false)`: stored/fixed/dynamic
   DEFLATE blocks in one zlib stream, through `flate`'s table-driven decoder (a
   256 KiB window, output grown to at most `max_output`); validates header,
   trees, backreferences and Adler32. Trailing bytes, including another stream,
-  are rejected by default.
+  are rejected by default. A stream split into 1 MiB segments (what
+  `encode` and `compress` write over 2 MiB) decodes on several threads, as
+  does `inflate`'s: every segment is checked (its size, its end at the next
+  flush, the Adler-32), and any other stream decodes on one thread.
 - Results own their bytes. `bytes()` borrows them in Base; the Luce bridge copies
   them. `consumed()` is the input-byte count, including zlib header/checksum. With
   `allow_trailing=true`, it stops at the first stream so a caller can frame the next

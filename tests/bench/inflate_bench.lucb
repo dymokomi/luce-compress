@@ -2,12 +2,15 @@
 ## file is deflated whole at levels 1 and 6 and inflated back; each zlib
 ## file (for instance zlib's own output of the same bytes, from Python's
 ## zlib.compress) is inflated to the raw file's size. Prints the best of five
-## as MB/s of output, and checks every result against the raw bytes.
+## as MB/s of output, and checks every result against the raw bytes. Then
+## the whole-buffer API: compress (1 MiB segments on several threads) and
+## inflate back.
 import c
 import files
 import memory
 import time
 import flate
+import compress
 
 func best_inflate(stream: const u8[], out: u8[], raw: const u8[], what: str) -> !:
     var best: u64 = 0
@@ -38,6 +41,20 @@ pub func main(arguments: str[]) -> i32!:
         print(f"flate level {level}: deflate {(i64)((f64)raw.length / 1000.0 / (f64)spent * 1000000.0 / 1000.0)} MB/s, {(f64)spent / 1000000.0} ms")
         var label: u8[64] = ---
         try best_inflate(packed[..<size], out, raw, try format(label, f"flate level {level}"))
+    for level in [1, 6]:
+        let start = time.now()
+        let packed_all = try compress.compress(raw, (i64)level)
+        defer free(packed_all) in memory.heap
+        let spent = time.since(start)
+        print(f"compress.compress level {level}: {(f64)spent / 1000000.0} ms, {packed_all.length} bytes")
+        var best: u64 = 0
+        for round in 0..<(usize)5:
+            let inflated = time.now()
+            try compress.inflate(packed_all, out)
+            let took = time.since(inflated)
+            if round == 0 or took < best: best = took
+        assert((str)out == (str)raw)
+        print(f"compress.inflate of it: {(f64)best / 1000000.0} ms")
     for at in 2..<arguments.length:
         let stream = try files.read((c.str)arguments[at])
         defer free(stream) in memory.heap

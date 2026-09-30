@@ -1,0 +1,231 @@
+## Large whole buffers on several threads, as pigz splits them: deflated in
+## independent 1 MiB segments (each with a fresh window, ended by a sync
+## flush, the last by a final block) joined into one zlib stream with the
+## segments' Adler-32s combined, which any inflater reads; and inflated the
+## same way when a stream's sync flushes mark exactly such segments, which
+## is checked (each segment's size, its end at the next, the Adler-32) with
+## a fallback to one thread for any other stream. The segment size is fixed,
+## so the bytes do not depend on the machine.
+import memory
+import os
+import thread
+import luce_compress.flate as flate
+from luce_compress.binary import corrupt
+
+pub let segment_bytes: usize = 1048576
+## Buffers larger than this go on several threads.
+pub let parallel_above: usize = 2097152
+
+## One segment's work: its input, where its output goes, what it made.
+struct Piece:
+    var start: usize
+    var end: usize
+    var out: u8[]
+    var used: usize
+    var produced: usize
+    var adler: u32
+    var failed: bool
+
+struct Work:
+    var input: const u8[]
+    var output: u8[]
+    var pieces: Piece[]
+    var level: i32
+
+## `entry(context, index)` for every index below `count`, on this thread and
+## up to (processors - 1) more; a thread that cannot start leaves its share
+## to the others.
+struct Crew:
+    var next: @usize
+    var count: usize = 0
+    var entry: func(void*?, usize) -> unit = skip
+    var context: void*? = none
+
+func skip(context: void*?, index: usize):
+    discard(context)
+    discard(index)
+
+func crew_loop(context: void*?):
+    let crew = (Crew*)(context else return)
+    while true:
+        let index = crew.next.add(1, .relaxed)
+        if index >= crew.count: return
+        crew.entry(crew.context, index)
+
+func run(count: usize, entry: func(void*?, usize) -> unit, context: void*?):
+    var crew = Crew()
+    crew.next.store(0, .relaxed)
+    crew.count = count
+    crew.entry = entry
+    crew.context = context
+    var handles: thread.Handle[63]
+    var started: usize = 0
+    let wanted = (usize)os.cpus()
+    let helpers = (count if count < wanted else wanted) -| 1
+    while started < helpers and started < handles.length:
+        handles[started] = thread.spawn(crew_loop, (void*)&crew, 0, "luce-compress") catch failure:
+            discard(failure)
+            break
+        started += 1
+    crew_loop((void*)&crew)
+    for at in 0..<started:
+        handles[at].join() catch failure: discard(failure)
+
+func deflate_piece(context: void*?, index: usize):
+    let work = (Work*)(context else return)
+    let piece = &work.pieces[index]
+    let slice = work.input[piece.start..<piece.end]
+    piece.out = alloc u8[flate.deflate_bound(slice.length)] in memory.heap catch failure:
+        discard(failure)
+        piece.failed = true
+        recover empty()
+    if piece.failed: return
+    piece.used = flate.deflate_raw(slice, work.level, piece.out, piece.end == work.input.length) catch failure:
+        discard(failure)
+        piece.failed = true
+        recover 0
+    piece.adler = flate.adler32(slice)
+
+## `data` (over `parallel_above` bytes) as a zlib stream at `level`, its
+## segments deflated in parallel; on memory.heap, the caller frees it.
+pub func deflate(data: const u8[], level: i32) -> u8[]!:
+    let count = (data.length + segment_bytes - 1) // segment_bytes
+    let pieces = try alloc Piece[count] in memory.heap
+    for at in 0..<count:
+        let start = at * segment_bytes
+        pieces[at] = Piece(start = start, end = start + segment_bytes if data.length - start > segment_bytes else data.length, out = empty(), used = 0, produced = 0, adler = 1, failed = false)
+    defer release(pieces)
+    var work = Work(input = data, output = empty(), pieces = pieces, level = level)
+    run(count, deflate_piece, (void*)&work)
+    var total: usize = 6
+    for piece in pieces:
+        if piece.failed: error(memory.exhausted, "out of memory deflating a segment")
+        total += piece.used
+    let out = try alloc u8[total] in memory.heap
+    let header = flate.zlib_header(level)
+    out[0] = header[0]
+    out[1] = header[1]
+    var at: usize = 2
+    var adler: u32 = 1
+    for index in 0..<count:
+        let piece = &pieces[index]
+        memory.copy(out[at..], piece.out[..<piece.used], piece.used)
+        at += piece.used
+        adler = piece.adler if index == 0 else flate.adler32_combine(adler, piece.adler, piece.end - piece.start)
+    out[at] = (u8)(adler >> 24)
+    out[at + 1] = (u8)(adler >> 16)
+    out[at + 2] = (u8)(adler >> 8)
+    out[at + 3] = (u8)adler
+    return out
+
+func release(pieces: Piece[]):
+    for piece in pieces:
+        if piece.out.length > 0: free(piece.out) in memory.heap
+    free(pieces) in memory.heap
+
+func empty() -> u8[]:
+    var none_yet: u8[]
+    return none_yet
+
+## Where a zlib stream's payload has sync flushes (`00 00 FF FF`): the
+## offsets just after each, in order, into `starts` (as room allows); the
+## count, stopping past `most`. Words with no 0xFF byte are skipped eight
+## bytes at a time.
+func scan(data: const u8[], most: usize, starts: usize[]) -> usize:
+    if data.length < 10: return 0
+    let end = data.length - 4
+    var found: usize = 0
+    var at: usize = 2
+    let ones: u64 = 0x0101010101010101
+    let highs: u64 = 0x8080808080808080
+    while at + 8 <= end:
+        let inverted = ~memory.read[u64]((void*)&data[at])
+        # A zero byte of ~word is a 0xFF byte of the word.
+        if ((inverted -% ones) & ~inverted & highs) == 0:
+            at += 8
+            continue
+        for k in 0..<(usize)8:
+            let p = at + k
+            if p >= 4 and p + 2 <= end and data[p] == 255 and data[p + 1] == 255 and data[p - 1] == 0 and data[p - 2] == 0:
+                if found < starts.length: starts[found] = p + 2
+                found += 1
+                if found > most: return found
+        at += 8
+    # The tail, byte by byte.
+    var p = (at if at > 4 else 4)
+    while p + 2 <= end:
+        if data[p] == 255 and data[p + 1] == 255 and data[p - 1] == 0 and data[p - 2] == 0:
+            if found < starts.length: starts[found] = p + 2
+            found += 1
+            if found > most: return found
+        p += 1
+    return found
+
+## How many sync flushes (`00 00 FF FF`) a zlib stream's payload holds, up
+## to `most + 1`.
+pub func markers(data: const u8[], most: usize = 65536) -> usize:
+    var none_yet: usize[]
+    return scan(data, most, none_yet)
+
+## Where the segments of a zlib stream (`data`, header and Adler-32
+## included) start in its DEFLATE payload: after each sync flush; at most
+## `most` of them, else none (not such a stream).
+func boundaries(data: const u8[], most: usize) -> usize[]?!:
+    let starts = try alloc usize[most + 1] in memory.heap
+    let found = scan(data, most, starts)
+    if found > most:
+        free(starts) in memory.heap
+        return none
+    let exact = try alloc usize[found] in memory.heap
+    memory.copy(exact, starts[..<found], found)
+    free(starts) in memory.heap
+    return exact
+
+func inflate_piece(context: void*?, index: usize):
+    let work = (Work*)(context else return)
+    let piece = &work.pieces[index]
+    let limit = (index + 1) * segment_bytes
+    let room = work.output[index * segment_bytes..<(limit if limit < work.output.length else work.output.length)]
+    let (used, produced) = flate.inflate_raw_bounded(work.input[piece.start..<piece.end], room) catch failure:
+        discard(failure)
+        piece.failed = true
+        recover (0, 0)
+    if piece.failed: return
+    piece.used = used
+    piece.produced = produced
+    piece.adler = flate.adler32(room[..<produced])
+
+## Inflate `data`, a zlib stream, into `output` (room for the whole result)
+## on several threads when its sync flushes mark 1 MiB segments: the bytes
+## made, or none when the stream is not so split (or does not check out),
+## for a one-thread inflate to decide. With `exact`, the result must fill
+## `output`.
+pub func inflate(data: const u8[], output: u8[], exact: bool) -> usize?!:
+    if data.length < 10 or output.length <= parallel_above: return none
+    let most = (output.length + segment_bytes - 1) // segment_bytes - 1
+    let starts = (try boundaries(data, most)) else return none
+    defer free(starts) in memory.heap
+    if starts.length == 0 or (exact and starts.length != most): return none
+    let count = starts.length + 1
+    let pieces = try alloc Piece[count] in memory.heap
+    defer release(pieces)
+    for at in 0..<count:
+        let start = 2 if at == 0 else starts[at - 1]
+        pieces[at] = Piece(start = start, end = starts[at] if at < starts.length else data.length - 4, out = empty(), used = 0, produced = 0, adler = 1, failed = false)
+    var work = Work(input = data, output = output, pieces = pieces, level = 0)
+    run(count, inflate_piece, (void*)&work)
+    # Every segment whole and ending where the next starts; the last may be
+    # short; the Adler-32 of all of it the stream's.
+    var total: usize = 0
+    var adler: u32 = 1
+    for index in 0..<count:
+        let piece = pieces[index]
+        if piece.failed or piece.used != piece.end - piece.start: return none
+        if index + 1 < count and piece.produced != segment_bytes: return none
+        adler = piece.adler if index == 0 else flate.adler32_combine(adler, piece.adler, piece.produced)
+        total += piece.produced
+    if exact and total != output.length: return none
+    let at = data.length - 4
+    let stored = ((u32)data[at] << 24) | ((u32)data[at + 1] << 16) | ((u32)data[at + 2] << 8) | (u32)data[at + 3]
+    if stored != adler: return none
+    return total

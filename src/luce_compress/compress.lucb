@@ -5,6 +5,7 @@ import luce_compress.binary as binary
 import luce_compress.decoder as decoder
 import luce_compress.encoder as encoder
 import luce_compress.flate as flate
+import luce_compress.segments as segments
 
 pub let invalid = binary.invalid
 pub let corrupt = binary.corrupt
@@ -78,6 +79,22 @@ pub func decode(data: const u8[], max_output: i64 = 67108864, allow_trailing: bo
     var output = binary.Buffer(maximum = try binary.checked_limit(max_output))
     if data.length > binary.maximum:
         error(limit_exceeded, "compressed input exceeds 1 GiB")
+    # A stream split into 1 MiB segments (as `compress` writes a large
+    # buffer) inflates on several threads; any other on one.
+    if not allow_trailing and data.length > 65536:
+        let flushes = segments.markers(data)
+        let room = (flushes + 1) * segments.segment_bytes
+        if flushes > 0 and room <= output.maximum + segments.segment_bytes:
+            let within = room if room < output.maximum else output.maximum
+            output.reserve(within) catch failure:
+                output.close()
+                error(failure.code, failure.message)
+            let made = segments.inflate(data, output.data[..<within], false) catch failure:
+                output.close()
+                error(failure.code, failure.message)
+            if let total = made:
+                output.used = total
+                return try owned(output, (i64)data.length)
     # One byte past the limit reaches the buffer, which reports the limit.
     let used = flate.inflate_zlib_streamed(data, output.maximum + 1, append_output, (void*)&output) catch failure:
         output.close()
@@ -97,6 +114,11 @@ func append_output(context: void*?, bytes: const u8[]) -> !:
 ## table-driven decoder of `flate`. A damaged stream fails `corrupt`; running
 ## out of memory fails `memory.exhausted`.
 pub func inflate(data: const u8[], output: u8[]) -> !:
+    # A stream split into 1 MiB segments inflates on several threads.
+    let parallel = segments.inflate(data, output, true) catch failure:
+        if failure.code == memory.exhausted: error(failure.code, failure.message)
+        recover none
+    if parallel != none: return
     let used = flate.inflate_zlib(data, output) catch failure:
         if failure.code == memory.exhausted: error(failure.code, failure.message)
         error(corrupt, failure.message)
@@ -104,10 +126,14 @@ pub func inflate(data: const u8[], output: u8[]) -> !:
         error(corrupt, "the zlib stream does not match its declared size")
 
 ## Deflate `data` at `level` (0 through 9, zlib's) into a fresh zlib stream
-## on the heap; the caller frees it. Base only.
+## on the heap; the caller frees it. A buffer over 2 MiB is deflated in
+## independent 1 MiB segments on several threads (one valid stream, which
+## `inflate` and `decode` read back on several threads too). Base only.
 pub func compress(data: const u8[], level: i64 = default_level) -> u8[]!:
     if level < 0 or level > 9: error(invalid, "compression level must be 0 through 9")
     if data.length > binary.maximum: error(limit_exceeded, "input exceeds 1 GiB")
+    # Over 2 MiB, in 1 MiB segments on several threads (segments.lucb).
+    if data.length > segments.parallel_above: return try segments.deflate(data, (i32)level)
     let scratch = try alloc u8[flate.deflate_bound(data.length) + 6] in memory.heap
     defer free(scratch) in memory.heap
     let used = try flate.deflate_zlib(data, (i32)level, scratch)

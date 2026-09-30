@@ -93,6 +93,22 @@ def check(executable):
             if plain:
                 invoke("decode", stream, len(plain) - 1, reject=True)
 
+        # Over 2 MiB, 1 MiB segments deflate on several threads into one
+        # stream zlib reads; it (not zlib's own streams, nor sync flushes
+        # sharing a window) decodes back on several threads.
+        big = b"".join(generator.randbytes(4096) + b"abcd" * 1024 for _ in range(1500))
+        encoded, consumed = invoke("encode", big, 64 * 1048576)
+        assert consumed == len(big) and zlib.decompress(encoded) == big
+        invoke("decode", encoded, len(big), expected=big)
+        invoke("decode", encoded, len(big) - 1, reject=True)
+        invoke("decode", zlib.compress(big, 6), len(big), expected=big)
+        compressor = zlib.compressobj(6)
+        synced = b"".join(compressor.compress(big[at:at + 1048576]) + compressor.flush(zlib.Z_SYNC_FLUSH) for at in range(0, len(big), 1048576)) + compressor.flush()
+        invoke("decode", synced, len(big), expected=big)
+        changed = bytearray(encoded)
+        changed[len(encoded) // 2] ^= 0x55
+        invoke("decode", bytes(changed), len(big), reject=True)
+
         for plain in [b"", b"A", b"A" * 1000]:
             stream = dynamic_literal(plain)
             assert zlib.decompress(stream) == plain
