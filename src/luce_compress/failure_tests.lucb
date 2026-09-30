@@ -246,6 +246,22 @@ func buffer_retry(heap: Heap*) -> !:
     buffer.close()
     heap.clean()
 
+## The Base one-shot inflate reports a refused allocation as memory.exhausted,
+## not as a damaged stream, and succeeds once memory is there.
+func inflate_exhaustion(heap: Heap*, plain: const u8[], packed: const u8[]) -> !:
+    var output: u8[8192]
+    heap.arm(1, true)
+    var exhausted = false
+    compress.inflate(packed, output[..<plain.length]) catch failure:
+        assert(failure.code == memory.exhausted)
+        exhausted = true
+    assert(exhausted and heap.refused > 0)
+    heap.disarm()
+    heap.clean()
+    try compress.inflate(packed, output[..<plain.length])
+    equal(output[..<plain.length], plain)
+    heap.clean()
+
 func native_without_allocations(heap: Heap*, plain: const u8[], packed: const u8[]) -> !:
     var encoder = try codec.make_encoder()
     var decoder = try codec.make_decoder()
@@ -549,6 +565,7 @@ pub func main(arguments: str[]) -> i32!:
     checks += try one_shot(&heap, packed, b"", false, 513, compress.limit_exceeded, 3)
     checks += try one_shot(&heap, damaged[..<packed.length], b"", false, 8192, compress.corrupt, 6)
     try buffer_retry(&heap)
+    try inflate_exhaustion(&heap, plain, packed)
     try native_without_allocations(&heap, plain, packed)
     for encoding in [false, true]:
         for framing in ["zlib", "raw"]:
