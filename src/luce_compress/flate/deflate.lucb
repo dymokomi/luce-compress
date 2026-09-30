@@ -199,7 +199,7 @@ struct Compressor:
     ## position with the same hash, or -1. Four bytes, as zlib-ng hashes, make far
     ## shorter chains than three on image data for a sliver of compression.
     mutating func insert(data: const u8*, p: usize) -> i32:
-        let key = *(const u32*)(data + p)
+        let key = memory.read[u32](data + p)
         let h = (usize)((key *% 2654435761) >> (32 - hash_bits))
         let heads = self.head.data
         let earlier = heads[h]
@@ -221,8 +221,8 @@ struct Compressor:
         var chain = depth
         var cur = candidate
         let here = data + p
-        let head4 = *(const u32*)here
-        var tail = *(const u32*)(here + (length -% 3))
+        let head4 = memory.read[u32](here)
+        var tail = memory.read[u32](here + (length -% 3))
         let prev = self.prev.data
         let nice = self.nice
         # No candidate below the window; -1 (no candidate) is below it too.
@@ -240,7 +240,7 @@ struct Compressor:
                     break
                 if found >= most:
                     break
-                tail = *(const u32*)(here + (length -% 3))
+                tail = memory.read[u32](here + (length -% 3))
             cur = prev[at & window_mask]
         return (length, distance) if distance > 0 else (0, 0)
 
@@ -252,7 +252,7 @@ struct Compressor:
         let prev = self.prev.data
         var k = first
         while k < end:
-            let h = (usize)((*(const u32*)(data + k) *% 2654435761) >> (32 - hash_bits))
+            let h = (usize)((memory.read[u32](data + k) *% 2654435761) >> (32 - hash_bits))
             prev[k & window_mask] = heads[h]
             heads[h] = (i32)k
             k = k +% 1
@@ -290,8 +290,8 @@ func walk(data: const u8*, prev: const i32*, first: i32, lowest: i32, steps: usi
             break
         let there = data + (usize)cur
         left = left -% 1
-        if *(const u32*)(there + offset) == tail:
-            if *(const u32*)there == head4:
+        if memory.read[u32](there + offset) == tail:
+            if memory.read[u32](there) == head4:
                 *steps = left
                 return cur
         cur = prev[(usize)cur & window_mask]
@@ -303,7 +303,7 @@ func walk(data: const u8*, prev: const i32*, first: i32, lowest: i32, steps: usi
 func match_length(a: const u8*, b: const u8*, most: usize) -> usize:
     var n: usize = 0
     while n +% 8 <= most:
-        let x = *(const u64*)(a + n) ^ *(const u64*)(b + n)
+        let x = memory.read[u64](a + n) ^ memory.read[u64](b + n)
         if x != 0:
             return n +% (lowest_bit(x) >> 3)
         n = n +% 8

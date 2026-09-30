@@ -31,7 +31,7 @@ func compress_fastest(c: Compressor*, data: const u8*, n: usize, last: bool) -> 
             p = p +% 1
             continue
         let here = data + p
-        let seq = *(const u32*)here
+        let seq = memory.read[u32](here)
         let h = (usize)((seq *% 2654435761) >> (32 - fastest_bits)) << 1
         let first = table[h]
         let second = table[h + 1]
@@ -41,10 +41,10 @@ func compress_fastest(c: Compressor*, data: const u8*, n: usize, last: bool) -> 
         let lowest = (i32)(p - window if p > window else 0)
         var length: usize = 0
         var distance: usize = 0
-        if first >= lowest and *(const u32*)(data + (usize)first) == seq:
+        if first >= lowest and memory.read[u32](data + (usize)first) == seq:
             length = match_length(data + (usize)first + 4, here + 4, most -% 4) +% 4
             distance = p -% (usize)first
-        if length < fastest_nice and second >= lowest and *(const u32*)(data + (usize)second) == seq:
+        if length < fastest_nice and second >= lowest and memory.read[u32](data + (usize)second) == seq:
             let other = match_length(data + (usize)second + 4, here + 4, most -% 4) +% 4
             if other > length:
                 length = other
@@ -59,7 +59,7 @@ func compress_fastest(c: Compressor*, data: const u8*, n: usize, last: bool) -> 
         let stop = end if end +% 5 <= n else (n - 4 if n > 4 else 0)
         var k = p +% 1
         while k < stop:
-            let kh = (usize)((*(const u32*)(data + k) *% 2654435761) >> (32 - fastest_bits)) << 1
+            let kh = (usize)((memory.read[u32](data + k) *% 2654435761) >> (32 - fastest_bits)) << 1
             table[kh + 1] = table[kh]
             table[kh] = (i32)k
             k = k +% 1

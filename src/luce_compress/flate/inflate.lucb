@@ -127,7 +127,7 @@ struct Stream:
 
     mutating func refill():
         if self.pos + 8 <= self.length:
-            self.acc |= *(const u64*)(self.data + self.pos) << (u64)self.bits
+            self.acc |= memory.read[u64](self.data + self.pos) << (u64)self.bits
             self.pos += (usize)((63 - self.bits) >> 3)
             self.bits |= 56
             return
@@ -387,7 +387,7 @@ func decode_block(s: Stream*, literals: const Table*, distances: const Table*, o
     let fast_end = (edge if edge < size else size) -| slack
     let fast_input = input_end -| 16
     while o < fast_end and pos <= fast_input:
-        acc |= *(const u64*)(input + pos) << (u64)(bits & 63)
+        acc |= memory.read[u64](input + pos) << (u64)(bits & 63)
         pos = pos +% (usize)((63 -% bits) >> 3)
         bits |= 56
         var e = lit[(usize)(acc & 4095)]
@@ -447,7 +447,7 @@ func decode_block(s: Stream*, literals: const Table*, distances: const Table*, o
         if distance >= 8:
             var n: usize = 0
             while n < length:
-                *(u64*)(to + n) = *(const u64*)(back + n)
+                memory.write[u64](to + n, memory.read[u64](back + n))
                 n = n +% 8
         elif distance == 1:
             memory.set(u8[](to, length), *back)
@@ -460,7 +460,7 @@ func decode_block(s: Stream*, literals: const Table*, distances: const Table*, o
                 to[n] = back[n]
                 n = n +% 1
             while n < length:
-                *(u64*)(to + n) = *(const u64*)(to + (n -% period))
+                memory.write[u64](to + n, memory.read[u64](to + (n -% period)))
                 n = n +% 8
         o = o +% length
         if o >= *next_report:
@@ -474,7 +474,7 @@ func decode_block(s: Stream*, literals: const Table*, distances: const Table*, o
         if bits < 48:
             # Eight bytes at once while the input has them.
             if s.pos + 8 <= input_end:
-                acc |= *(const u64*)(input + s.pos) << (u64)bits
+                acc |= memory.read[u64](input + s.pos) << (u64)bits
                 s.pos += (usize)((63 - bits) >> 3)
                 bits |= 56
             else:
@@ -537,7 +537,7 @@ func decode_block(s: Stream*, literals: const Table*, distances: const Table*, o
         if distance >= 8 and o + length + 8 <= size:
             var n: usize = 0
             while n < length:
-                *(u64*)(to + n) = *(const u64*)(back + n)
+                memory.write[u64](to + n, memory.read[u64](back + n))
                 n += 8
         elif distance == 1:
             memory.set(u8[](to, length), *back)

@@ -65,7 +65,7 @@ pub func adler32(data: const u8[], adler: u32 = 1) -> u32:
         while i + 8 <= end:
             # Eight bytes at once: their sum, and their sum weighted 8..1, from 16-bit
             # lanes multiplied so one lane gathers the total (no lane overflows).
-            let v = *(const u64*)(p + i)
+            let v = memory.read[u64](p + i)
             let even = v & 0x00FF00FF00FF00FF
             let odd = (v >> 8) & 0x00FF00FF00FF00FF
             let sum = (u32)(((even + odd) *% 0x0001000100010001) >> 48)

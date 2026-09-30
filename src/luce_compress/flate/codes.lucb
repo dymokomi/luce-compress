@@ -22,7 +22,7 @@ struct Writer:
         self.acc |= value << (u64)self.bits
         self.bits += count
         if self.bits >= 32:
-            *(u32*)(self.out + self.pos) = (u32)self.acc
+            memory.write[u32](self.out + self.pos, (u32)self.acc)
             self.pos += 4
             self.acc >>= 32
             self.bits -= 32
@@ -359,7 +359,7 @@ func write_symbols(w: Writer*, block: const Block*, symbols: const Symbols*, lit
             acc = acc | (((u64)literal_codes[ls] | ((u64)(value -% (usize)lengths_base[lc]) << (u64)(llen & 63))) << (u64)(bits & 63))
             bits = bits +% llen +% (u32)lengths_extra[lc]
             if bits >= 32:
-                *(u32*)(out + pos) = (u32)acc
+                memory.write[u32](out + pos, (u32)acc)
                 pos = pos +% 4
                 acc = acc >> 32
                 bits = bits -% 32
@@ -368,7 +368,7 @@ func write_symbols(w: Writer*, block: const Block*, symbols: const Symbols*, lit
             acc = acc | (((u64)distance_codes[dc] | ((u64)(d -% (usize)distances_base[dc]) << (u64)(dlen & 63))) << (u64)(bits & 63))
             bits = bits +% dlen +% (u32)distances_extra[dc]
         if bits >= 32:
-            *(u32*)(out + pos) = (u32)acc
+            memory.write[u32](out + pos, (u32)acc)
             pos = pos +% 4
             acc = acc >> 32
             bits = bits -% 32
