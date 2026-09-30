@@ -11,7 +11,6 @@ from check_stream import check as check_stream
 from check_git import check as check_git
 from check_encode import check as check_encode
 from check_work import check as check_work
-from check_stress import check as check_stress
 from check_fuzz import check as check_fuzz
 from check_large import check as check_large
 from check_flate import check as check_flate
@@ -68,7 +67,9 @@ def main():
         check_git(output / "stream-driver")
         check_encode(output / "encode-driver")
         check_work(output / "stream-driver", output / "encode-driver")
-        check_stress(output / "stress-driver")
+        # A fresh interpreter: on Linux a child's peak RSS starts at its
+        # parent's (the mm it was forked from), and this one holds the oracles.
+        run([sys.executable, ROOT / "tests/check_stress.py", output / "stress-driver"])
         check_fuzz(output / "fuzz-driver")
         check_large(output / "file-driver")
         check_flate(output / "flate-driver")
