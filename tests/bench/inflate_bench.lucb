@@ -6,7 +6,7 @@
 ## the whole-buffer API: compress (1 MiB segments on several threads) and
 ## inflate back.
 import c
-import luce_std.files
+from luce_std import files
 import memory
 import time
 import flate

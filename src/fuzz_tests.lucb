@@ -2,7 +2,7 @@
 import native as codec
 import compress
 import binary
-import luce_std.files
+from luce_std import files
 import memory
 import c
 

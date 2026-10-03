@@ -1,6 +1,6 @@
 ## Test-only file adapter. Partial output remains in a disposable fixture directory.
 import native as codec
-import luce_std.files
+from luce_std import files
 import io
 import strings
 import c

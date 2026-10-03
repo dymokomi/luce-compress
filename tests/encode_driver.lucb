@@ -1,7 +1,7 @@
 ## Fixture-only whole-file I/O. Native encoder sees short-lived disjoint spans.
 import native as codec
 import compress
-import luce_std.files
+from luce_std import files
 import memory
 import strings
 import c

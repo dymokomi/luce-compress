@@ -166,7 +166,7 @@ entries only, not a production Git engine.
 as PNG, TIFF and OpenEXR do:
 
 ```luce
-import luce_compress.flate
+from luce_compress import flate
 
 let out = try alloc u8[flate.deflate_bound(data.length) + 6] in memory.heap
 let used = try flate.deflate_zlib(data, 6, out)          # a zlib stream at level 0..9
@@ -196,7 +196,7 @@ let adler = flate.adler32_combine(flate.adler32(first), flate.adler32(second), s
 a time, for formats packed in a ZIP (Procreate brushes, OpenDocument, EPUB):
 
 ```luce
-import luce_compress.zip as zip
+from luce_compress import zip
 
 var archive = try zip.open(bytes)                        # finds the end record, reads the directory
 defer archive.close()                                    # frees the entry list; `bytes` stay yours

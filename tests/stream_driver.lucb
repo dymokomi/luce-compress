@@ -2,7 +2,7 @@
 ## The decoder itself receives overwritten, short-lived input/output chunks.
 import native as codec
 import compress
-import luce_std.files
+from luce_std import files
 import memory
 import strings
 import c
