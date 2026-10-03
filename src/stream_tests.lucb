@@ -1,5 +1,5 @@
 import compress
-import luce_compress.decoder as codec
+import decoder as codec
 import thread
 import interop
 

@@ -1,7 +1,7 @@
 ## The flate driver: `flate_driver deflate <in> <out> <level>` (a zlib stream),
 ## `inflate <in.zlib> <out> <size>`, `segments <in> <out> <level> [parts]` (raw
 ## DEFLATE in independent segments) or `time <in.zlib> - <size>`.
-import files
+import luce_std.files
 import c
 import memory
 import strings

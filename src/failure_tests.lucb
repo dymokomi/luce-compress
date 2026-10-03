@@ -3,8 +3,8 @@
 import memory
 import interop
 import compress
-import compress_native as codec
-import luce_compress.binary as binary
+import native as codec
+import binary
 
 struct Block:
     var address: u8*?

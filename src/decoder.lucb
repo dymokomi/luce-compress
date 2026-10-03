@@ -1,6 +1,6 @@
 ## Incremental RFC 1950/1951 decoder. No heap allocation or retained caller spans.
-import luce_compress.deflate as deflate
-from luce_compress.binary import invalid, corrupt, unsupported, limit, closed
+import deflate
+from binary import invalid, corrupt, unsupported, limit, closed
 
 pub let need_input: i64 = 0
 pub let need_output: i64 = 1

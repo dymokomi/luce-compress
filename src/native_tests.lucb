@@ -2,9 +2,9 @@ import compress
 import thread
 import interop
 import memory
-import luce_compress.binary as binary
-import luce_compress.flate as flate
-import luce_compress.segments as segments
+import binary
+import flate
+import segments
 
 ## Over 2 MiB, `compress` deflates 1 MiB segments on several threads into one
 ## stream: flate's one-thread inflate reads it, `inflate` and `decode` read

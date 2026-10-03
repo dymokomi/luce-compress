@@ -1,6 +1,6 @@
 ## Native incremental API. The decoder is a value; the encoder is an owning handle.
-import luce_compress.decoder as decoder
-import luce_compress.encoder as encoder
+import decoder
+import encoder
 
 pub type Step = decoder.Step
 pub type Statistics = decoder.Statistics

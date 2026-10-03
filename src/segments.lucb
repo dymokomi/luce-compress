@@ -9,8 +9,8 @@
 import memory
 import os
 import thread
-import luce_compress.flate as flate
-from luce_compress.binary import corrupt
+import flate
+from binary import corrupt
 
 pub let segment_bytes: usize = 1048576
 ## Buffers larger than this go on several threads.

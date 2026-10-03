@@ -19,7 +19,7 @@
 #
 #==============================================================================================
 import memory
-import luce_compress.binary as binary
+import binary
 
 ## The block is damaged, or longer than the output it must fill.
 pub let corrupt = binary.corrupt

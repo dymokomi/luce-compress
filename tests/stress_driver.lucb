@@ -1,5 +1,5 @@
 ## Test-only generated-stream pipeline. Never retains a whole source or result.
-import compress_native as codec
+import native as codec
 import thread
 import time
 import strings

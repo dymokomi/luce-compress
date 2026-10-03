@@ -5,7 +5,7 @@
 ## independent 1 MiB segments, as luce-png's bands do, and prints MB/s and the
 ## compressed size. `--write` saves the generated data for other tools.
 import c
-import files
+import luce_std.files
 import memory
 import strings
 import time

@@ -19,7 +19,7 @@ luce_compress = "../luce-compress"
 ```
 
 ```luce
-from compress import encode, decode
+from luce_compress.compress import encode, decode
 
 pub func main(arguments: list[str]) -> int!:
     let packed = encode(b"Luce package source")
@@ -120,7 +120,7 @@ fail before advancing. Deterministic Base-heap failure tests now sweep the actua
 construction/result/growth allocations, including the native reference shell;
 see [failure coverage and its limits](docs/ALLOCATION_FAILURES.md).
 See the [contract](docs/STREAMING_CONTRACT.md) and executable
-[Luce example](tests/facade.luc) / [native tests](src/luce_compress/stream_tests.lucb).
+[Luce example](tests/facade.luc) / [native tests](src/stream_tests.lucb).
 
 ## Incremental encoding
 
@@ -166,7 +166,7 @@ entries only, not a production Git engine.
 as PNG, TIFF and OpenEXR do:
 
 ```luce
-import flate
+import luce_compress.flate
 
 let out = try alloc u8[flate.deflate_bound(data.length) + 6] in memory.heap
 let used = try flate.deflate_zlib(data, 6, out)          # a zlib stream at level 0..9

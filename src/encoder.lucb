@@ -1,9 +1,9 @@
 ## Incremental fixed-Huffman LZ77, sharing the existing encoder's match policy.
 ## Two bounded allocations at construction; no allocation or borrowed spans in step.
 import memory
-import luce_compress.deflate as deflate
-from luce_compress.decoder import Step, Statistics, need_input, need_output, finished, yielded, default_work_limit, check_work_limit
-from luce_compress.binary import invalid, corrupt, limit, closed
+import deflate
+from decoder import Step, Statistics, need_input, need_output, finished, yielded, default_work_limit, check_work_limit
+from binary import invalid, corrupt, limit, closed
 
 pub func make_encoder(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> Encoder!:
     if framing != "zlib" and framing != "raw": error(invalid, "framing must be zlib or raw")

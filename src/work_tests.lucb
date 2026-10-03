@@ -1,6 +1,6 @@
 ## Scheduling tests: no scheduler or shared ownership is hidden in the codec.
 import compress
-import compress_native as codec
+import native as codec
 import interop
 import thread
 

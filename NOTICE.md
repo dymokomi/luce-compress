@@ -1,8 +1,8 @@
 # Provenance
 
-`src/luce_compress/deflate.lucb` is adapted from the Luce Base implementation in
+`src/deflate.lucb` is adapted from the Luce Base implementation in
 `dymokomi/luce-image`, revision `422e1cf3e580bfcdc72540ac41ef4f70a11a7451`, file
-`src/luce_image/deflate.lucb`. That source is Copyright (c) 2026 Dy Mokomi and was
+`src/deflate.lucb`. That source is Copyright (c) 2026 Dy Mokomi and was
 published under MIT; its permission/copyright notice is retained in LICENSE-MIT.
 Changes here add bounded variable-size decoding, consumed-byte reporting and
 stricter malformed Huffman-tree validation. No image-library source is modified.

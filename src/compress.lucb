@@ -1,11 +1,11 @@
 ## Owning Luce facade; all codec implementation remains Luce Base.
 import interop
 import memory
-import luce_compress.binary as binary
-import luce_compress.decoder as decoder
-import luce_compress.encoder as encoder
-import luce_compress.flate as flate
-import luce_compress.segments as segments
+import binary
+import decoder
+import encoder
+import flate
+import segments
 
 pub let invalid = binary.invalid
 pub let corrupt = binary.corrupt

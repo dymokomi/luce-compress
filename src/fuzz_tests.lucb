@@ -1,8 +1,8 @@
 ## Test-only bounded batch format; Python/zlib supplies independent expectations.
-import compress_native as codec
+import native as codec
 import compress
-import luce_compress.binary as binary
-import files
+import binary
+import luce_std.files
 import memory
 import c
 

@@ -2,7 +2,7 @@
 ## encoder.lucb): canonical Huffman trees and the length and distance
 ## bases. The whole-buffer codec is flate's (compress.lucb calls it).
 ## Adapted from luce-image 422e1cf, Copyright (c) 2026 Dy Mokomi; see NOTICE.md.
-from luce_compress.binary import corrupt
+from binary import corrupt
 
 pub struct Tree:
     pub var counts: u32[16]

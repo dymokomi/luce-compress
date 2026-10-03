@@ -1,4 +1,4 @@
-import compress_native as codec
+import native as codec
 import compress
 import interop
 import thread

@@ -35,9 +35,9 @@ def main():
     run([sys.executable, ROOT / "tests/test_oracles.py"])
     for flags in (["--native"], ["--backend=c"]):
         if args.mode == "all" or (args.mode == "c") == (flags[0] == "--backend=c"):
-            run([args.base.resolve(), "test", ROOT / "src/luce_compress/flate", *flags])
-            run([args.base.resolve(), "test", ROOT / "src/luce_compress/zip", *flags])
-            run([args.base.resolve(), "test", ROOT / "src/luce_compress/lz4", *flags])
+            run([args.base.resolve(), "test", ROOT / "src/flate", *flags])
+            run([args.base.resolve(), "test", ROOT / "src/zip", *flags])
+            run([args.base.resolve(), "test", ROOT / "src/lz4", *flags])
     for mode, flags in MODES.items():
         if args.mode != "all" and args.mode != mode:
             continue
@@ -45,13 +45,13 @@ def main():
         output = ROOT / "build" / mode
         output.mkdir(parents=True, exist_ok=True)
         print(f"MODE {mode}", flush=True)
-        for source, name in [(ROOT / "src/luce_compress/native_tests.lucb", "native"), (ROOT / "tests/driver.lucb", "driver"),
-                             (ROOT / "src/luce_compress/stream_tests.lucb", "stream-tests"), (ROOT / "tests/stream_driver.lucb", "stream-driver"),
-                             (ROOT / "src/luce_compress/encoder_tests.lucb", "encoder-tests"), (ROOT / "tests/encode_driver.lucb", "encode-driver"),
-                             (ROOT / "src/luce_compress/failure_tests.lucb", "failure-tests"),
-                             (ROOT / "src/luce_compress/work_tests.lucb", "work-tests"),
+        for source, name in [(ROOT / "src/native_tests.lucb", "native"), (ROOT / "tests/driver.lucb", "driver"),
+                             (ROOT / "src/stream_tests.lucb", "stream-tests"), (ROOT / "tests/stream_driver.lucb", "stream-driver"),
+                             (ROOT / "src/encoder_tests.lucb", "encoder-tests"), (ROOT / "tests/encode_driver.lucb", "encode-driver"),
+                             (ROOT / "src/failure_tests.lucb", "failure-tests"),
+                             (ROOT / "src/work_tests.lucb", "work-tests"),
                              (ROOT / "tests/stress_driver.lucb", "stress-driver"),
-                             (ROOT / "src/luce_compress/fuzz_tests.lucb", "fuzz-driver"),
+                             (ROOT / "src/fuzz_tests.lucb", "fuzz-driver"),
                              (ROOT / "tests/file_driver.lucb", "file-driver"),
                              (ROOT / "tests/flate_driver.lucb", "flate-driver")]:
             run([args.base.resolve(), "build", source, *flags, "-o", output / name])

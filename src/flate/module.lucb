@@ -25,7 +25,7 @@
 #
 #==============================================================================================
 import memory
-from luce_compress.binary import corrupt, invalid, limit
+from binary import corrupt, invalid, limit
 
 ## Reports progress while inflating: the context, and bytes of output complete.
 pub type Progress = func(void*?, usize) -> unit

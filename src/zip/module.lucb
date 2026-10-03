@@ -23,8 +23,8 @@
 #
 #==============================================================================================
 import memory
-import luce_compress.flate as flate
-import luce_compress.binary as binary
+import flate
+import binary
 
 ## The bytes are not a ZIP archive.
 pub let invalid = binary.invalid

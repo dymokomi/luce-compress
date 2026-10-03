@@ -1,6 +1,6 @@
 # Deterministic allocation-failure contract
 
-The test executable `src/luce_compress/failure_tests.lucb` is entirely Luce Base and
+The test executable `src/failure_tests.lucb` is entirely Luce Base and
 uses the existing `memory.Allocator` interface. It temporarily replaces the Base
 heap **inside its own single-threaded test process**. Production code has no fault
 hooks, and either language's sources are unchanged. Do not run this heap replacement concurrently:
@@ -69,7 +69,7 @@ exhaustive behavior for every possible input, memory condition or runtime path.
 After bootstrapping the pinned compilers, a focused run is:
 
 ```sh
-build/toolchain/luce-base build src/luce_compress/failure_tests.lucb --native --opt 0 -o build/failure-tests
+build/toolchain/luce-base build src/failure_tests.lucb --native --opt 0 -o build/failure-tests
 build/failure-tests
 ```
 
