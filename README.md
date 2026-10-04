@@ -165,7 +165,7 @@ entries only, not a production Git engine.
 `import flate` (Base) is for callers that know their sizes and frame their own data,
 as PNG, TIFF and OpenEXR do:
 
-```luce
+```luce-base
 from luce_compress import flate
 
 let out = try alloc u8[flate.deflate_bound(data.length) + 6] in memory.heap
@@ -195,7 +195,7 @@ let adler = flate.adler32_combine(flate.adler32(first), flate.adler32(second), s
 `import luce_compress.zip as zip` (Base) reads an archive held in memory, one entry at
 a time, for formats packed in a ZIP (Procreate brushes, OpenDocument, EPUB):
 
-```luce
+```luce-base
 from luce_compress import zip
 
 var archive = try zip.open(bytes)                        # finds the end record, reads the directory
