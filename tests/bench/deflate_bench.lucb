@@ -52,11 +52,11 @@ pub func main(arguments: str[]) -> i32!:
         print("usage: deflate_bench <photo|flat|path> <levels...> [--write <path>]")
         return 2
     let kind = arguments[1]
-    var data: u8[]
+    var data: const u8[]
     if kind == "photo" or kind == "flat":
         data = try generate(kind)
     else:
-        data = try files.read((c.str)kind)
+        data = (try files.read((c.str)kind)).value
     let out = try alloc u8[flate.deflate_bound(segment) + 64] in memory.heap
     var index: usize = 2
     while index < arguments.length:

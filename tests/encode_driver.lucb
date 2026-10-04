@@ -8,8 +8,9 @@ import c
 
 pub func main(arguments: str[]) -> i32!:
     assert(arguments.length == 9 or arguments.length == 10)
-    let plain = try files.read((c.str)arguments[1])
-    defer free(plain) in memory.heap
+    let file = try files.read((c.str)arguments[1])
+    defer file.release()
+    let plain = file.value
     let input_chunk = strings.parse_i64(arguments[4]) else trap("input chunk")
     let output_chunk = strings.parse_i64(arguments[5]) else trap("output chunk")
     let max_input = strings.parse_i64(arguments[6]) else trap("input budget")

@@ -3,7 +3,6 @@ import native as codec
 import compress
 import binary
 from luce_std import files
-import memory
 import c
 
 func check(reader: binary.Reader*) -> !:
@@ -86,8 +85,9 @@ func check(reader: binary.Reader*) -> !:
 
 pub func main(arguments: str[]) -> i32!:
     assert(arguments.length == 2)
-    let data = try files.read_limit((c.str)arguments[1], 16777216)
-    defer free(data) in memory.heap
+    let file = try files.read((c.str)arguments[1], limit = 16777216)
+    defer file.release()
+    let data = file.value
     var reader = binary.Reader(data = data)
     assert((str)(try reader.take(8)) == "LCFZ01\0\0")
     let count = try reader.uint(4)

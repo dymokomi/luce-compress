@@ -9,7 +9,9 @@ import time
 import flate
 
 pub func main(arguments: str[]) -> i32!:
-    let input = try files.read((c.str)arguments[2])
+    let file = try files.read((c.str)arguments[2])
+    defer file.release()
+    let input = file.value
     let number = (usize)(strings.parse_u64(arguments[4]) else 6)
     if arguments[1] == "time":
         let out = try alloc u8[number] in memory.heap

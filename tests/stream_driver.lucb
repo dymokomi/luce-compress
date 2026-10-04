@@ -9,10 +9,12 @@ import c
 
 pub func main(arguments: str[]) -> i32!:
     assert(arguments.length == 10 or arguments.length == 11)
-    let packed = try files.read((c.str)arguments[1])
-    defer free(packed) in memory.heap
-    let expected = try files.read((c.str)arguments[2])
-    defer free(expected) in memory.heap
+    let packed_file = try files.read((c.str)arguments[1])
+    defer packed_file.release()
+    let packed = packed_file.value
+    let expected_file = try files.read((c.str)arguments[2])
+    defer expected_file.release()
+    let expected = expected_file.value
     let input_chunk = strings.parse_i64(arguments[4]) else trap("input chunk")
     let output_chunk = strings.parse_i64(arguments[5]) else trap("output chunk")
     let max_input = strings.parse_i64(arguments[6]) else trap("input budget")

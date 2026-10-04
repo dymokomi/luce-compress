@@ -28,8 +28,9 @@ pub func main(arguments: str[]) -> i32!:
     if arguments.length < 2:
         print("usage: inflate_bench <raw> [<zlib> ...]")
         return 2
-    let raw = try files.read((c.str)arguments[1])
-    defer free(raw) in memory.heap
+    let raw_file = try files.read((c.str)arguments[1])
+    defer raw_file.release()
+    let raw = raw_file.value
     let out = try alloc u8[raw.length] in memory.heap
     defer free(out) in memory.heap
     let packed = try alloc u8[flate.deflate_bound(raw.length) + 6] in memory.heap
@@ -56,7 +57,8 @@ pub func main(arguments: str[]) -> i32!:
         assert((str)out == (str)raw)
         print(f"compress.inflate of it: {(f64)best / 1000000.0} ms")
     for at in 2..<arguments.length:
-        let stream = try files.read((c.str)arguments[at])
-        defer free(stream) in memory.heap
+        let stream_file = try files.read((c.str)arguments[at])
+        defer stream_file.release()
+        let stream = stream_file.value
         try best_inflate(stream, out, raw, arguments[at])
     return 0
