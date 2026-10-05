@@ -1,0 +1,186 @@
+#==============================================================================================
+#
+#   brotli/commands - Commands: block switches, literals, distances and copies (RFC 7932
+#                     sections 4-7 and 9.3)
+#
+#   DESCRIPTION:
+#       Each command is an insert-and-copy symbol with the insert length's extra bits,
+#       the copy length's extra bits, its literals (each from the code its block type and
+#       the last two bytes select), then, unless the meta-block is complete, a distance
+#       and a copy or a dictionary word. Each of these is a state of its own, so the
+#       decoder can stop between any two of them, or between two literals.
+#
+#==============================================================================================
+
+extend Decoder:
+    ## Switch category `c` (0 literals, 1 insert-and-copy, 2 distances) to its next block
+    ## type and count (section 6); false when the input ran out.
+    func switch_block(c: usize) -> bool!:
+        self.begin(54)
+        let code = self.symbol(self.trees.data + (usize)self.type_codes[c])
+        let count_code = (usize)self.symbol(self.trees.data + (usize)self.count_codes[c])
+        let count = count_base[count_code] + self.take(count_extra[count_code])
+        if try self.short():
+            return false
+        var kind = self.type_last[c] if code == 0 else self.type_now[c] + 1 if code == 1 else code - 2
+        if kind >= self.types[c]:
+            kind -= self.types[c]
+        self.type_last[c] = self.type_now[c]
+        self.type_now[c] = kind
+        self.block_left[c] = count
+        if c == 0:
+            self.select_literal_type()
+        elif c == 2:
+            self.select_distance_type()
+        return true
+
+    ## The context mode of the current literal block type, and the table of the code
+    ## each of its 64 contexts selects.
+    func select_literal_type():
+        let kind = (usize)self.type_now[0]
+        let row = kind * 64
+        for context in 0..<(usize)64:
+            self.literal_tables[context] = self.literal_codes[(usize)self.maps[row + context]]
+        self.literal_mode = (usize)self.modes[kind] * 512
+
+    ## The context map row of the current distance block type.
+    func select_distance_type():
+        self.distance_map = distance_map_at + (usize)self.type_now[2] * 4
+
+    ## An insert-and-copy symbol and the insert length (section 5).
+    func read_command() -> bool!:
+        if self.block_left[1] == 0 and not try self.switch_block(1):
+            return false
+        self.begin(39)
+        let code = self.symbol(self.trees.data + (usize)self.command_codes[(usize)self.type_now[1]])
+        let cell = (usize)(code >> 6)
+        let insert_code = (usize)(cell_insert[cell] + ((code >> 3) & 7))
+        let insert = insert_base[insert_code] + self.take(insert_extra[insert_code])
+        if try self.short():
+            return false
+        self.block_left[1] -= 1
+        self.insert_left = (usize)insert
+        self.copy_code = cell_copy[cell] + (code & 7)
+        self.implicit = code < 128
+        self.state = state_copy_length
+        return true
+
+    ## The copy length's extra bits.
+    func read_copy_length() -> bool!:
+        self.begin(24)
+        let code = (usize)self.copy_code
+        let length = copy_base[code] + self.take(copy_extra[code])
+        if try self.short():
+            return false
+        if self.insert_left > self.remaining:
+            error(corrupt, "brotli literals overrun their meta-block")
+        self.copy_length = (usize)length
+        self.remaining -= self.insert_left
+        self.total_out += (u64)self.insert_left
+        self.state = state_insert
+        return true
+
+    ## The command's literals, each by the code its block type and context select.
+    func insert_literals() -> bool!:
+        while self.insert_left > 0:
+            if self.pos >= self.ring_size and not try self.room():
+                return false
+            if self.block_left[0] == 0 and not try self.switch_block(0):
+                return false
+            self.begin(15)
+            let mode = self.literal_mode
+            let context = (usize)(context_lookup[mode + (usize)self.p1] | context_lookup[mode + 256 + (usize)self.p2])
+            let byte = (u8)self.symbol(self.trees.data + (usize)self.literal_tables[context])
+            if try self.short():
+                return false
+            self.block_left[0] -= 1
+            self.ring[self.pos] = byte
+            self.pos += 1
+            self.p2 = self.p1
+            self.p1 = byte
+            self.insert_left -= 1
+        # A meta-block complete after its literals ignores the copy.
+        self.state = state_distance if self.remaining > 0 else state_meta_done
+        return true
+
+    ## The copy's distance (section 4): a copy, or a dictionary word beyond the window.
+    func read_distance() -> bool!:
+        var distance: i64 = 0
+        var code: u32 = 0
+        if self.implicit:
+            distance = self.distances[self.distance_at & 3]
+        else:
+            if self.block_left[2] == 0 and not try self.switch_block(2):
+                return false
+            self.begin(39)
+            let context = self.copy_length - 2 if self.copy_length < 5 else 3
+            let tree = self.distance_codes[(usize)self.maps[self.distance_map + context]]
+            code = self.symbol(self.trees.data + (usize)tree)
+            var extra: u32 = 0
+            var bits: u32 = 0
+            if code >= 16 + self.direct:
+                bits = 1 + ((code - self.direct - 16) >> (self.postfix + 1))
+                extra = self.take(bits)
+            if try self.short():
+                return false
+            self.block_left[2] -= 1
+            if code < 16:
+                let slot = (self.distance_at -% (usize)short_slot[(usize)code]) & 3
+                distance = self.distances[slot] + short_delta[(usize)code]
+                if distance <= 0:
+                    error(corrupt, "invalid brotli distance")
+            elif code < 16 + self.direct:
+                distance = (i64)code - 15
+            else:
+                let d = code - self.direct - 16
+                let high = d >> self.postfix
+                let low = d & (((u32)1 << self.postfix) - 1)
+                let offset = ((2 + (u64)(high & 1)) << (u64)bits) - 4
+                distance = (i64)(((offset + (u64)extra) << (u64)self.postfix) + (u64)low + (u64)self.direct + 1)
+        let reach = self.reach()
+        if (u64)distance > reach:
+            if (u64)distance > most_distance:
+                error(corrupt, "invalid brotli distance")
+            self.distance = (usize)distance
+            self.state = state_word
+            return true
+        if code != 0:
+            self.distance_at += 1
+            self.distances[self.distance_at & 3] = distance
+        if self.copy_length > self.remaining:
+            error(corrupt, "brotli copy overruns its meta-block")
+        self.distance = (usize)distance
+        self.copy_left = self.copy_length
+        self.remaining -= self.copy_length
+        self.total_out += (u64)self.copy_length
+        self.state = state_copy
+        return true
+
+    ## The farthest a copy may reach back: the output so far, up to the window less 16.
+    func reach() -> u64:
+        let most = (u64)self.window - 16
+        return self.total_out if self.total_out < most else most
+
+    ## A static dictionary word, transformed (section 8).
+    func dictionary_word() -> bool!:
+        if self.pos >= self.ring_size and not try self.room():
+            return false
+        let written = try write_word(self.ring.data + self.pos, (u64)self.distance, self.copy_length, self.reach())
+        if written > self.remaining:
+            error(corrupt, "brotli dictionary word overruns its meta-block")
+        self.pos += written
+        self.remaining -= written
+        self.total_out += (u64)written
+        self.recall()
+        self.state = state_command if self.remaining > 0 else state_meta_done
+        return true
+
+    ## The end of a meta-block: the next, or the end of the stream after the last.
+    func meta_done() -> bool!:
+        if not self.last:
+            self.state = state_meta
+            return true
+        if not self.align():
+            error(corrupt, "nonzero padding after the brotli stream")
+        self.state = state_done
+        return true

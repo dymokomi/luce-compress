@@ -1,0 +1,106 @@
+#==============================================================================================
+#
+#   brotli/bits - The bit reader and its resumable units
+#
+#   DESCRIPTION:
+#       Bits come least significant first through a 64-bit accumulator, refilled eight
+#       bytes at a time while the input has them. Decoding is a run of units, each at most
+#       57 bits: a header field group, one symbol and its extra bits, a block switch. A
+#       unit starts with `begin(n)`, which makes n bits readable; past the end of the
+#       input the missing bits read as zeros, counted in `padded`. It ends with `short()`:
+#       if it read into those zeros the input ran out inside it, so it is undone (the
+#       accumulator as it was, every input byte absorbed) and the decoder asks for more
+#       input, or fails when the input was declared final. Nothing a unit decides is
+#       stored before `short()` passes. So a stream can stop at any byte and go on with
+#       the next call's input, and a caller never offers a byte twice.
+#
+#       A step that stops for output, or at the stream's end, gives back to its input the
+#       whole bytes read ahead (`give_back`). They are always this step's: at the start of
+#       a step the reader holds less than a byte, or (after `need_input`) only bits the
+#       unit that ran short will consume, since a unit reads past its real bits only when
+#       its fields need more than they hold.
+#
+#==============================================================================================
+
+extend Decoder:
+    ## Absorb input bytes until at least 57 bits are held or the input is spent.
+    inline func refill():
+        let data = self.input
+        if self.input_at + 8 <= data.length:
+            self.acc |= memory.read[u64](data.data + self.input_at) << (u64)self.bits
+            self.input_at += (usize)((63 - self.bits) >> 3)
+            self.bits |= 56
+            return
+        while self.bits <= 56 and self.input_at < data.length:
+            self.acc |= (u64)data[self.input_at] << (u64)self.bits
+            self.input_at += 1
+            self.bits += 8
+
+    ## Start a unit of at most `count` (<= 57) bits.
+    inline func begin(count: u32):
+        if self.bits < count:
+            self.refill()
+            if self.bits < count:
+                # The input is spent: zeros stand for the rest. The accumulator's bits
+                # above `bits` may hold a byte read ahead; clear them first.
+                self.acc &= ((u64)1 << (u64)self.bits) - 1
+                self.padded += count - self.bits
+                self.bits = count
+        self.saved_acc = self.acc
+        self.saved_bits = self.bits
+
+    ## Whether the unit begun last read past the input: if so it is undone, and when the
+    ## input was final the stream is truncated.
+    inline func short() -> bool!:
+        if self.bits >= self.padded:
+            return false
+        if self.final_input:
+            error(corrupt, "truncated brotli stream")
+        self.acc = self.saved_acc
+        self.bits = self.saved_bits - self.padded
+        self.padded = 0
+        return true
+
+    ## The next `count` (<= 32) bits.
+    inline func take(count: u32) -> u32:
+        let value = (u32)(self.acc & (((u64)1 << (u64)count) - 1))
+        self.acc >>= (u64)count
+        self.bits -= count
+        return value
+
+    ## The next symbol of the prefix code whose lookup table starts at `table` (8-bit root;
+    ## an entry is the symbol << 16 | its bits, or a link to a second-level table).
+    inline func symbol(table: const u32*) -> u32:
+        var entry = table[(usize)(self.acc & 255)]
+        var length = entry & 255
+        if length > 8:
+            let index = (usize)((self.acc >> 8) & (((u64)1 << (u64)(length - 8)) - 1))
+            entry = table[(usize)(entry >> 16) + index]
+            length = (entry & 255) + 8
+        self.acc >>= (u64)length
+        self.bits -= length
+        return entry >> 16
+
+    ## Skip to the next byte boundary; the skipped bits must be zero. Part of a unit
+    ## (one that read past the input skips nothing: `short()` undoes it).
+    func align() -> bool:
+        if self.bits < self.padded:
+            return true
+        return self.take((self.bits - self.padded) & 7) == 0
+
+    ## Forget the zeros past the input, and any byte read ahead beyond `bits`.
+    func unpad():
+        self.bits -= self.padded
+        self.padded = 0
+        self.acc &= ((u64)1 << (u64)self.bits) - 1 if self.bits < 64 else ~(u64)0
+
+    ## Return whole bytes read ahead of the decoding to this call's input, so the input
+    ## consumed ends where the decoding does (they are this call's: see the description).
+    func give_back():
+        self.unpad()
+        var whole = self.bits >> 3
+        if (usize)whole > self.input_at:
+            whole = (u32)self.input_at
+        self.bits -= whole * 8
+        self.input_at -= (usize)whole
+        self.acc &= ((u64)1 << (u64)self.bits) - 1 if self.bits < 64 else ~(u64)0

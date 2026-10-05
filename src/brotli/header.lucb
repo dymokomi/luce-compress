@@ -1,0 +1,289 @@
+#==============================================================================================
+#
+#   brotli/header - The stream header and meta-block headers (RFC 7932 sections 6, 7.3, 9)
+#
+#   DESCRIPTION:
+#       The window size, then each meta-block's header: its length and kind (data,
+#       uncompressed or metadata), then for compressed data the block types and counts of
+#       the three categories, the distance parameters, the literal context modes, the two
+#       context maps and every prefix code. Each step is a resumable unit or a code read
+#       by prefix.lucb; `part` and `item` say where the header is.
+#
+#==============================================================================================
+
+# mark: Header parts ==========================================================================
+
+let part_types: u32 = 0
+let part_type_code: u32 = 1
+let part_count_code: u32 = 2
+let part_count: u32 = 3
+let part_distances: u32 = 4
+let part_modes: u32 = 5
+let part_literal_trees: u32 = 6
+let part_literal_map: u32 = 7
+let part_distance_trees: u32 = 8
+let part_distance_map: u32 = 9
+let part_codes: u32 = 10
+
+## Context map stages.
+let map_rle: u32 = 0
+let map_code: u32 = 1
+let map_values: u32 = 2
+let map_imtf: u32 = 3
+
+## Where the distance context map starts in `maps`, after the literal map's 64 x 256.
+let distance_map_at: usize = 16384
+
+extend Decoder:
+    ## The stream header: the window size (section 9.1).
+    func read_window() -> bool!:
+        self.begin(7)
+        var window_bits: u32 = 16
+        if self.take(1) == 1:
+            let high = self.take(3)
+            if high != 0:
+                window_bits = 17 + high
+            else:
+                let low = self.take(3)
+                window_bits = 17 if low == 0 else low + 8
+                if low == 1:
+                    if try self.short():
+                        return false
+                    error(unsupported, "large-window brotli streams are not supported")
+        if try self.short():
+            return false
+        self.window = (usize)1 << window_bits
+        self.state = state_meta
+        return true
+
+    ## A meta-block header up to its compressed part (section 9.2).
+    func read_meta() -> bool!:
+        self.begin(38)
+        let last = self.take(1) == 1
+        if last and self.take(1) == 1:
+            # The last meta-block is empty: the stream ends at the next byte boundary.
+            let zeros = self.align()
+            if try self.short():
+                return false
+            if not zeros:
+                error(corrupt, "nonzero padding after the brotli stream")
+            self.state = state_done
+            return true
+        let nibbles = self.take(2) + 4
+        if nibbles == 7:
+            # Metadata: skipped, not part of the output.
+            let reserved = self.take(1)
+            let count = self.take(2)
+            var skip: u32 = 0
+            var top: u32 = 0
+            for i in 0..<count:
+                top = self.take(8)
+                skip |= top << (8 * i)
+            let zeros = self.align()
+            if try self.short():
+                return false
+            if reserved != 0:
+                error(corrupt, "reserved brotli metadata bit is set")
+            if count > 1 and top == 0:
+                error(corrupt, "brotli metadata length has a needless byte")
+            if not zeros:
+                error(corrupt, "nonzero padding before brotli metadata")
+            self.remaining = (usize)skip + 1 if count > 0 else 0
+            self.last = last
+            self.state = state_skip
+            self.unpad()
+            return true
+        var length: u32 = 0
+        var nibble: u32 = 0
+        for i in 0..<nibbles:
+            nibble = self.take(4)
+            length |= nibble << (4 * i)
+        let uncompressed = not last and self.take(1) == 1
+        let zeros = self.align() if uncompressed else true
+        if try self.short():
+            return false
+        if nibbles > 4 and nibble == 0:
+            error(corrupt, "brotli meta-block length has a needless nibble")
+        if not zeros:
+            error(corrupt, "nonzero padding before an uncompressed brotli meta-block")
+        let size = (usize)length + 1
+        if (u64)size > self.max_output - self.total_out:
+            error(limit, "brotli output exceeds its limit")
+        try self.prepare_ring(size, last)
+        self.remaining = size
+        self.last = last
+        if uncompressed:
+            self.state = state_raw
+            self.unpad()
+            return true
+        self.state = state_header
+        self.part = part_types
+        self.category = 0
+        self.trees_used = 0
+        return true
+
+    ## A number 0..255 in 1 to 11 bits (the code of NBLTYPES and NTREES, section 9.2).
+    func small_number() -> u32:
+        if self.take(1) == 0:
+            return 0
+        let bits = self.take(3)
+        if bits == 0:
+            return 1
+        return ((u32)1 << bits) + self.take(bits)
+
+    ## The rest of a compressed meta-block's header, a part at a time.
+    func read_header() -> bool!:
+        while true:
+            let c = (usize)self.category
+            if self.part == part_types:
+                self.begin(11)
+                let types = self.small_number() + 1
+                if try self.short():
+                    return false
+                self.types[c] = types
+                self.type_last[c] = 1
+                self.type_now[c] = 0
+                self.block_left[c] = 16777216
+                self.part = part_type_code if types >= 2 else part_types
+                if types < 2:
+                    self.next_category()
+            elif self.part == part_type_code:
+                let offset = try self.read_code(self.types[c] + 2) else return false
+                self.type_codes[c] = offset
+                self.part = part_count_code
+            elif self.part == part_count_code:
+                let offset = try self.read_code(26) else return false
+                self.count_codes[c] = offset
+                self.part = part_count
+            elif self.part == part_count:
+                self.begin(39)
+                let code = self.symbol(self.trees.data + (usize)self.count_codes[c])
+                let count = count_base[(usize)code] + self.take(count_extra[(usize)code])
+                if try self.short():
+                    return false
+                self.block_left[c] = count
+                self.part = part_types
+                self.next_category()
+            elif self.part == part_distances:
+                self.begin(6)
+                let postfix = self.take(2)
+                let direct = self.take(4) << postfix
+                if try self.short():
+                    return false
+                self.postfix = postfix
+                self.direct = direct
+                self.part = part_modes
+                self.item = 0
+            elif self.part == part_modes:
+                while self.item < self.types[0]:
+                    self.begin(2)
+                    let mode = self.take(2)
+                    if try self.short():
+                        return false
+                    self.modes[(usize)self.item] = (u8)mode
+                    self.item += 1
+                self.part = part_literal_trees
+            elif self.part == part_literal_trees or self.part == part_distance_trees:
+                self.begin(11)
+                let trees = self.small_number() + 1
+                if try self.short():
+                    return false
+                let literal = self.part == part_literal_trees
+                let size = (usize)self.types[0] * 64 if literal else (usize)self.types[2] * 4
+                let at: usize = 0 if literal else distance_map_at
+                self.tree_count[0 if literal else 1] = trees
+                self.part = part_literal_map if literal else part_distance_map
+                if trees >= 2:
+                    self.map_stage = map_rle
+                    self.map_start = at
+                    self.map_at = at
+                    self.map_end = at + size
+                else:
+                    memory.set(self.maps[at..<at + size], 0)
+                    self.part = part_distance_trees if literal else part_codes
+                    self.item = 0
+            elif self.part == part_literal_map or self.part == part_distance_map:
+                let literal = self.part == part_literal_map
+                if not try self.read_map(self.tree_count[0 if literal else 1]):
+                    return false
+                self.part = part_distance_trees if literal else part_codes
+                self.item = 0
+            else:
+                # The prefix codes: literal, then insert-and-copy, then distance.
+                let literals = self.tree_count[0]
+                let commands = literals + self.types[1]
+                let all = commands + self.tree_count[1]
+                let distance_alphabet = 16 + self.direct + (48 << self.postfix)
+                while self.item < all:
+                    let n = self.item
+                    let alphabet: u32 = 256 if n < literals else 704 if n < commands else distance_alphabet
+                    let offset = try self.read_code(alphabet) else return false
+                    if n < literals:
+                        self.literal_codes[(usize)n] = offset
+                    elif n < commands:
+                        self.command_codes[(usize)(n - literals)] = offset
+                    else:
+                        self.distance_codes[(usize)(n - commands)] = offset
+                    self.item += 1
+                self.select_literal_type()
+                self.select_distance_type()
+                self.state = state_command
+                return true
+
+    ## On to the next block category, or to the distance parameters after the last.
+    func next_category():
+        self.category += 1
+        if self.category == 3:
+            self.part = part_distances
+
+    ## A context map of `trees` prefix codes into `maps[map_at..<map_end]` (section 7.3).
+    func read_map(trees: u32) -> bool!:
+        if self.map_stage == map_rle:
+            self.begin(5)
+            var rle: u32 = 0
+            if self.take(1) == 1:
+                rle = self.take(4) + 1
+            if try self.short():
+                return false
+            self.map_rle = rle
+            self.map_stage = map_code
+        if self.map_stage == map_code:
+            let offset = try self.read_code(trees + self.map_rle) else return false
+            self.map_code = offset
+            self.map_stage = map_values
+        if self.map_stage == map_values:
+            let table = self.trees.data + (usize)self.map_code
+            while self.map_at < self.map_end:
+                self.begin(31)
+                let code = self.symbol(table)
+                let run = self.take(code) if code != 0 and code <= self.map_rle else 0
+                if try self.short():
+                    return false
+                if code == 0 or code > self.map_rle:
+                    self.maps[self.map_at] = (u8)(code - self.map_rle if code != 0 else 0)
+                    self.map_at += 1
+                    continue
+                let zeros = ((usize)1 << code) + (usize)run
+                if zeros > self.map_end - self.map_at:
+                    error(corrupt, "brotli context map run overruns the map")
+                memory.set(self.maps[self.map_at..<self.map_at + zeros], 0)
+                self.map_at += zeros
+            self.map_stage = map_imtf
+        self.begin(1)
+        let imtf = self.take(1)
+        if try self.short():
+            return false
+        if imtf == 1:
+            var order: u8[256]
+            for i in 0..<(usize)256:
+                order[i] = (u8)i
+            for at in self.map_start..<self.map_end:
+                let index = (usize)self.maps[at]
+                let value = order[index]
+                self.maps[at] = value
+                var k = index
+                while k > 0:
+                    order[k] = order[k - 1]
+                    k -= 1
+                order[0] = value
+        return true

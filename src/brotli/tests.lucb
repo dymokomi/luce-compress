@@ -1,0 +1,204 @@
+#==============================================================================================
+#
+#   brotli/tests - The module's tests
+#
+#   DESCRIPTION:
+#       Hand-made streams (empty, uncompressed, metadata, damaged headers), the decoder's
+#       contract (pieces of every size, output stalls, limits, trailing bytes, closing,
+#       failing and resetting) and every truncation and many corruptions of a reference
+#       stream; vectors.lucb adds reference and crafted streams.
+#
+#==============================================================================================
+
+# mark: Helpers ===============================================================================
+
+## CRC-32 (ISO 3309), bit by bit: the vectors' check, kept apart from the codecs.
+func checksum(data: const u8[]) -> u32:
+    var crc: u32 = 0xFFFFFFFF
+    for byte in data:
+        crc ^= (u32)byte
+        for _ in 0..<8:
+            crc = (crc >> 1) ^ (0xEDB88320 if crc & 1 != 0 else 0)
+    return ~crc
+
+## Decode `packed` through a Decoder, `piece` input and `room` output bytes a step at a
+## time, into a heap buffer of `size` bytes (the caller frees it); fails as the decoder
+## does, or when the output would exceed `size`.
+func decode_pieces(packed: const u8[], size: usize, piece: usize, room: usize) -> u8[]!:
+    var state = Decoder.open()
+    defer state.close()
+    let output = try new u8[size + room] in memory.heap
+    errdefer free(output) in memory.heap
+    var at: usize = 0
+    var made: usize = 0
+    var offered: usize = 0
+    while true:
+        if offered <= at:
+            offered = at + piece if at + piece < packed.length else packed.length
+        if made > size:
+            error(limit, "more output than expected")
+        let step = try state.step(packed[at..<offered], output[made..<made + room], offered == packed.length)
+        at += (usize)step.consumed
+        made += (usize)step.produced
+        if step.status == finished:
+            assert(at == packed.length)
+            break
+        if step.status == need_input:
+            assert(at == offered)
+    let result = try new u8[made] --- in memory.heap
+    memory.copy(result, output[..<made], made)
+    free(output) in memory.heap
+    return result
+
+## Check a vector: whole, and in pieces of a few sizes, to `size` bytes of CRC-32 `crc`.
+func check_vector(packed: const u8[], size: usize, crc: u32) -> !:
+    let whole = try decode(packed, size)
+    assert(whole.length == size and checksum(whole) == crc)
+    free(whole) in memory.heap
+    var into = try new u8[size] in memory.heap
+    defer free(into) in memory.heap
+    assert(try decode_into(packed, into) == size and checksum(into) == crc)
+    for shape in [(usize)1, 2, 3, 7, 64, 1000]:
+        let pieces = try decode_pieces(packed, size, shape, shape * 3 + 1)
+        assert(pieces.length == size and checksum(pieces) == crc)
+        free(pieces) in memory.heap
+    # A decoder limited one byte short fails with `limit`.
+    if size > 0:
+        assert(failure_of(packed, size - 1) == limit)
+
+## The failure code of decoding `packed` whole, or `closed` when it decodes.
+func failure_of(packed: const u8[], max_output: usize = default_limit) -> ErrorCode:
+    let output = decode(packed, max_output) catch failure:
+        return failure.code
+    free(output) in memory.heap
+    return closed
+
+# mark: Hand-made streams =====================================================================
+
+test "an empty stream decodes to nothing":
+    # WBITS 16 (one 0 bit), then ISLAST and ISLASTEMPTY.
+    let out = try decode(b"\x06")
+    assert(out.length == 0)
+    free(out) in memory.heap
+    assert(failure_of(b"\x86") == corrupt)  # nonzero padding
+    assert(failure_of(b"") == corrupt)
+    assert(failure_of(b"\x06\x00") == corrupt)  # trailing bytes
+    let trailing = try decode(b"\x06\x00", allow_trailing = true)
+    free(trailing) in memory.heap
+
+test "an uncompressed meta-block is copied":
+    # WBITS 16; not last; four nibbles of MLEN - 1 = 4; uncompressed; "hello"; last, empty.
+    let packed = b"\x40\x00\x10hello\x03"
+    let out = try decode(packed)
+    defer free(out) in memory.heap
+    assert((str)out == "hello")
+    let pieces = try decode_pieces(packed, 5, 1, 1)
+    defer free(pieces) in memory.heap
+    assert((str)pieces == "hello")
+    # Truncated inside the bytes, and with nonzero padding before them.
+    assert(failure_of(b"\x40\x00\x10hel") == corrupt)
+    assert(failure_of(b"\x40\x00\x30hello\x03") == corrupt)
+
+test "metadata is skipped":
+    # WBITS 16; not last; MNIBBLES 0; one MSKIPBYTES byte of MSKIPLEN - 1 = 2; "abc".
+    let out = try decode(b"\x2C\x01abc\x03")
+    assert(out.length == 0)
+    free(out) in memory.heap
+    let pieces = try decode_pieces(b"\x2C\x01abc\x03", 0, 1, 1)
+    free(pieces) in memory.heap
+    # A reserved bit, and a needless length byte (two bytes, the last zero).
+    assert(failure_of(b"\x3C\x01abc\x03") == corrupt)
+    assert(failure_of(b"\x4C\x01\x00abc\x03") == corrupt)
+
+test "a large-window stream is refused and bad headers fail":
+    # WBITS bits 1000100 then 6 bits of window: large-window brotli.
+    assert(failure_of(b"\x11\x0A\x03") == unsupported)
+    # A last nibble of zero in a five-nibble length.
+    assert(failure_of(b"\x04\x00\x00\x00") == corrupt)
+
+# mark: The decoder's contract ================================================================
+
+test "a closed, failed or reset decoder behaves":
+    var state = Decoder.open()
+    var out: u8[16]
+    var failure_code = invalid
+    _ = state.step(b"\x86", out, true) catch failure:
+        failure_code = failure.code
+        recover Step(0, 0, 0, 0)
+    assert(failure_code == corrupt and state.statistics().failed)
+    failure_code = invalid
+    _ = state.step(b"\x06", out, true) catch failure:
+        failure_code = failure.code
+        recover Step(0, 0, 0, 0)
+    assert(failure_code == corrupt)
+    try state.reset()
+    let step = try state.step(b"\x06", out, true)
+    assert(step.status == finished and step.consumed == 1 and step.produced == 0)
+    assert(state.statistics().finished)
+    let again = try state.step(b"", out)
+    assert(again.status == finished and again.consumed == 0)
+    state.close()
+    state.close()
+    failure_code = invalid
+    _ = state.step(b"\x06", out, true) catch failure:
+        failure_code = failure.code
+        recover Step(0, 0, 0, 0)
+    assert(failure_code == closed)
+
+test "without final input a stream waits, and consumed ends at its end":
+    var state = Decoder.open()
+    defer state.close()
+    var out: u8[16]
+    let first = try state.step(b"\x40\x00\x10he", out)
+    assert(first.status == need_input and first.consumed == 5 and first.produced == 2)
+    let rest = try state.step(b"llo\x03TRAILING", out[2..])
+    assert(rest.status == finished and rest.consumed == 4 and rest.produced == 3)
+    assert((str)out[..<5] == "hello")
+
+test "no output room stalls the decoder without losing input":
+    var state = Decoder.open()
+    defer state.close()
+    let packed = b"\x40\x00\x10hello\x03"
+    var out: u8[8]
+    let stalled = try state.step(packed, out[..<0], true)
+    assert(stalled.status == need_output and stalled.produced == 0)
+    let done = try state.step(packed[(usize)stalled.consumed..], out, true)
+    assert(done.status == finished and (usize)(stalled.consumed + done.consumed) == packed.length)
+    assert((str)out[..<5] == "hello")
+
+# mark: Damaged streams =======================================================================
+
+test "every truncation of a stream fails and damage never traps":
+    # Google's brotli CLI, quality 11 and window 10, over 1,000 bytes of words.
+    var packed: u8[300]
+    let parts = [
+        b"\xa1\x38\x1f\x00\x61\xa4\x76\xaa\x65\x71\x1a\xfc\xff\x36\xbf\xdf\x92\x4e\x68\xfb\x55\x59\xea\x77",
+        b"\x38\x37\x61\xf8\x40\x64\x21\x14\x8b\x2a\x15\x3e\xbf\x0b\x81\x3d\x3f\x99\xc0\xed\xd2\xc1\x41\xc1",
+        b"\x4b\x7d\xbe\xb3\x95\x13\x2d\x58\x85\x4a\x55\x67\xa3\x97\x82\xb0\xd7\xdc\xda\xa6\x49\x37\xb8\x43",
+        b"\x7c\xf8\xb7\x44\x67\xdd\xf6\x03\xef\x0d\x02\x7d\xf9\x9b\x83\xba\x57\x52\xae\xff\x09\x55\x5d\x69",
+        b"\xfc\x7d\xf5\x18\x5f\x45\xd4\xf6\x70\x9c\x69\x09\x01\x9c\x3e\x52\x7d\x9f\xc7\x8c\x3f\xe6\x32\x63",
+        b"\xe3\xd5\xa2\x44\x14\x54\x46\x4d\x3d\x32\x5e\xa8\xd1\xc4\xb8\xe2\x96\xa7\xb3\x43\xba\x62\xf4\x34",
+        b"\x42\xc4\x1e\x6e\xb9\xbb\xa2\xa4\x80\xa6\xc4\x08\xf8\xe6\xa8\x43\x67\x99\x46\x02\x12\x2f\xd3\xce",
+        b"\x30\xf4\xd2\x0d\x73\x10\xa2\xeb\xaa\xb1\xf2\x0a\x4e\x65\xaa\x9f\x8a\x9a\xb1\x8a\x29\x76\x5a\x06",
+        b"\xf4\xf1\xcf\x8c\x42\xb3\x30\x29\x81\x7c\xe2\x02\x20\xef\x2c\xd8\x67\x14\x14\x48\x95\xa7\xe3\x75",
+        b"\x97\xf3\x5d\x10\xa6\x64\x66\x53\x54\x8a\x3d\x16\x16\xb2\xc1\x74\x98\x10\x63\xf3\xaf\xa2\x28\x03",
+        b"\x1e\xbd\x49\x40\x38\xa3\x5c\xcc\x55\x41\x0c\x83\x56\x38\x0e\x27\xf7\xde\xf2\x45\x79\xbb\x25\x6f",
+        b"\xfa\xca\x4f\xb3\x9b\xa5\x97\xbb\x31\xdf\x11\xc2\x44\xbf\x5b\x6d\xca\xb8\xdb\xb4\x3a\x01\x5e\x5f",
+        b"\x7a\xb6\x65\x24\xfd\x4e\x99\xab\x8e\x66\x84\x00",
+    ]
+    var at: usize = 0
+    for part in parts:
+        memory.copy(packed[at..], part, part.length)
+        at += part.length
+    let whole = try decode(packed)
+    assert(whole.length == 1000 and checksum(whole) == 4052459106)
+    free(whole) in memory.heap
+    for cut in 0..<packed.length:
+        assert(failure_of(packed[..<cut]) == corrupt)
+    var copy: u8[300]
+    for place in 0..<packed.length:
+        for bit in 0..<8:
+            copy = packed
+            copy[place] ^= (u8)1 << (u8)bit
+            let code = failure_of(copy, 4096)
+            assert(code == corrupt or code == closed or code == limit)

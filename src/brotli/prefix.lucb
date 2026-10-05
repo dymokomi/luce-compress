@@ -1,0 +1,273 @@
+#==============================================================================================
+#
+#   brotli/prefix - Prefix codes: reading them, and their lookup tables (RFC 7932 section 3)
+#
+#   DESCRIPTION:
+#       A code decodes through a table indexed by the next 8 bits: an entry is the symbol
+#       and its code's length, or for longer codes a link to a second-level table of up
+#       to 7 more bits, stored after the root. A code's tables go into the meta-block's
+#       one growable array of tables (`trees`); a code is known by its offset there.
+#       Reading a code is resumable: a simple code is one unit, a complex code one unit
+#       per code length code length and one per code length (with its extra bits).
+#
+#==============================================================================================
+
+## Entries one code's table may need at most: a full root of 256 and 256 second-level
+## tables of 128 (a complete code never needs as many).
+let tree_room: usize = 256 + 256 * 128
+
+# mark: Lookup tables =========================================================================
+
+## The bit-reversed canonical code after `key`, a code of `length` bits (the table index
+## of the next code, read least significant bit first); 0 after the last.
+func next_key(key: u32, length: u32) -> u32:
+    var step: u32 = (u32)1 << (length - 1)
+    while key & step != 0:
+        step >>= 1
+    if step == 0:
+        return 0
+    return (key & (step - 1)) + step
+
+## Bits of the second-level table for codes starting at `length` past the root, from the
+## codes of each length not yet placed (`count`).
+func table_bits(length: u32, root: u32, count: const u16*) -> u32:
+    var bits = length - root
+    var left: i32 = (i32)1 << bits
+    while bits + root < 15:
+        left -= (i32)count[(usize)(bits + root)]
+        if left <= 0:
+            break
+        bits += 1
+        left <<= 1
+    return bits
+
+## Fill `table` with the complete canonical code whose symbols, ordered by code length and
+## then value, are `sorted`, `count[n]` of them of length n; a root of `root` bits. The
+## entries used, root included. `count` is consumed.
+func build_table(table: u32*, root: u32, sorted: const u16*, count: u16*) -> usize:
+    let size = (usize)1 << root
+    var key: u32 = 0
+    var at: usize = 0
+    for length in 1..<root + 1:
+        while count[(usize)length] > 0:
+            let entry = ((u32)sorted[at] << 16) | length
+            var slot = (usize)key
+            while slot < size:
+                table[slot] = entry
+                slot += (usize)1 << length
+            key = next_key(key, length)
+            at += 1
+            count[(usize)length] -= 1
+    var used = size
+    var prefix: u32 = 0xFFFFFFFF
+    var start: usize = 0
+    var bits: u32 = 0
+    for length in root + 1..<(u32)16:
+        while count[(usize)length] > 0:
+            let low = key & (u32)(size - 1)
+            if low != prefix:
+                bits = table_bits(length, root, count)
+                start = used
+                used += (usize)1 << bits
+                table[(usize)low] = ((u32)start << 16) | (root + bits)
+                prefix = low
+            let entry = ((u32)sorted[at] << 16) | (length - root)
+            var slot = (usize)(key >> root)
+            while slot < (usize)1 << bits:
+                table[start + slot] = entry
+                slot += (usize)1 << (length - root)
+            key = next_key(key, length)
+            at += 1
+            count[(usize)length] -= 1
+    return used
+
+## Fill `table` from per-symbol code lengths (0 for an unused symbol) of a complete code.
+func build_lengths(table: u32*, root: u32, lengths: const u8[]) -> usize:
+    var count: u16[16]
+    for length in lengths:
+        count[(usize)length] += 1
+    count[0] = 0
+    var offsets: u16[16]
+    for n in 1..<(usize)15:
+        offsets[n + 1] = offsets[n] + count[n]
+    var sorted: u16[704]
+    for i in 0..<lengths.length:
+        let length = (usize)lengths[i]
+        if length != 0:
+            sorted[(usize)offsets[length]] = (u16)i
+            offsets[length] += 1
+    return build_table(table, root, &sorted[0], &count[0])
+
+## Fill `table` (a 256-entry root) with a code of one symbol and no bits.
+func build_single(table: u32*, symbol: u32) -> usize:
+    for i in 0..<(usize)256:
+        table[i] = symbol << 16
+    return 256
+
+## Bits needed to write any symbol below `alphabet` (at least 2 symbols).
+func alphabet_bits(alphabet: u32) -> u32:
+    var bits: u32 = 0
+    var n = alphabet - 1
+    while n != 0:
+        bits += 1
+        n >>= 1
+    return bits
+
+# mark: Reading codes =========================================================================
+
+let code_kind: u32 = 0
+let code_length_lengths: u32 = 1
+let code_symbol_lengths: u32 = 2
+
+extend Decoder:
+    ## Room for one more code's table in `trees`, grown when needed; a pointer valid until
+    ## the next call.
+    func tree_space() -> u32*!:
+        if self.trees_used + tree_room > self.trees.length:
+            var capacity = self.trees.length * 2
+            if capacity < self.trees_used + tree_room:
+                capacity = self.trees_used + tree_room
+            let grown = try new u32[capacity] --- in memory.heap
+            if self.trees_used > 0:
+                memory.copy(grown, self.trees[..<self.trees_used], self.trees_used)
+            if self.trees.length > 0:
+                free(self.trees) in memory.heap
+            self.trees = grown
+        return self.trees.data + self.trees_used
+
+    ## Read a prefix code over `alphabet` symbols into `trees`; its offset, or none when
+    ## the input ran out (call again with more).
+    func read_code(alphabet: u32) -> u32?!:
+        if self.code_stage == code_kind:
+            let table = try self.tree_space()
+            let bits = alphabet_bits(alphabet)
+            self.begin(5 + 4 * bits)
+            let kind = self.take(2)
+            if kind != 1:
+                if try self.short():
+                    return none
+                self.code_stage = code_length_lengths
+                self.code_index = kind
+                self.code_space = 32
+                self.code_count = 0
+                for i in 0..<(usize)18:
+                    self.code_lengths[i] = 0
+            else:
+                let count = self.take(2) + 1
+                var symbols: u16[4]
+                for i in 0..<(usize)count:
+                    symbols[i] = (u16)self.take(bits)
+                let select = self.take(1) if count == 4 else 0
+                if try self.short():
+                    return none
+                for i in 0..<(usize)count:
+                    if (u32)symbols[i] >= alphabet:
+                        error(corrupt, "brotli prefix code symbol is out of range")
+                    for j in 0..<i:
+                        if symbols[i] == symbols[j]:
+                            error(corrupt, "brotli prefix code repeats a symbol")
+                let offset = (u32)self.trees_used
+                self.trees_used += build_simple(table, symbols, count, select)
+                return offset
+        if self.code_stage == code_length_lengths:
+            while self.code_index < 18:
+                self.begin(4)
+                let peek = (usize)(self.acc & 15)
+                _ = self.take((u32)length_bits[peek])
+                if try self.short():
+                    return none
+                let value = length_value[peek]
+                self.code_lengths[(usize)length_order[(usize)self.code_index]] = value
+                self.code_index += 1
+                if value != 0:
+                    self.code_space -= (i32)32 >> (i32)value
+                    self.code_count += 1
+                    if self.code_space <= 0:
+                        break
+            if self.code_count != 1 and self.code_space != 0:
+                error(corrupt, "invalid brotli code length code")
+            if self.code_count == 1:
+                for i in 0..<(usize)18:
+                    if self.code_lengths[i] != 0:
+                        for k in 0..<(usize)32:
+                            self.code_table[k] = (u32)i << 16
+            else:
+                _ = build_lengths(&self.code_table[0], 5, self.code_lengths)
+            self.code_stage = code_symbol_lengths
+            self.code_index = 0
+            self.code_space = 32768
+            self.previous_length = 8
+            self.repeat = 0
+            self.repeat_length = 0
+            for i in 0..<(usize)alphabet:
+                self.lengths[i] = 0
+        while self.code_index < alphabet and self.code_space > 0:
+            self.begin(8)
+            let entry = self.code_table[(usize)(self.acc & 31)]
+            _ = self.take(entry & 255)
+            let code = entry >> 16
+            let extra = self.take(2) if code == 16 else self.take(3) if code == 17 else 0
+            if try self.short():
+                return none
+            if code < 16:
+                self.repeat = 0
+                self.lengths[(usize)self.code_index] = (u8)code
+                self.code_index += 1
+                if code != 0:
+                    self.previous_length = code
+                    self.code_space -= (i32)32768 >> (i32)code
+                continue
+            # A repeat: of the last nonzero length (16) or of zero (17); a repeat right
+            # after one of the same kind extends it.
+            let length = self.previous_length if code == 16 else 0
+            let shift: u32 = 2 if code == 16 else 3
+            if self.repeat_length != length:
+                self.repeat = 0
+                self.repeat_length = length
+            let before = self.repeat
+            if self.repeat > 0:
+                self.repeat = (self.repeat - 2) << shift
+            self.repeat += extra + 3
+            let added = self.repeat - before
+            if added > alphabet - self.code_index:
+                error(corrupt, "brotli code length repeat overruns the alphabet")
+            for i in 0..<(usize)added:
+                self.lengths[(usize)self.code_index + i] = (u8)length
+            self.code_index += added
+            if length != 0:
+                self.code_space -= (i32)(added << (15 - length))
+        if self.code_space != 0:
+            error(corrupt, "invalid brotli prefix code")
+        self.code_stage = code_kind
+        let table = try self.tree_space()
+        let offset = (u32)self.trees_used
+        self.trees_used += build_lengths(table, 8, self.lengths[..<(usize)alphabet])
+        return offset
+
+## Fill `table` with a simple code (section 3.4): `count` distinct symbols; with four,
+## `select` picks lengths 2, 2, 2, 2 (0) or 1, 2, 3, 3 (1).
+func build_simple(table: u32*, symbols: u16[4], count: u32, select: u32) -> usize:
+    if count == 1:
+        return build_single(table, (u32)symbols[0])
+    var sorted = symbols
+    var lengths: u16[16]
+    # Symbols of one length are sorted; the lengths follow the listed order.
+    var sorted_from: usize = 0
+    if count == 2 or (count == 4 and select == 0):
+        lengths[(usize)(1 if count == 2 else 2)] = (u16)count
+    elif count == 3:
+        lengths[1] = 1
+        lengths[2] = 2
+        sorted_from = 1
+    else:
+        lengths[1] = 1
+        lengths[2] = 1
+        lengths[3] = 2
+        sorted_from = 2
+    for i in sorted_from..<(usize)count:
+        for j in i + 1..<(usize)count:
+            if sorted[j] < sorted[i]:
+                let swap = sorted[i]
+                sorted[i] = sorted[j]
+                sorted[j] = swap
+    return build_table(table, 8, &sorted[0], &lengths[0])

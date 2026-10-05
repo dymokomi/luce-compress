@@ -38,6 +38,7 @@ def main():
             run([args.base.resolve(), "test", ROOT / "src/flate", *flags])
             run([args.base.resolve(), "test", ROOT / "src/zip", *flags])
             run([args.base.resolve(), "test", ROOT / "src/lz4", *flags])
+            run([args.base.resolve(), "test", ROOT / "src/brotli", *flags])
     for mode, flags in MODES.items():
         if args.mode != "all" and args.mode != mode:
             continue

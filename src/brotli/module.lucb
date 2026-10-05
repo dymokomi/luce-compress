@@ -1,0 +1,318 @@
+#==============================================================================================
+#
+#   brotli - Brotli decompression (RFC 7932): whole buffers and incremental streams
+#
+#   DESCRIPTION:
+#       The full format: meta-blocks (compressed, uncompressed and metadata), simple and
+#       complex prefix codes, block switches, context modelling, distance codes with
+#       NPOSTFIX and NDIRECT, and the static dictionary with its 121 transforms, over
+#       windows of 1 KiB to 16 MiB (large-window streams are refused as unsupported).
+#       `decode` and `decode_into` decode a whole buffer; a `Decoder` takes its input and
+#       gives its output in pieces of any size, holding at most the stream's window and
+#       its prefix codes. Damaged or truncated input fails with `corrupt` and output past
+#       a caller's limit with `limit`, never a trap; a stream's whole output is bounded
+#       before any of it is written, so a small input cannot make a large allocation
+#       beyond the limit.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb      the API and the decoder's state
+#       bits.lucb        the bit reader and its resumable units
+#       prefix.lucb      prefix codes and their lookup tables
+#       header.lucb      the stream and meta-block headers and context maps
+#       commands.lucb    block switches, literals, distances and copies
+#       fast.lucb        whole commands at once while the input and the window allow
+#       window.lucb      the sliding window, output, copies and dictionary words
+#       tables.lucb      the format's length, count and distance tables
+#       dictionary.lucb  the static dictionary, its transforms and the context lookups
+#       tests.lucb       the module's tests
+#
+#==============================================================================================
+import memory
+import binary
+import decoder
+from binary import invalid, corrupt, limit, unsupported, closed
+
+## The offered input was consumed; supply the next bytes.
+pub let need_input = decoder.need_input
+## The output is full; call again with room, offering the input not yet consumed.
+pub let need_output = decoder.need_output
+## The stream is complete and all its output given.
+pub let finished = decoder.finished
+
+## What a step did: input bytes consumed, output bytes produced, and the status.
+pub type Step = decoder.Step
+
+## The whole-buffer decoders' default output limit: 64 MiB.
+pub let default_limit: usize = 67108864
+
+# mark: Whole buffers =========================================================================
+
+## The Brotli stream `data` decoded into a heap buffer the caller frees; at most `limit`
+## bytes of output. Bytes after the stream fail unless `allow_trailing`.
+pub func decode(data: const u8[], max_output: usize = default_limit, allow_trailing: bool = false) -> u8[]!:
+    var state = Decoder.open((u64)max_output)
+    defer state.close()
+    var output = binary.Buffer(maximum = max_output)
+    errdefer output.close()
+    var guess = data.length * 4 + 1024
+    if guess > max_output:
+        guess = max_output
+    try output.reserve(guess)
+    var at: usize = 0
+    while true:
+        let step = try state.step(data[at..], output.data[output.used..], true)
+        at += (usize)step.consumed
+        output.used += (usize)step.produced
+        if step.status == finished:
+            break
+        if step.status != need_output:
+            error(corrupt, "truncated brotli stream")
+        # need_output: more room, up to the limit (the decoder fails first past it).
+        try output.reserve(output.data.length - output.used + 1)
+    if at != data.length and not allow_trailing:
+        error(corrupt, "trailing bytes after the brotli stream")
+    let result = try new u8[output.used] --- in memory.heap
+    memory.copy(result, output.view(), output.used)
+    output.close()
+    return result
+
+## The Brotli stream `data` decoded into `output`; the bytes it produced. A stream that
+## would produce more fails with `limit`, and bytes after the stream with `corrupt`.
+pub func decode_into(data: const u8[], output: u8[]) -> usize!:
+    var state = Decoder.open((u64)output.length)
+    defer state.close()
+    let step = try state.step(data, output, true)
+    if step.status != finished:
+        error(limit, "brotli output exceeds its buffer")
+    if (usize)step.consumed != data.length:
+        error(corrupt, "trailing bytes after the brotli stream")
+    return (usize)step.produced
+
+# mark: The incremental decoder ===============================================================
+
+let state_window: u32 = 0
+let state_meta: u32 = 1
+let state_skip: u32 = 2
+let state_raw: u32 = 3
+let state_header: u32 = 4
+let state_command: u32 = 5
+let state_copy_length: u32 = 6
+let state_insert: u32 = 7
+let state_distance: u32 = 8
+let state_copy: u32 = 9
+let state_word: u32 = 10
+let state_meta_done: u32 = 11
+let state_done: u32 = 12
+
+## An incremental Brotli decoder. `step` takes input and gives output in pieces of any
+## size; the decoder owns heap memory (its window and prefix codes) until `close`. Not
+## for concurrent use; independent decoders may run on separate threads.
+pub struct Decoder:
+    var ready: bool
+    var failed: bool
+    var max_output: u64
+    var state: u32
+    # The current step's input and output, borrowed for the call.
+    var input: const u8[]
+    var input_at: usize
+    var final_input: bool
+    var output: u8[]
+    var produced: usize
+    var total_in: u64
+    # The bit reader (bits.lucb).
+    var acc: u64
+    var bits: u32
+    var padded: u32
+    var saved_acc: u64
+    var saved_bits: u32
+    # The window (window.lucb).
+    var ring: u8[]
+    var ring_size: usize
+    var window: usize
+    var pos: usize
+    var flushed: usize
+    var wrapped: bool
+    var total_out: u64
+    var p1: u8
+    var p2: u8
+    # The meta-block: its bytes left, whether it is the last.
+    var remaining: usize
+    var last: bool
+    var part: u32
+    var category: u32
+    var item: u32
+    # Block types and counts by category (literal, insert-and-copy, distance).
+    var types: u32[3]
+    var type_last: u32[3]
+    var type_now: u32[3]
+    var block_left: u32[3]
+    var type_codes: u32[3]
+    var count_codes: u32[3]
+    # Distances.
+    var postfix: u32
+    var direct: u32
+    var distances: i64[4]
+    var distance_at: usize
+    # Context modelling: modes, maps (literal then distance), the current literal block
+    # type's code table by context, and the current distance block type's map row.
+    var modes: u8[256]
+    var tree_count: u32[2]
+    var maps: u8[]
+    var literal_tables: u32[64]
+    var literal_mode: usize
+    var distance_map: usize
+    var map_stage: u32
+    var map_rle: u32
+    var map_code: u32
+    var map_start: usize
+    var map_at: usize
+    var map_end: usize
+    # Prefix codes: every table of the meta-block in `trees`, known by offset.
+    var trees: u32[]
+    var trees_used: usize
+    var literal_codes: u32[256]
+    var command_codes: u32[256]
+    var distance_codes: u32[256]
+    # A prefix code being read (prefix.lucb).
+    var code_stage: u32
+    var code_index: u32
+    var code_space: i32
+    var code_count: u32
+    var code_lengths: u8[18]
+    var code_table: u32[32]
+    var lengths: u8[704]
+    var previous_length: u32
+    var repeat: u32
+    var repeat_length: u32
+    # The command being decoded.
+    var insert_left: usize
+    var copy_code: u32
+    var implicit: bool
+    var copy_length: usize
+    var copy_left: usize
+    var distance: usize
+
+    ## A decoder whose stream may produce at most `max_output` bytes (fails with `limit`
+    ## beyond). It allocates nothing until its first step.
+    pub static func open(max_output: u64 = 0xFFFFFFFFFFFFFFFF) -> Decoder:
+        var made = Decoder()
+        made.ready = true
+        made.max_output = max_output
+        made.distances = [16, 15, 11, 4]
+        made.distance_at = 3
+        return made
+
+    ## Decode from `input` into `output`. `final_input` declares that `input` ends the
+    ## stream's data (a stream it leaves incomplete then fails as truncated). A
+    ## `need_input` step consumed all its input; after `need_output`, offer again the
+    ## input it did not consume. At `finished`, `consumed` ends exactly at the stream's
+    ## end. A failure leaves the decoder failed until `reset`.
+    pub func step(input: const u8[], output: u8[], final_input: bool = false) -> Step!:
+        if not self.ready:
+            error(closed, "brotli decoder is closed or uninitialized")
+        if self.failed:
+            error(corrupt, "brotli decoder failed; reset before reuse")
+        errdefer self.fail()
+        self.input = input
+        self.input_at = 0
+        self.final_input = final_input
+        self.output = output
+        self.produced = 0
+        self.flush()
+        if self.state != state_done:
+            try self.run()
+            self.flush()
+        var status = need_input
+        if self.pending():
+            status = need_output
+            self.give_back()
+        elif self.state == state_done:
+            status = finished
+            self.give_back()
+        else:
+            self.unpad()
+        let consumed = self.input_at
+        let produced = self.produced
+        self.total_in += (u64)consumed
+        self.release_spans()
+        return Step((i64)consumed, (i64)produced, status, 0)
+
+    ## Bytes consumed and produced so far, and whether the stream is complete or failed.
+    pub func statistics() -> decoder.Statistics:
+        return decoder.Statistics((i64)self.total_in, (i64)self.total_out, self.state == state_done and not self.pending(), self.failed)
+
+    ## Start a new stream with the same limit; memory is released.
+    pub func reset() -> !:
+        if not self.ready:
+            error(closed, "brotli decoder is closed or uninitialized")
+        let max_output = self.max_output
+        self.close()
+        self = Decoder.open(max_output)
+
+    ## Release the decoder's memory; idempotent.
+    pub func close():
+        if self.ring.length > 0:
+            free(self.ring) in memory.heap
+        if self.trees.length > 0:
+            free(self.trees) in memory.heap
+        if self.maps.length > 0:
+            free(self.maps) in memory.heap
+        var empty: u8[]
+        var none_trees: u32[]
+        self.ring = empty
+        self.maps = empty
+        self.trees = none_trees
+        self.ready = false
+
+    func fail():
+        self.failed = true
+        self.release_spans()
+
+    func release_spans():
+        var empty: u8[]
+        self.input = empty
+        self.output = empty
+
+    ## Run states until the stream ends, the input runs out or the output has no room.
+    func run() -> !:
+        if self.maps.length == 0:
+            self.maps = try new u8[distance_map_at + 1024] in memory.heap
+        while self.state != state_done:
+            var going = false
+            match self.state:
+                0:
+                    going = try self.read_window()
+                1:
+                    going = try self.read_meta()
+                2:
+                    going = try self.raw(false)
+                3:
+                    going = try self.raw(true)
+                4:
+                    going = try self.read_header()
+                5:
+                    # Whole commands at once while the input and the ring allow.
+                    if self.input_at + 8 <= self.input.length and self.padded == 0:
+                        try self.fast()
+                    going = true
+                    if self.state == state_command:
+                        going = try self.read_command()
+                6:
+                    going = try self.read_copy_length()
+                7:
+                    going = try self.insert_literals()
+                8:
+                    going = try self.read_distance()
+                9:
+                    going = try self.copy_bytes()
+                    if going:
+                        self.state = state_command if self.remaining > 0 else state_meta_done
+                10:
+                    going = try self.dictionary_word()
+                11:
+                    going = try self.meta_done()
+                _:
+                    trap("invalid brotli decoder state")
+            if not going:
+                return

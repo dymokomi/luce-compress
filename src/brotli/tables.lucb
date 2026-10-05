@@ -1,0 +1,50 @@
+#==============================================================================================
+#
+#   brotli/tables - The format's length, count and distance tables (RFC 7932 sections 4-6)
+#
+#==============================================================================================
+
+# mark: Insert and copy lengths ===============================================================
+
+## The first insert length of each insert length code, and its extra bits (section 5).
+let insert_base: u32[24] = [0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114, 6210, 22594]
+let insert_extra: u32[24] = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24]
+
+## The first copy length of each copy length code, and its extra bits (section 5).
+let copy_base: u32[24] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54, 70, 102, 134, 198, 326, 582, 1094, 2118]
+let copy_extra: u32[24] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24]
+
+## Each 64-symbol cell of the insert-and-copy alphabet: the first insert length code and
+## the first copy length code of its 8 x 8 square. Cells 0 and 1 (symbols 0..127) also
+## reuse the last distance.
+let cell_insert: u32[11] = [0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16]
+let cell_copy: u32[11] = [0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16]
+
+# mark: Block counts ==========================================================================
+
+## The first block count of each block count code, and its extra bits (section 6).
+let count_base: u32[26] = [1, 5, 9, 13, 17, 25, 33, 41, 49, 65, 81, 97, 113, 145, 177, 209, 241, 305, 369, 497, 753, 1265, 2289, 4337, 8433, 16625]
+let count_extra: u32[26] = [2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13, 24]
+
+# mark: Distances =============================================================================
+
+## Distance symbols 0..15 (section 4): which of the last distances each starts from (0 the
+## last, 1 the one before it...) and what it adds to it.
+let short_slot: u32[16] = [0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
+let short_delta: i64[16] = [0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3]
+
+## The largest distance a stream may express (Google's decoder rejects any larger, so
+## that adding to a last distance cannot overflow).
+let most_distance: u64 = 0x7FFFFFFC
+
+# mark: Prefix codes ==========================================================================
+
+## The order in which a complex prefix code gives the code lengths of the code length
+## alphabet (section 3.5).
+let length_order: u8[18] = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+## The fixed code for code length code lengths, indexed by the next four bits: the
+## length's value and how many bits its code takes (section 3.5's table: 0 is 00, 1 is
+## 0111, 2 is 011, 3 is 10, 4 is 01, 5 is 1111, read right to left).
+let length_value: u8[16] = [0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5]
+let length_bits: u8[16] = [2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4]

@@ -1,0 +1,220 @@
+#==============================================================================================
+#
+#   brotli/fast - Whole commands with the bit reader and window in locals
+#
+#   DESCRIPTION:
+#       While the input holds eight more bytes at every refill and a command's literals
+#       and copy fit the ring without wrapping, `fast` decodes command after command
+#       without the resumable units: an eight-byte refill never runs short, so no unit can
+#       read past the input and nothing needs undoing. Its state lives in locals and goes
+#       back to the decoder whenever it stops, which is at the boundary of a step the
+#       resumable states (commands.lucb) take over from: a command, its copy length, the
+#       literals left of one, a distance, a copy, a word at the ring's end or the end of
+#       the meta-block.
+#       Block switches, rarer, go through those states' own code. Its arithmetic wraps and
+#       its shift counts are masked where the format already bounds them, so they need no
+#       checks.
+#
+#==============================================================================================
+
+## The table entry for the code at the bottom of `acc`: its symbol << 16 | its length.
+inline func entry_at(table: const u32*, acc: u64) -> u32:
+    let entry = table[(usize)(acc & 255)]
+    let length = entry & 255
+    if length <= 8:
+        return entry
+    let index = (usize)(entry >> 16) +% (usize)((acc >> 8) & (((u64)1 << (u64)((length -% 8) & 63)) -% 1))
+    let second = table[index]
+    return (second & 0xFFFF0000) | ((second & 255) +% 8)
+
+## The low `count` bits of `acc`.
+inline func low_bits(acc: u64, count: u32) -> u64:
+    return acc & (((u64)1 << (u64)(count & 63)) -% 1)
+
+extend Decoder:
+    ## Decode commands from `state_command` while the input and the ring allow; the state
+    ## to go on from is left in `state`.
+    func fast() -> !:
+        let data = self.input.data
+        let length = self.input.length
+        let ring = self.ring.data
+        let size = self.ring_size
+        let trees = self.trees.data
+        let lookup = &context_lookup[0]
+        let literal_tables = &self.literal_tables[0]
+        var acc = self.acc
+        var bits = self.bits
+        var at = self.input_at
+        var pos = self.pos
+        var p1 = (usize)self.p1
+        var p2 = (usize)self.p2
+        var remaining = self.remaining
+        var total = self.total_out
+        var stop = state_command
+        while true:
+            # A command: insert-and-copy symbol, insert and copy extra bits (39 + 24).
+            if self.block_left[1] == 0 or at +% 8 > length:
+                break
+            if bits < 39:
+                acc |= memory.read[u64](data + at) << (u64)(bits & 63)
+                at +%= (usize)((63 -% bits) >> 3)
+                bits |= 56
+            let entry = entry_at(trees + (usize)self.command_codes[(usize)self.type_now[1]], acc)
+            acc >>= (u64)(entry & 63)
+            bits -%= entry & 255
+            let code = entry >> 16
+            let cell = (usize)(code >> 6)
+            let insert_code = (usize)(cell_insert[cell] + ((code >> 3) & 7))
+            let insert_bits = insert_extra[insert_code]
+            var insert = (usize)insert_base[insert_code] +% (usize)low_bits(acc, insert_bits)
+            acc >>= (u64)(insert_bits & 63)
+            bits -%= insert_bits
+            self.block_left[1] -= 1
+            let copy_code = cell_copy[cell] + (code & 7)
+            if bits < 24:
+                if at +% 8 > length:
+                    self.insert_left = insert
+                    self.copy_code = copy_code
+                    self.implicit = code < 128
+                    stop = state_copy_length
+                    break
+                acc |= memory.read[u64](data + at) << (u64)(bits & 63)
+                at +%= (usize)((63 -% bits) >> 3)
+                bits |= 56
+            let copy_bits = copy_extra[(usize)copy_code]
+            let copy_length = (usize)copy_base[(usize)copy_code] +% (usize)low_bits(acc, copy_bits)
+            acc >>= (u64)(copy_bits & 63)
+            bits -%= copy_bits
+            if insert > remaining:
+                error(corrupt, "brotli literals overrun their meta-block")
+            self.copy_length = copy_length
+            self.implicit = code < 128
+            remaining -= insert
+            total +%= (u64)insert
+            if pos +% insert > size:
+                self.insert_left = insert
+                stop = state_insert
+                break
+            # The literals, each by the code its block type and the last two bytes select.
+            let mode = self.literal_mode
+            var left = self.block_left[0]
+            while insert > 0 and left > 0:
+                if bits < 15:
+                    if at +% 8 > length:
+                        break
+                    acc |= memory.read[u64](data + at) << (u64)(bits & 63)
+                    at +%= (usize)((63 -% bits) >> 3)
+                    bits |= 56
+                let context = (usize)(lookup[mode +% p1] | lookup[mode +% 256 +% p2])
+                let literal = entry_at(trees + (usize)literal_tables[context], acc)
+                acc >>= (u64)(literal & 63)
+                bits -%= literal & 255
+                let byte = (u8)(literal >> 16)
+                ring[pos] = byte
+                pos +%= 1
+                p2 = p1
+                p1 = (usize)byte
+                left -%= 1
+                insert -%= 1
+            self.block_left[0] = left
+            if insert > 0:
+                # A literal block switch, or the input near its end: the state takes the rest.
+                self.insert_left = insert
+                stop = state_insert
+                break
+            if remaining == 0:
+                stop = state_meta_done
+                break
+            # The distance: the last one, or a symbol and its extra bits (15 + 24).
+            var distance: i64 = 0
+            var symbol: u32 = 0
+            if self.implicit:
+                distance = self.distances[self.distance_at & 3]
+            else:
+                if self.block_left[2] == 0 or (bits < 39 and at +% 8 > length):
+                    stop = state_distance
+                    break
+                if bits < 39:
+                    acc |= memory.read[u64](data + at) << (u64)(bits & 63)
+                    at +%= (usize)((63 -% bits) >> 3)
+                    bits |= 56
+                let context = copy_length -% 2 if copy_length < 5 else 3
+                let found = entry_at(trees + (usize)self.distance_codes[(usize)self.maps[self.distance_map + context]], acc)
+                acc >>= (u64)(found & 63)
+                bits -%= found & 255
+                symbol = found >> 16
+                self.block_left[2] -= 1
+                if symbol < 16:
+                    let slot = (self.distance_at -% (usize)short_slot[(usize)symbol]) & 3
+                    distance = self.distances[slot] + short_delta[(usize)symbol]
+                    if distance <= 0:
+                        error(corrupt, "invalid brotli distance")
+                elif symbol < 16 + self.direct:
+                    distance = (i64)symbol - 15
+                else:
+                    let d = symbol - self.direct - 16
+                    let extra_bits = 1 + (d >> (self.postfix + 1))
+                    let extra = low_bits(acc, extra_bits)
+                    acc >>= (u64)(extra_bits & 63)
+                    bits -%= extra_bits
+                    let offset = ((2 + (u64)((d >> self.postfix) & 1)) << (u64)extra_bits) - 4
+                    let low = (u64)(d & (((u32)1 << self.postfix) - 1))
+                    distance = (i64)(((offset + extra) << (u64)self.postfix) + low + (u64)self.direct + 1)
+            let most = (u64)self.window - 16
+            let reach = total if total < most else most
+            if (u64)distance > reach:
+                # A dictionary word, at most 37 bytes: past the ring's end it may be, as long
+                # as it starts within it (the next command finds the ring full).
+                if (u64)distance > most_distance:
+                    error(corrupt, "invalid brotli distance")
+                if pos >= size:
+                    self.distance = (usize)distance
+                    stop = state_word
+                    break
+                let written = try write_word(ring + pos, (u64)distance, copy_length, reach)
+                if written > remaining:
+                    error(corrupt, "brotli dictionary word overruns its meta-block")
+                pos +%= written
+                remaining -= written
+                total +%= (u64)written
+                if written >= 2:
+                    p1 = (usize)ring[pos -% 1]
+                    p2 = (usize)ring[pos -% 2]
+                elif written == 1:
+                    p2 = p1
+                    p1 = (usize)ring[pos -% 1]
+                if remaining == 0:
+                    stop = state_meta_done
+                    break
+                continue
+            if symbol != 0:
+                self.distance_at +%= 1
+                self.distances[self.distance_at & 3] = distance
+            if copy_length > remaining:
+                error(corrupt, "brotli copy overruns its meta-block")
+            let back = (usize)distance
+            remaining -= copy_length
+            total +%= (u64)copy_length
+            let source = (pos -% back) & (size -% 1)
+            if pos +% copy_length > size or source +% copy_length > size:
+                # Across the ring's end: the copy state goes a byte at a time.
+                self.distance = back
+                self.copy_left = copy_length
+                stop = state_copy
+                break
+            copy_match(ring, pos, source, copy_length, back)
+            pos +%= copy_length
+            p1 = (usize)ring[pos -% 1]
+            p2 = (usize)ring[pos -% 2]
+            if remaining == 0:
+                stop = state_meta_done
+                break
+        self.acc = acc
+        self.bits = bits
+        self.input_at = at
+        self.pos = pos
+        self.p1 = (u8)p1
+        self.p2 = (u8)p2
+        self.remaining = remaining
+        self.total_out = total
+        self.state = stop

@@ -1,0 +1,258 @@
+#==============================================================================================
+#
+#   brotli/window - The sliding window, its output, copies and dictionary words
+#
+#   DESCRIPTION:
+#       Output is decoded into a ring of a power of two bytes, never more than the
+#       stream's window, with `slack` bytes past its end for a dictionary word or a
+#       copy's eight-byte overshoot. The ring starts small and doubles while it has not
+#       wrapped, so a short stream holds little memory. Once it is the window's size, each
+#       time it fills its bytes must have gone to the caller's output before it wraps: a
+#       caller giving no room stalls the decoder there (`need_output`). The 16 bytes past
+#       the write position are always out of reach of a copy (the format's window is the
+#       ring less 16), so copies may overrun by a word.
+#
+#==============================================================================================
+
+## Bytes past the ring's end: a transformed dictionary word (at most 37) or a copy's
+## overshoot (at most 7) may land there before the ring wraps.
+let slack: usize = 64
+
+## The ring's least size.
+let least_ring: usize = 1024
+
+extend Decoder:
+    ## Make the ring ready for a meta-block of `length` bytes: a first ring that holds
+    ## the whole stream when this block is its last.
+    func prepare_ring(length: usize, last: bool) -> !:
+        if self.ring.length > 0:
+            return
+        var size = least_ring
+        let wanted = length if last else 65536
+        while size < wanted and size < self.window:
+            size *= 2
+        if size > self.window:
+            size = self.window
+        try self.resize_ring(size)
+
+    ## A ring of `size` bytes holding the output so far (the ring has not wrapped).
+    func resize_ring(size: usize) -> !:
+        let ring = try new u8[size + slack] --- in memory.heap
+        memory.set(ring[size..], 0)
+        if self.pos > 0:
+            memory.copy(ring, self.ring[..<self.pos], self.pos)
+        if self.ring.length > 0:
+            free(self.ring) in memory.heap
+        self.ring = ring
+        self.ring_size = size
+
+    ## The ring is full (`pos` at or past its size): double it, or hand its bytes on and
+    ## wrap. False when the caller's output has no room for them.
+    func room() -> bool!:
+        if self.pos < self.ring_size:
+            return true
+        if not self.wrapped and self.ring_size < self.window:
+            try self.resize_ring(self.ring_size * 2)
+            return true
+        self.flush()
+        if self.flushed < self.ring_size:
+            return false
+        # Bytes past the end (a word's) were handed on with the rest; they move to the
+        # ring's start, where they belong.
+        let over = self.pos - self.ring_size
+        if over > 0:
+            memory.copy(self.ring, self.ring[self.ring_size..<self.pos], over)
+        self.pos = over
+        self.flushed -= self.ring_size
+        self.wrapped = true
+        return true
+
+    ## Hand decoded bytes on to the caller's output, as many as it has room for. Bytes past
+    ## the ring's end follow its last in memory, so they go in order too.
+    func flush():
+        var count = self.pos - self.flushed
+        let space = self.output.length - self.produced
+        if count > space:
+            count = space
+        if count == 0:
+            return
+        memory.copy(self.output[self.produced..], self.ring[self.flushed..<self.flushed + count], count)
+        self.flushed += count
+        self.produced += count
+
+    ## Whether decoded bytes wait for the caller's output.
+    func pending() -> bool:
+        return self.pos > self.flushed
+
+    ## The last two bytes of output, after a copy, a word or raw bytes.
+    func recall():
+        let mask = self.ring_size - 1
+        # Bytes past the ring's end (a word before the ring wraps) are read where they are.
+        self.p1 = 0
+        self.p2 = 0
+        if self.total_out >= 1:
+            self.p1 = self.ring[self.pos - 1] if self.pos >= 1 else self.ring[mask]
+        if self.total_out >= 2:
+            self.p2 = self.ring[self.pos - 2] if self.pos >= 2 else self.ring[(self.pos -% 2) & mask]
+
+    # mark: Copies ============================================================================
+
+    ## Copy `copy_left` bytes from `distance` back; false when stalled for output room.
+    func copy_bytes() -> bool!:
+        while self.copy_left > 0:
+            if self.pos >= self.ring_size and not try self.room():
+                return false
+            let mask = self.ring_size - 1
+            let back = (self.pos -% self.distance) & mask
+            let count = self.copy_left
+            if self.pos + count <= self.ring_size and back + count <= self.ring_size:
+                copy_match(self.ring.data, self.pos, back, count, self.distance)
+                self.pos += count
+                self.copy_left = 0
+                break
+            # Across the ring's end: a byte at a time up to it.
+            var n: usize = 0
+            while n < count and self.pos < self.ring_size:
+                self.ring[self.pos] = self.ring[(self.pos -% self.distance) & mask]
+                self.pos += 1
+                n += 1
+            self.copy_left -= n
+        self.recall()
+        return true
+
+    # mark: Uncompressed and metadata bytes ===================================================
+
+    ## The bytes of an uncompressed meta-block (`keep`) or of metadata; false when the
+    ## input ran out or the output has no room.
+    func raw(keep: bool) -> bool!:
+        while self.remaining > 0:
+            if keep and self.pos >= self.ring_size and not try self.room():
+                return false
+            var room = self.remaining
+            if keep and self.ring_size - self.pos < room:
+                room = self.ring_size - self.pos
+            if self.bits >= 8:
+                # Bytes the bit reader read ahead come first.
+                let byte = (u8)self.take(8)
+                if keep:
+                    self.ring[self.pos] = byte
+                    self.pos += 1
+                    self.total_out += 1
+                self.remaining -= 1
+                continue
+            let data = self.input
+            var count = data.length - self.input_at
+            if count == 0:
+                if self.final_input:
+                    error(corrupt, "truncated brotli stream")
+                return false
+            if count > room:
+                count = room
+            if keep:
+                memory.copy(self.ring[self.pos..], data[self.input_at..<self.input_at + count], count)
+                self.pos += count
+                self.total_out += (u64)count
+            self.input_at += count
+            self.remaining -= count
+        if keep:
+            self.recall()
+        self.state = state_meta_done
+        return true
+
+## Copy `count` bytes in `ring` from `back` to `to`, `distance` back (the source wraps
+## ahead of `to` when `back > to`, never within 16 bytes of it). Writes may run up to 7
+## bytes past `to + count`.
+inline func copy_match(ring: u8*, to: usize, back: usize, count: usize, distance: usize):
+    let target = ring + to
+    let source = ring + back
+    if distance >= 8 or back > to:
+        var n: usize = 0
+        while n < count:
+            memory.write[u64](target + n, memory.read[u64](source + n))
+            n += 8
+    elif distance == 1:
+        memory.set(u8[](target, count), *source)
+    else:
+        # A short period: its first eight-or-more bytes one by one, then words from that
+        # far back (a multiple of the period).
+        let period = distance * ((8 + distance - 1) // distance)
+        var n: usize = 0
+        while n < period and n < count:
+            target[n] = source[n]
+            n += 1
+        while n < count:
+            memory.write[u64](target + n, memory.read[u64](target + (n - period)))
+            n += 8
+
+# mark: Dictionary words ====================================================================
+
+## Write at `target` (room for 37 bytes) the dictionary word that `distance` names for a
+## copy of `length` (section 8), `reach` being the farthest a copy may go; its length.
+func write_word(target: u8*, distance: u64, length: usize, reach: u64) -> usize!:
+    if length < 4 or length > 24:
+        error(corrupt, "invalid brotli dictionary reference length")
+    let id = distance - reach - 1
+    let bits = (u64)word_bits[length]
+    let index = (usize)(id & (((u64)1 << bits) - 1))
+    let transform = (usize)(id >> bits)
+    if transform >= 121:
+        error(corrupt, "invalid brotli dictionary transform")
+    let source = (u8*)&words[0] + (usize)word_offsets[length] + index * length
+    if transform == 0:
+        # The word itself, a word at a time (the dictionary ends in a word of padding).
+        var n: usize = 0
+        while n < length:
+            memory.write[u64](target + n, memory.read[u64](source + n))
+            n += 8
+        return length
+    let written = transform_word(target, u8[](source, length), transform)
+    if written == 0 and distance <= 120:
+        # Google's decoder rejects these: they could repeat without progress.
+        error(corrupt, "empty brotli dictionary word")
+    return written
+
+## Apply transform `id` to `word` into `target` (room for 37 bytes); the bytes written.
+func transform_word(target: u8*, word: const u8[], id: usize) -> usize:
+    let at = id * 5
+    let kind = (usize)transforms[at + 2]
+    var n: usize = 0
+    for i in 0..<(usize)transforms[at + 1]:
+        target[n] = affixes[(usize)transforms[at] + i]
+        n += 1
+    var first: usize = 0
+    var end = word.length
+    if kind >= 3 and kind <= 11:
+        first = kind - 2 if kind - 2 < end else end
+    elif kind >= 12:
+        end = end - (kind - 11) if kind - 11 < end else 0
+    let start = n
+    for i in first..<end:
+        target[n] = word[i]
+        n += 1
+    if kind == 1 or kind == 2:
+        # Ferment: upper-case ASCII letters; flip a bit of UTF-8 sequences.
+        var i = start
+        while i < n:
+            let step = ferment(target, i, n)
+            if kind == 1:
+                break
+            i += step
+    for i in 0..<(usize)transforms[at + 4]:
+        target[n] = affixes[(usize)transforms[at + 3] + i]
+        n += 1
+    return n
+
+## Upper-case the character at `at` (before `end`) as RFC 7932's Ferment does; its bytes.
+func ferment(text: u8*, at: usize, end: usize) -> usize:
+    let byte = text[at]
+    if byte < 192:
+        if byte >= 97 and byte <= 122:
+            text[at] = byte ^ 32
+        return 1
+    if byte < 224:
+        if at + 1 < end:
+            text[at + 1] ^= 32
+        return 2
+    if at + 2 < end:
+        text[at + 2] ^= 5
+    return 3
