@@ -18,7 +18,7 @@ struct Writer:
     var bits: u32
 
     ## `count` bits (at most 32) of `value`.
-    mutating func put(value: u64, count: u32):
+    func put(value: u64, count: u32):
         self.acc |= value << (u64)self.bits
         self.bits += count
         if self.bits >= 32:
@@ -28,7 +28,7 @@ struct Writer:
             self.bits -= 32
 
     ## Pad to a byte with zeros and write out what is pending.
-    mutating func align():
+    func align():
         while self.bits > 0:
             self.out[self.pos] = (u8)self.acc
             self.pos += 1
@@ -45,7 +45,7 @@ struct Block:
     var literal_freq: u32[286]
     var distance_freq: u32[30]
 
-    mutating func clear():
+    func clear():
         self.count = 0
         for i in 0..<(usize)286:
             self.literal_freq[i] = 0
@@ -60,7 +60,7 @@ struct Symbols:
     var near: u8[256]
     var far: u8[256]
 
-    static func make() -> Symbols:
+    func make() -> Symbols:
         var s = Symbols()
         for code in 0..<(usize)29:
             let base = (usize)length_base[code]

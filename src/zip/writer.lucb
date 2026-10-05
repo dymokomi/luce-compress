@@ -41,9 +41,9 @@ pub func write_stored(files: const StoredFile[], alignment: usize, output: u8[])
     let size = stored_size(files, alignment)
     if size > 0xFFFFFFFF: error(limit, "a ZIP archive without ZIP64 holds at most 4 GiB")
     if output.length < size: error(limit, "the ZIP output buffer is smaller than the archive")
-    let offsets = try alloc usize[files.length] in memory.heap
+    let offsets = try new usize[files.length] --- in memory.heap
     defer free(offsets) in memory.heap
-    let crcs = try alloc u32[files.length] in memory.heap
+    let crcs = try new u32[files.length] --- in memory.heap
     defer free(crcs) in memory.heap
     var at: usize = 0
     for index in 0..<files.length:

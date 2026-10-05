@@ -54,10 +54,10 @@ func check(reader: binary.Reader*) -> !:
         assert(output[capacity] == 173)
         if rejected:
             var poisoned = false
-            discard(decoder.step(b"", output) catch failure:
+            _ = decoder.step(b"", output) catch failure:
                 assert(failure.code == compress.corrupt)
                 poisoned = true
-                recover codec.Step())
+                recover codec.Step()
             assert(poisoned)
             try decoder.reset()
             assert(not decoder.statistics().failed and decoder.statistics().input_bytes == 0 and decoder.statistics().output_bytes == 0)

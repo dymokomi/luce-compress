@@ -18,7 +18,7 @@ let segment: usize = 1048576
 ## Rows of `width` RGBA8 pixels, each led by PNG's Sub filter byte.
 func generate(kind: str) -> u8[]!:
     let stride = width * 4 + 1
-    let data = try alloc u8[stride * height] in memory.heap
+    let data = try new u8[stride * height] --- in memory.heap
     var seed: u32 = 2463534242
     for y in 0..<height:
         let row = y * stride
@@ -57,7 +57,7 @@ pub func main(arguments: str[]) -> i32!:
         data = try generate(kind)
     else:
         data = (try files.read((c.str)kind)).value
-    let out = try alloc u8[flate.deflate_bound(segment) + 64] in memory.heap
+    let out = try new u8[flate.deflate_bound(segment) + 64] --- in memory.heap
     var index: usize = 2
     while index < arguments.length:
         if arguments[index] == "--write":

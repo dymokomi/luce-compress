@@ -21,16 +21,16 @@ struct Heap: memory.Allocator:
     var bytes: usize
     var peak: usize
 
-    mutating func arm(index: usize = 0, persistent: bool = false):
+    func arm(index: usize = 0, persistent: bool = false):
         self.attempts = 0
         self.refused = 0
         self.fail_at = index
         self.persistent = persistent
 
-    mutating func disarm():
+    func disarm():
         self.fail_at = 0
 
-    pub mutating func allocate(size: usize, alignment: usize) -> u8[]?:
+    pub func allocate(size: usize, alignment: usize) -> u8[]?:
         self.attempts += 1
         if self.fail_at > 0 and (self.attempts == self.fail_at or (self.persistent and self.attempts > self.fail_at)):
             self.refused += 1
@@ -49,12 +49,12 @@ struct Heap: memory.Allocator:
                 return block
         trap("allocation ledger capacity exceeded")
 
-    pub mutating func resize(block: u8[], size: usize) -> bool:
-        discard(block)
-        discard(size)
+    pub func resize(block: u8[], size: usize) -> bool:
+        _ = block
+        _ = size
         trap("codec unexpectedly used allocator.resize; extend the fault model")
 
-    pub mutating func release(block: u8[]):
+    pub func release(block: u8[]):
         if block.length == 0:
             self.parent.release(block)
             return
@@ -88,7 +88,7 @@ struct Stream:
     var encoder: compress.Deflater?
     var decoder: compress.Inflater?
 
-    mutating func feed(input: const u8[], capacity: i64, final_input: bool,
+    func feed(input: const u8[], capacity: i64, final_input: bool,
         work_limit: i64 = codec.maximum_work_limit) -> interop.Reference[compress.Data]!:
         if self.encoding:
             var selected = self.encoder else trap("encoder absent")
@@ -111,7 +111,7 @@ struct Stream:
         let selected = self.decoder else trap("decoder absent")
         return try selected.statistics()
 
-    mutating func reset() -> !:
+    func reset() -> !:
         if self.encoding:
             var selected = self.encoder else trap("encoder absent")
             selected.reset() catch failure:
@@ -125,7 +125,7 @@ struct Stream:
                 error(failure.code, failure.message)
             self.decoder = selected
 
-    mutating func close():
+    func close():
         if let value = self.encoder:
             var selected = value
             selected.close()
@@ -531,7 +531,7 @@ func cooperative_failures(heap: Heap*, encoding: bool, input: const u8[], expect
 func streamed(input: const u8[]) -> u8[]!:
     var encoder = try codec.make_encoder()
     defer encoder.close()
-    let out = try alloc u8[input.length + input.length // 8 + 1024] in memory.heap
+    let out = try new u8[input.length + input.length // 8 + 1024] --- in memory.heap
     var used: usize = 0
     var at: usize = 0
     while true:
@@ -539,13 +539,13 @@ func streamed(input: const u8[]) -> u8[]!:
         at += (usize)step.consumed
         used += (usize)step.produced
         if step.status == codec.finished: break
-    let exact = try alloc u8[used] in memory.heap
+    let exact = try new u8[used] --- in memory.heap
     memory.copy(exact, out[..<used], used)
     free(out) in memory.heap
     return exact
 
 pub func main(arguments: str[]) -> i32!:
-    discard(arguments)
+    _ = arguments
     ## Inputs and clean expected bytes belong to the original allocator. They are
     ## borrowed, never released, while the replacement heap is installed.
     var plain: u8[8192]
@@ -570,7 +570,7 @@ pub func main(arguments: str[]) -> i32!:
     defer free(stream_packed) in memory.heap
     let stream_short = try streamed(short_plain)
     defer free(stream_short) in memory.heap
-    let oversized = try alloc u8[1048577] in memory.heap
+    let oversized = try new u8[1048577] --- in memory.heap
     defer free(oversized) in memory.heap
     var damaged: u8[10000]
     memory.copy(damaged, packed, packed.length)
@@ -603,7 +603,7 @@ pub func main(arguments: str[]) -> i32!:
                     assert(allocations == (2 if capacity == 0 else 3))
                     for persistent in [false, true]:
                         for at in 1..<allocations + 1:
-                            discard(try feed_attempt(&heap, encoding, framing, input, expected, capacity, target, at, persistent))
+                            _ = try feed_attempt(&heap, encoding, framing, input, expected, capacity, target, at, persistent)
                             checks += 1
         checks += try validation_and_finished(&heap, encoding, plain if encoding else packed, oversized)
         checks += try cooperative_failures(&heap, encoding, short_plain if encoding else stream_short, stream_short if encoding else short_plain)

@@ -18,7 +18,7 @@ let fastest_nice: usize = 32
 
 ## Compress `data[0..<n]` into `c`'s writer at level 1.
 func compress_fastest(c: Compressor*, data: const u8*, n: usize, last: bool) -> !:
-    let buckets = try alloc i32[(usize)2 << fastest_bits] in memory.heap
+    let buckets = try new i32[(usize)2 << fastest_bits] --- in memory.heap
     defer free(buckets) in memory.heap
     memory.set(u8[]((u8*)buckets.data, buckets.length * 4), 255)
     let table = buckets.data

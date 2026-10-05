@@ -8,7 +8,7 @@ pub struct Tree:
     pub var counts: u32[16]
     pub var symbols: u32[288]
 
-    pub mutating func build(lengths: const u32[], code_lengths: bool = false) -> !:
+    pub func build(lengths: const u32[], code_lengths: bool = false) -> !:
         self = Tree()
         for length in lengths:
             if length > 15:

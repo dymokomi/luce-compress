@@ -11,12 +11,13 @@ import memory
 import time
 import flate
 import compress
+import strings
 
 func best_inflate(stream: const u8[], out: u8[], raw: const u8[], what: str) -> !:
     var best: u64 = 0
     for round in 0..<(usize)5:
         let start = time.now()
-        discard(try flate.inflate_zlib(stream, out))
+        _ = try flate.inflate_zlib(stream, out)
         let spent = time.since(start)
         if round == 0 or spent < best: best = spent
     assert((str)out == (str)raw)
@@ -31,9 +32,9 @@ pub func main(arguments: str[]) -> i32!:
     let raw_file = try files.read((c.str)arguments[1])
     defer raw_file.release()
     let raw = raw_file.value
-    let out = try alloc u8[raw.length] in memory.heap
+    let out = try new u8[raw.length] --- in memory.heap
     defer free(out) in memory.heap
-    let packed = try alloc u8[flate.deflate_bound(raw.length) + 6] in memory.heap
+    let packed = try new u8[flate.deflate_bound(raw.length) + 6] --- in memory.heap
     defer free(packed) in memory.heap
     for level in [1, 6]:
         let start = time.now()
@@ -41,7 +42,7 @@ pub func main(arguments: str[]) -> i32!:
         let spent = time.since(start)
         print(f"flate level {level}: deflate {(i64)((f64)raw.length / 1000.0 / (f64)spent * 1000000.0 / 1000.0)} MB/s, {(f64)spent / 1000000.0} ms")
         var label: u8[64] = ---
-        try best_inflate(packed[..<size], out, raw, try format(label, f"flate level {level}"))
+        try best_inflate(packed[..<size], out, raw, try strings.format(label, f"flate level {level}"))
     for level in [1, 6]:
         let start = time.now()
         let packed_all = try compress.compress(raw, (i64)level)

@@ -49,7 +49,7 @@ struct Table:
 
     ## Build from code lengths. Only the code-length alphabet must be complete; a
     ## lone one-bit code or no codes at all is accepted, as zlib does.
-    mutating func build(lengths: const u8[], alphabet: u32) -> !:
+    func build(lengths: const u8[], alphabet: u32) -> !:
         self.alphabet = alphabet
         memory.set(u8[]((u8*)&self.fast[0], 16384), 0)
         for n in 0..<(usize)16:
@@ -125,7 +125,7 @@ struct Stream:
     var context: void*?
     var base: usize
 
-    mutating func refill():
+    func refill():
         if self.pos + 8 <= self.length:
             self.acc |= memory.read[u64](self.data + self.pos) << (u64)self.bits
             self.pos += (usize)((63 - self.bits) >> 3)
@@ -139,7 +139,7 @@ struct Stream:
                 self.padded += 8
             self.bits += 8
 
-    mutating func take(count: u32) -> u32:
+    func take(count: u32) -> u32:
         if self.bits < count:
             self.refill()
         let value = (u32)(self.acc & (((u64)1 << (u64)count) - 1))
@@ -156,7 +156,7 @@ struct Stream:
         return self.base + self.pos - (usize)((self.bits - self.padded) >> 3) if self.bits >= self.padded else self.base + self.pos
 
     ## The next piece of input, if `more` has one.
-    mutating func next_piece() -> bool:
+    func next_piece() -> bool:
         let more = self.more else return false
         let piece = more(self.context)
         if piece.length == 0:
@@ -236,7 +236,7 @@ struct Slide:
 
     ## Hand on what is new in `through[..<o]` and keep its last 32 KiB at its
     ## start; the new output position.
-    mutating func advance(through: u8[], o: usize) -> usize!:
+    func advance(through: u8[], o: usize) -> usize!:
         let deliver = self.deliver else error(corrupt, "deflate stream is longer than its output")
         try deliver(self.context, through[self.start..<o])
         let keep = window if o > window else o
@@ -248,7 +248,7 @@ struct Slide:
         return keep
 
     ## The end: the rest handed on, and the output its promised length.
-    mutating func finish(through: u8[], o: usize) -> !:
+    func finish(through: u8[], o: usize) -> !:
         if self.base + o != self.total and not self.open:
             error(corrupt, "deflate stream is shorter than its output")
         self.produced = self.base + o
@@ -268,7 +268,7 @@ func inflate_through(data: const u8[], more: More?, output: u8[], slide: Slide*,
         let kind = s.take(2)
         if kind == 0:
             # Stored: to a byte boundary, then LEN, NLEN and the bytes.
-            discard(s.take(s.bits & 7))
+            _ = s.take(s.bits & 7)
             var count = (usize)s.take(16)
             let check = (usize)s.take(16)
             if s.overrun():

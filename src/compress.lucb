@@ -43,7 +43,7 @@ pub struct Data:
         if self.disposed: error(closed, "compression result is closed")
         return self.work
 
-    pub mutating func close():
+    pub func close():
         self.buffer.close()
         self.disposed = true
 
@@ -134,10 +134,10 @@ pub func compress(data: const u8[], level: i64 = default_level) -> u8[]!:
     if data.length > binary.maximum: error(limit_exceeded, "input exceeds 1 GiB")
     # Over 2 MiB, in 1 MiB segments on several threads (segments.lucb).
     if data.length > segments.parallel_above: return try segments.deflate(data, (i32)level)
-    let scratch = try alloc u8[flate.deflate_bound(data.length) + 6] in memory.heap
+    let scratch = try new u8[flate.deflate_bound(data.length) + 6] --- in memory.heap
     defer free(scratch) in memory.heap
     let used = try flate.deflate_zlib(data, (i32)level, scratch)
-    let out = try alloc u8[used] in memory.heap
+    let out = try new u8[used] --- in memory.heap
     memory.copy(out, scratch[..<used], used)
     return out
 
@@ -158,7 +158,7 @@ pub struct Inflater:
         *state = initialized
         self.state = state
 
-    pub mutating func feed(input: const u8[], capacity: i64 = 65536, final_input: bool = false,
+    pub func feed(input: const u8[], capacity: i64 = 65536, final_input: bool = false,
         work_limit: i64 = decoder.default_work_limit) -> interop.Reference[Data]!:
         let state = self.state else error(closed, "inflater is closed")
         try decoder.check_work_limit(work_limit)
@@ -180,7 +180,7 @@ pub struct Inflater:
         chunk.work = step.work_units
         return result
 
-    pub mutating func reset() -> !:
+    pub func reset() -> !:
         let state = self.state else error(closed, "inflater is closed")
         try state.reset()
 
@@ -188,7 +188,7 @@ pub struct Inflater:
         let state = self.state else error(closed, "inflater is closed")
         return state.statistics()
 
-    pub mutating func close():
+    pub func close():
         if let state = self.state: free(state) in memory.heap
         self.state = none
 
@@ -200,9 +200,9 @@ pub struct Deflater:
     pub func init(framing: str = "zlib", max_input: i64 = 1073741824, max_output: i64 = 1073741824) -> !:
         self.state = try encoder.make_encoder(framing, max_input, max_output)
 
-    pub mutating func feed(input: const u8[], capacity: i64 = 65536, final_input: bool = false,
+    pub func feed(input: const u8[], capacity: i64 = 65536, final_input: bool = false,
         work_limit: i64 = decoder.default_work_limit) -> interop.Reference[Data]!:
-        discard(try self.state.statistics())  ## reject closed before allocating
+        _ = try self.state.statistics()  ## reject closed before allocating
         try decoder.check_work_limit(work_limit)
         if capacity < 0 or capacity > 1048576 or input.length > 1048576:
             error(invalid, "feed input/output chunks must be at most 1 MiB")
@@ -220,13 +220,13 @@ pub struct Deflater:
         chunk.work = step.work_units
         return result
 
-    pub mutating func reset() -> !:
+    pub func reset() -> !:
         try self.state.reset()
 
     pub func statistics() -> Statistics!:
         return try self.state.statistics()
 
-    pub mutating func close():
+    pub func close():
         self.state.close()
 
 pub let deflater_type: interop.Type[Deflater] = interop.Type[Deflater]("Deflater", Deflater.close, closeable = true)
@@ -235,7 +235,7 @@ test "whole-buffer inflate and compress round trip and reject a wrong size":
     let raw = b"the quick brown fox jumps over the lazy dog, again and again and again"
     let packed = try compress(raw)
     defer free(packed) in memory.heap
-    let out = try alloc u8[raw.length] in memory.heap
+    let out = try new u8[raw.length] --- in memory.heap
     defer free(out) in memory.heap
     try inflate(packed, out)
     assert((str)out == (str)raw)

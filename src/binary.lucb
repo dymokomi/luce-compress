@@ -18,7 +18,7 @@ pub struct Reader:
     pub var position: usize
     pub var little: bool = true
 
-    pub mutating func take(count: usize) -> const u8[]!:
+    pub func take(count: usize) -> const u8[]!:
         if self.position > self.data.length or count > self.data.length - self.position:
             error(corrupt, "truncated compressed data")
         if count == 0: return b""
@@ -26,11 +26,11 @@ pub struct Reader:
         self.position += count
         return self.data[start..<self.position]
 
-    pub mutating func byte() -> u8!:
+    pub func byte() -> u8!:
         let data = try self.take(1)
         return data[0]
 
-    pub mutating func uint(count: usize) -> u64!:
+    pub func uint(count: usize) -> u64!:
         if count > 8: error(invalid, "integer field exceeds eight bytes")
         let data = try self.take(count)
         var result: u64
@@ -44,7 +44,7 @@ pub struct Buffer:
     pub var used: usize
     pub var maximum: usize = 67108864
 
-    pub mutating func reserve(count: usize) -> !:
+    pub func reserve(count: usize) -> !:
         if count > self.maximum or self.used > self.maximum - count:
             error(limit, "compressed or expanded byte limit exceeded")
         let needed = self.used + count
@@ -53,23 +53,23 @@ pub struct Buffer:
         if capacity > self.maximum: capacity = self.maximum
         while capacity < needed:
             capacity = self.maximum if capacity > self.maximum // 2 else capacity * 2
-        let next = try alloc u8[capacity] in memory.heap
+        let next = try new u8[capacity] --- in memory.heap
         if self.used > 0: memory.copy(next, self.data, self.used)
         if self.data.length > 0: free(self.data) in memory.heap
         self.data = next
 
-    pub mutating func put(data: const u8[]) -> !:
+    pub func put(data: const u8[]) -> !:
         if data.length == 0: return
         try self.reserve(data.length)
         memory.copy(self.data[self.used..], data, data.length)
         self.used += data.length
 
-    pub mutating func byte(value: u8) -> !:
+    pub func byte(value: u8) -> !:
         try self.reserve(1)
         self.data[self.used] = value
         self.used += 1
 
-    pub mutating func uint(value: u64, count: usize, little: bool = true) -> !:
+    pub func uint(value: u64, count: usize, little: bool = true) -> !:
         if count > 8: error(invalid, "integer field exceeds eight bytes")
         for i in 0..<count:
             let shift = i * 8 if little else (count - 1 - i) * 8
@@ -79,7 +79,7 @@ pub struct Buffer:
         if self.used == 0: return b""
         return self.data[..<self.used]
 
-    pub mutating func close():
+    pub func close():
         if self.data.length > 0: free(self.data) in memory.heap
         var empty: u8[]
         self.data = empty

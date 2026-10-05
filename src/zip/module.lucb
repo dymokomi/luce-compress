@@ -114,7 +114,7 @@ pub struct Archive:
         let packed = try self.packed(entry)
         if entry.method == method_stored and packed.length != entry.size:
             error(corrupt, "a stored ZIP entry's sizes disagree")
-        let output = try alloc u8[entry.size] in memory.heap
+        let output = try new u8[entry.size] --- in memory.heap
         errdefer free(output) in memory.heap
         if entry.method == method_stored:
             if entry.size > 0:
@@ -122,7 +122,7 @@ pub struct Archive:
         else:
             let used = flate.inflate_raw(packed, output) catch failure:
                 error(corrupt, failure.message)
-            discard(used)
+            _ = used
         if flate.crc32(output) != entry.crc:
             error(corrupt, "the ZIP entry's CRC-32 does not match")
         return output
@@ -142,7 +142,7 @@ pub struct Archive:
         return data[start..<start + entry.compressed_size]
 
     ## Free the entry list; the borrowed bytes stay the caller's.
-    pub mutating func close():
+    pub func close():
         if self.entries.length > 0:
             free(self.entries) in memory.heap
         var empty: Entry[]
@@ -171,7 +171,7 @@ pub func open(data: const u8[], max_entries: usize = maximum_entries) -> Archive
     var archive = Archive(data = data, count = 0)
     if total == 0:
         return archive
-    archive.entries = try alloc Entry[total] in memory.heap
+    archive.entries = try new Entry[total] --- in memory.heap
     errdefer archive.close()
     var at = directory_offset
     let stop = directory_offset + directory_size

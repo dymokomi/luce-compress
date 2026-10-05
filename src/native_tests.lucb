@@ -11,7 +11,7 @@ import segments
 ## it back in parallel, and a damaged segment fails as corrupt.
 func segmented() -> !:
     let size: usize = 11 * 1048576 + 12345
-    let plain = try alloc u8[size] in memory.heap
+    let plain = try new u8[size] --- in memory.heap
     defer free(plain) in memory.heap
     var seed: u32 = 2463534242
     for at in 0..<size:
@@ -22,9 +22,9 @@ func segmented() -> !:
     let packed = try compress.compress(plain, 1)
     defer free(packed) in memory.heap
     assert(segments.markers(packed) == 11)
-    let back = try alloc u8[size] in memory.heap
+    let back = try new u8[size] --- in memory.heap
     defer free(back) in memory.heap
-    discard(try flate.inflate_zlib(packed, back))
+    _ = try flate.inflate_zlib(packed, back)
     assert((str)back == (str)plain)
     for at in 0..<size: back[at] = 0
     try compress.inflate(packed, back)
@@ -33,10 +33,10 @@ func segmented() -> !:
     defer decoded.release()
     assert((str)(try decoded.value().bytes()) == (str)plain)
     var small = false
-    discard(compress.decode(packed, (i64)size - 1) catch failure:
+    _ = compress.decode(packed, (i64)size - 1) catch failure:
         assert(failure.code == compress.limit_exceeded)
         small = true
-        recover decoded)
+        recover decoded
     assert(small)
     packed[packed.length // 2] ^= 85
     var damaged = false
@@ -46,7 +46,7 @@ func segmented() -> !:
     assert(damaged)
 
 func worker(raw: void*?):
-    discard(raw)
+    _ = raw
     for iteration in 0..<32:
         let encoded = compress.encode(b"parallel codec test test test") catch failure: trap(failure.message)
         defer encoded.release()
@@ -57,7 +57,7 @@ func worker(raw: void*?):
         assert((str)plain == "parallel codec test test test")
 
 pub func main(arguments: str[]) -> i32!:
-    discard(arguments)
+    _ = arguments
     assert(compress.adler32(b"") == 1 and compress.crc32(b"") == 0)
     assert(compress.adler32(b"Wikipedia") == 300286872)
     assert(compress.crc32(b"123456789") == 3421780262)
@@ -73,10 +73,10 @@ pub func main(arguments: str[]) -> i32!:
     decoded.value().close()
     decoded.value().close()
     var refused = false
-    discard(decoded.value().bytes() catch failure:
+    _ = decoded.value().bytes() catch failure:
         assert(failure.code == compress.closed)
         refused = true
-        recover b"")
+        recover b""
     assert(refused)
     for maximum in [-1, 1073741825]:
         var rejected = false

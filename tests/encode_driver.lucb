@@ -18,7 +18,7 @@ pub func main(arguments: str[]) -> i32!:
     let requested_work = (strings.parse_i64(arguments[9]) else trap("work limit")) if arguments.length == 10 else codec.default_work_limit
     var encoder = try codec.make_encoder(arguments[3], max_input, max_output)
     defer encoder.close()
-    let packed = try alloc u8[2097152] in memory.heap
+    let packed = try new u8[2097152] --- in memory.heap
     defer free(packed) in memory.heap
     var packed_size: usize
     var input: u8[65536]
@@ -51,10 +51,10 @@ pub func main(arguments: str[]) -> i32!:
             let statistics = try encoder.statistics()
             assert(statistics.failed and statistics.input_bytes <= max_input and statistics.output_bytes <= max_output)
             var refused = false
-            discard(encoder.step(b"", output) catch again:
+            _ = encoder.step(b"", output) catch again:
                 assert(again.code == compress.corrupt)
                 refused = true
-                recover codec.Step())
+                recover codec.Step()
             assert(refused)
             print(f"REJECT {statistics.input_bytes} {statistics.output_bytes}")
             return 1

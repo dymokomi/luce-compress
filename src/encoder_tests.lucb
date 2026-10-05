@@ -4,7 +4,7 @@ import interop
 import thread
 
 func worker(raw: void*?):
-    discard(raw)
+    _ = raw
     for iteration in 0..<16:
         var encoder = codec.make_encoder() catch failure: trap(failure.message)
         defer encoder.close()
@@ -28,7 +28,7 @@ func worker(raw: void*?):
         assert((str)(decoded.value().bytes() catch failure: trap(failure.message)) == (str)plain)
 
 pub func main(arguments: str[]) -> i32!:
-    discard(arguments)
+    _ = arguments
     assert(codec.encoder_storage_bytes() >= 557056 and codec.encoder_storage_bytes() < 560000)
     for framing in ["gzip", "auto"]:
         var rejected = false
@@ -52,10 +52,10 @@ pub func main(arguments: str[]) -> i32!:
     var output: u8[100]
     var uninitialized: codec.Encoder
     var rejected = false
-    discard(uninitialized.step(b"", empty) catch failure:
+    _ = uninitialized.step(b"", empty) catch failure:
         assert(failure.code == compress.closed)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected)
     uninitialized.close()
     var encoder = try codec.make_encoder(max_input = 12)
@@ -80,12 +80,12 @@ pub func main(arguments: str[]) -> i32!:
     assert(not (try streaming.statistics()).finished)
     assert((try streaming.step(b"", output, true)).status == codec.finished)
     try encoder.reset()
-    discard(try encoder.step(b"ABCABCABCABC", empty, true))
+    _ = try encoder.step(b"ABCABCABCABC", empty, true)
     rejected = false
-    discard(encoder.step(b"", output, true) catch failure:
+    _ = encoder.step(b"", output, true) catch failure:
         assert(failure.code == compress.invalid)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected and (try encoder.statistics()).failed)
     try encoder.reset()
     assert(not (try encoder.statistics()).failed)
@@ -93,10 +93,10 @@ pub func main(arguments: str[]) -> i32!:
     var no_output = try codec.make_encoder(max_output = 0)
     defer no_output.close()
     rejected = false
-    discard(no_output.step(b"", empty, true) catch failure:
+    _ = no_output.step(b"", empty, true) catch failure:
         assert(failure.code == compress.limit_exceeded)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected and (try no_output.statistics()).failed)
     encoder.close()
     encoder.close()

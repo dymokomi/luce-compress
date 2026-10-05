@@ -42,8 +42,8 @@ struct Crew:
     var context: void*? = none
 
 func skip(context: void*?, index: usize):
-    discard(context)
-    discard(index)
+    _ = context
+    _ = index
 
 func crew_loop(context: void*?):
     let crew = (Crew*)(context else return)
@@ -64,24 +64,24 @@ func run(count: usize, entry: func(void*?, usize) -> unit, context: void*?):
     let helpers = (count if count < wanted else wanted) -| 1
     while started < helpers and started < handles.length:
         handles[started] = thread.spawn(crew_loop, (void*)&crew, 0, "luce-compress") catch failure:
-            discard(failure)
+            _ = failure
             break
         started += 1
     crew_loop((void*)&crew)
     for at in 0..<started:
-        handles[at].join() catch failure: discard(failure)
+        handles[at].join() catch failure: _ = failure
 
 func deflate_piece(context: void*?, index: usize):
     let work = (Work*)(context else return)
     let piece = &work.pieces[index]
     let slice = work.input[piece.start..<piece.end]
-    piece.out = alloc u8[flate.deflate_bound(slice.length)] in memory.heap catch failure:
-        discard(failure)
+    piece.out = new u8[flate.deflate_bound(slice.length)] --- in memory.heap catch failure:
+        _ = failure
         piece.failed = true
         recover empty()
     if piece.failed: return
     piece.used = flate.deflate_raw(slice, work.level, piece.out, piece.end == work.input.length) catch failure:
-        discard(failure)
+        _ = failure
         piece.failed = true
         recover 0
     piece.adler = flate.adler32(slice)
@@ -90,7 +90,7 @@ func deflate_piece(context: void*?, index: usize):
 ## segments deflated in parallel; on memory.heap, the caller frees it.
 pub func deflate(data: const u8[], level: i32) -> u8[]!:
     let count = (data.length + segment_bytes - 1) // segment_bytes
-    let pieces = try alloc Piece[count] in memory.heap
+    let pieces = try new Piece[count] --- in memory.heap
     for at in 0..<count:
         let start = at * segment_bytes
         pieces[at] = Piece(start = start, end = start + segment_bytes if data.length - start > segment_bytes else data.length, out = empty(), used = 0, produced = 0, adler = 1, failed = false)
@@ -101,7 +101,7 @@ pub func deflate(data: const u8[], level: i32) -> u8[]!:
     for piece in pieces:
         if piece.failed: error(memory.exhausted, "out of memory deflating a segment")
         total += piece.used
-    let out = try alloc u8[total] in memory.heap
+    let out = try new u8[total] --- in memory.heap
     let header = flate.zlib_header(level)
     out[0] = header[0]
     out[1] = header[1]
@@ -171,12 +171,12 @@ pub func markers(data: const u8[], most: usize = 65536) -> usize:
 ## included) start in its DEFLATE payload: after each sync flush; at most
 ## `most` of them, else none (not such a stream).
 func boundaries(data: const u8[], most: usize) -> usize[]?!:
-    let starts = try alloc usize[most + 1] in memory.heap
+    let starts = try new usize[most + 1] --- in memory.heap
     let found = scan(data, most, starts)
     if found > most:
         free(starts) in memory.heap
         return none
-    let exact = try alloc usize[found] in memory.heap
+    let exact = try new usize[found] --- in memory.heap
     memory.copy(exact, starts[..<found], found)
     free(starts) in memory.heap
     return exact
@@ -187,7 +187,7 @@ func inflate_piece(context: void*?, index: usize):
     let limit = (index + 1) * segment_bytes
     let room = work.output[index * segment_bytes..<(limit if limit < work.output.length else work.output.length)]
     let (used, produced) = flate.inflate_raw_bounded(work.input[piece.start..<piece.end], room) catch failure:
-        discard(failure)
+        _ = failure
         piece.failed = true
         recover (0, 0)
     if piece.failed: return
@@ -207,7 +207,7 @@ pub func inflate(data: const u8[], output: u8[], exact: bool) -> usize?!:
     defer free(starts) in memory.heap
     if starts.length == 0 or (exact and starts.length != most): return none
     let count = starts.length + 1
-    let pieces = try alloc Piece[count] in memory.heap
+    let pieces = try new Piece[count] --- in memory.heap
     defer release(pieces)
     for at in 0..<count:
         let start = 2 if at == 0 else starts[at - 1]

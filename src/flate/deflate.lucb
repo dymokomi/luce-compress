@@ -100,7 +100,7 @@ pub func inflate_zlib_streamed(data: const u8[], maximum: usize, deliver: Delive
         error(corrupt, "invalid zlib header")
     if (data[1] & 32) != 0:
         error(corrupt, "preset zlib dictionaries are not supported")
-    let through = try alloc u8[262144] in memory.heap
+    let through = try new u8[262144] --- in memory.heap
     defer free(through) in memory.heap
     var check = Checked(deliver = deliver, context = context, adler = 1)
     var slide = Slide(deliver = checked_deliver, context = (void*)&check, base = 0, total = maximum, start = 0, open = true)
@@ -136,24 +136,24 @@ struct Compressor:
     ## Input the current block starts at.
     var block_start: usize
 
-    mutating func open(n: usize, level: i32) -> !:
+    func open(n: usize, level: i32) -> !:
         self.level = (usize)level
         self.depth = (usize)level_depth[self.level]
         self.nice = (usize)level_nice[self.level]
         # A parser checks the count before each symbol, so one slot past the
         # count at which a block closes is enough.
-        self.block.litlen = try alloc u16[block_symbols + 1] in memory.heap
-        self.block.distance = try alloc u16[block_symbols + 1] in memory.heap
+        self.block.litlen = try new u16[block_symbols + 1] --- in memory.heap
+        self.block.distance = try new u16[block_symbols + 1] --- in memory.heap
         self.block.clear()
         if level > 0:
-            self.head = try alloc i32[(usize)1 << hash_bits] in memory.heap
+            self.head = try new i32[(usize)1 << hash_bits] --- in memory.heap
             # -1 in every head: all bytes 0xFF.
             memory.set(u8[]((u8*)self.head.data, self.head.length * 4), 255)
             # Each position's predecessor, at its place in the window's ring; a walk
             # stops before a position the ring has since reused.
-            self.prev = try alloc i32[window] in memory.heap
+            self.prev = try new i32[window] --- in memory.heap
 
-    mutating func close():
+    func close():
         if self.head.length > 0:
             free(self.head) in memory.heap
         if self.prev.length > 0:
@@ -164,7 +164,7 @@ struct Compressor:
             free(self.block.distance) in memory.heap
 
     ## Write the block of symbols so far, covering input up to `end`.
-    mutating func flush(data: const u8*, start: usize, end: usize, final_block: bool) -> !:
+    func flush(data: const u8*, start: usize, end: usize, final_block: bool) -> !:
         write_block(&self.w, &self.block, &self.symbols, data, start, end, final_block)
         self.block.clear()
         self.block_start = end
@@ -172,7 +172,7 @@ struct Compressor:
     ## Record a literal. The block's arrays have room past `block_symbols` for
     ## every symbol a parser adds before it next checks the count, so the writes
     ## need no checks of their own.
-    mutating func literal(value: u8):
+    func literal(value: u8):
         let b = &self.block
         let k = b.count
         b.litlen.data[k] = (u16)value
@@ -182,7 +182,7 @@ struct Compressor:
         freq[(usize)value] = freq[(usize)value] +% 1
 
     ## Record a match of 3..258 bytes at distance 1..32768.
-    mutating func matched(length: usize, distance: usize):
+    func matched(length: usize, distance: usize):
         let b = &self.block
         let k = b.count
         b.litlen.data[k] = (u16)length
@@ -198,7 +198,7 @@ struct Compressor:
     ## Enter position `p` (with four bytes ahead) in the hash chains; the previous
     ## position with the same hash, or -1. Four bytes, as zlib-ng hashes, make far
     ## shorter chains than three on image data for a sliver of compression.
-    mutating func insert(data: const u8*, p: usize) -> i32:
+    func insert(data: const u8*, p: usize) -> i32:
         let key = memory.read[u32](data + p)
         let h = (usize)((key *% 2654435761) >> (32 - hash_bits))
         let heads = self.head.data
@@ -246,7 +246,7 @@ struct Compressor:
 
     ## Enter positions `first..<stop` in the hash chains, as a match covers them
     ## (as `insert` does, with the tables in hand).
-    mutating func skip(data: const u8*, n: usize, first: usize, stop: usize):
+    func skip(data: const u8*, n: usize, first: usize, stop: usize):
         let end = stop if stop +% 4 <= n else (n - 3 if n > 3 else 0)
         let heads = self.head.data
         let prev = self.prev.data
@@ -257,7 +257,7 @@ struct Compressor:
             heads[h] = (i32)k
             k = k +% 1
 
-    mutating func greedy(data: const u8*, n: usize, last: bool) -> !:
+    func greedy(data: const u8*, n: usize, last: bool) -> !:
         var p: usize = 0
         while p < n:
             if self.block.count >= block_symbols:

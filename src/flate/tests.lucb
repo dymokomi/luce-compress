@@ -74,13 +74,13 @@ func receive(context: void*?, bytes: const u8[]) -> !:
 
 test "a windowed inflate hands on the same bytes a window at a time":
     let size: usize = 400000
-    let input = try alloc u8[size] in memory.heap
+    let input = try new u8[size] --- in memory.heap
     defer free(input) in memory.heap
     for i in 0..<size:
         input[i] = (u8)((i * 7 + i // 300) % 251) if i % 1000 < 600 else (u8)(i % 3)
-    let packed = try alloc u8[size + 1000] in memory.heap
+    let packed = try new u8[size + 1000] --- in memory.heap
     defer free(packed) in memory.heap
-    let through = try alloc u8[70000] in memory.heap
+    let through = try new u8[70000] --- in memory.heap
     defer free(through) in memory.heap
     # Level 0 is stored blocks; 1 and 6 matches reaching back across slides.
     for level in [(i32)0, 1, 6]:
@@ -122,13 +122,13 @@ func receive_pieces(context: void*?, bytes: const u8[]) -> !:
 
 test "a windowed inflate takes its input in pieces of any size":
     let size: usize = 300000
-    let input = try alloc u8[size] in memory.heap
+    let input = try new u8[size] --- in memory.heap
     defer free(input) in memory.heap
     for i in 0..<size:
         input[i] = (u8)((i * 7 + i // 300) % 251) if i % 1000 < 600 else (u8)(i % 3)
-    let packed = try alloc u8[size + 1000] in memory.heap
+    let packed = try new u8[size + 1000] --- in memory.heap
     defer free(packed) in memory.heap
-    let through = try alloc u8[70000] in memory.heap
+    let through = try new u8[70000] --- in memory.heap
     defer free(through) in memory.heap
     for level in [(i32)0, 1, 6]:
         let used = try deflate_raw(input, level, packed, true)

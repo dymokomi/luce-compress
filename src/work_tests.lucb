@@ -28,16 +28,16 @@ func native_validation(framing: str) -> !:
     for i in 0..<output.length: output[i] = 173
     for work in [-1, 0, 65537, 9223372036854775807]:
         var rejected = false
-        discard(decoder.step(packed, output, true, work) catch failure:
+        _ = decoder.step(packed, output, true, work) catch failure:
             assert(failure.code == compress.invalid)
             rejected = true
-            recover codec.Step())
+            recover codec.Step()
         assert(rejected and not decoder.statistics().failed and decoder.statistics().input_bytes == 0)
         rejected = false
-        discard(encoder.step(plain, output, true, work) catch failure:
+        _ = encoder.step(plain, output, true, work) catch failure:
             assert(failure.code == compress.invalid)
             rejected = true
-            recover codec.Step())
+            recover codec.Step()
         assert(rejected and not (try encoder.statistics()).failed and (try encoder.statistics()).input_bytes == 0)
         for byte in output: assert(byte == 173)
     ## Rejected EOF-bearing calls must not constrain a shorter nonfinal retry.
@@ -78,16 +78,16 @@ func native_validation(framing: str) -> !:
     assert((try encoder.step(b"next", output, true, 1)).work_units == 0)
     ## Invalid work still rejects after completion, without clearing completion.
     var rejected = false
-    discard(decoder.step(b"", output, true, 0) catch failure:
+    _ = decoder.step(b"", output, true, 0) catch failure:
         assert(failure.code == compress.invalid)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected and decoder.statistics().finished and not decoder.statistics().failed)
     rejected = false
-    discard(encoder.step(b"", output, true, 0) catch failure:
+    _ = encoder.step(b"", output, true, 0) catch failure:
         assert(failure.code == compress.invalid)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected and (try encoder.statistics()).finished and not (try encoder.statistics()).failed)
     try decoder.reset()
     try encoder.reset()
@@ -96,16 +96,16 @@ func native_validation(framing: str) -> !:
     decoder.close()
     encoder.close()
     rejected = false
-    discard(decoder.step(packed, output, true, 0) catch failure:
+    _ = decoder.step(packed, output, true, 0) catch failure:
         assert(failure.code == compress.closed)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected)
     rejected = false
-    discard(encoder.step(plain, output, true, 0) catch failure:
+    _ = encoder.step(plain, output, true, 0) catch failure:
         assert(failure.code == compress.closed)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected)
 
 func facade_and_cancellation(framing: str) -> !:
@@ -170,13 +170,13 @@ func facade_and_cancellation(framing: str) -> !:
         deflater.close()
 
 func worker(raw: void*?):
-    discard(raw)
+    _ = raw
     native_validation("raw") catch failure: trap(failure.message)
     native_validation("zlib") catch failure: trap(failure.message)
     facade_and_cancellation("zlib") catch failure: trap(failure.message)
 
 pub func main(arguments: str[]) -> i32!:
-    discard(arguments)
+    _ = arguments
     for framing in ["raw", "zlib"]:
         try native_validation(framing)
         try facade_and_cancellation(framing)

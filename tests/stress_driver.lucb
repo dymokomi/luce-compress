@@ -34,7 +34,7 @@ struct Generator:
     var seed: u32
     var noise: bool
 
-    mutating func next() -> u8:
+    func next() -> u8:
         if not self.noise: return 65
         self.seed ^= self.seed << 13
         self.seed ^= self.seed >> 17
@@ -62,7 +62,7 @@ func pipeline(context: Context*) -> !:
     var input: u8[32768]
     var packed: u8[32769]
     var output: u8[32769]
-    discard(ready.add(1, .release))
+    _ = ready.add(1, .release)
     while start.load(.acquire) == 0: thread.sleep(1)
     if start.load(.acquire) == 2: return
     for round in 0..<context.rounds:

@@ -76,20 +76,20 @@ pub struct Decoder:
     var symbol_first: u32
     var symbol_index: u32
 
-    pub mutating func close():
+    pub func close():
         self.ready = false
 
-    mutating func poison():
+    func poison():
         self.failed = true
 
-    pub mutating func reset() -> !:
+    pub func reset() -> !:
         if not self.ready: error(closed, "decoder is closed or uninitialized")
         self = try make_decoder("zlib" if self.wrapped else "raw", (i64)self.max_in, (i64)self.max_out)
 
     pub func statistics() -> Statistics:
         return Statistics((i64)self.total_in, (i64)self.total_out, self.state == 20, self.failed)
 
-    mutating func read(input: Input*, count: u32) -> u32?!:
+    func read(input: Input*, count: u32) -> u32?!:
         while self.bit_count < count:
             if input.used == input.data.length: return none
             if self.total_in == self.max_in: error(limit, "compressed stream byte budget exceeded")
@@ -102,7 +102,7 @@ pub struct Decoder:
         self.bit_count -= count
         return value
 
-    mutating func symbol(tree: deflate.Tree*, input: Input*) -> u32?!:
+    func symbol(tree: deflate.Tree*, input: Input*) -> u32?!:
         if self.symbol_length == 0:
             self.symbol_length = 1
             self.symbol_code = 0
@@ -129,7 +129,7 @@ pub struct Decoder:
             error(limit, "compressed stream byte budget exhausted before completion")
         return Step((i64)input.used, (i64)produced, need_input, input.work_units)
 
-    mutating func emit(output: u8[], used: usize*, value: u8) -> !:
+    func emit(output: u8[], used: usize*, value: u8) -> !:
         if self.total_out == self.max_out: error(limit, "expanded stream byte budget exceeded")
         output[*used] = value
         *used += 1
@@ -139,7 +139,7 @@ pub struct Decoder:
         self.adler_a = (self.adler_a + (u32)value) % 65521
         self.adler_b = (self.adler_b + self.adler_a) % 65521
 
-    mutating func end_block():
+    func end_block():
         if self.final_block:
             ## read() never buffers a complete unused byte after a field/symbol.
             self.bits = 0
@@ -152,7 +152,7 @@ pub struct Decoder:
     ## survives output backpressure. Reoffer any unconsumed suffix, not the prefix.
     ## A core parse/byte-budget/EOF error may consume/emit bytes and poisons the
     ## stream. Invalid per-call work rejects before mutation, without poisoning.
-    pub mutating func step(data: const u8[], output: u8[], final_input: bool = false,
+    pub func step(data: const u8[], output: u8[], final_input: bool = false,
         work_limit: i64 = default_work_limit) -> Step!:
         if not self.ready: error(closed, "decoder is closed or uninitialized")
         if self.failed: error(corrupt, "decoder failed; reset before reuse")

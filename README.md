@@ -90,7 +90,7 @@ Native zero-copy consumers use `compress_native.make_decoder(...)` and
 The last two arguments default to `false` and `4096`. Its `Step` contains `consumed`,
 `produced`, `status`, `work_units`. The core retains a 32 KiB history ring and
 bounded bit/Huffman state, not caller pointers or the complete input/output. On the
-initial 64-bit targets `sizeof(Decoder)` is 37,960 bytes. Independent streams may
+initial 64-bit targets `memory.size_of(Decoder)` is 37,960 bytes. Independent streams may
 run on separate bounded workers; never mutate/close one instance concurrently.
 
 Streaming total budgets accept nonnegative signed 64-bit values and default to

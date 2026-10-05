@@ -57,10 +57,10 @@ pub func main(arguments: str[]) -> i32!:
             assert(statistics.failed)
             assert(statistics.input_bytes <= max_input and statistics.output_bytes <= max_output)
             var refused = false
-            discard(decoder.step(b"", output) catch again:
+            _ = decoder.step(b"", output) catch again:
                 assert(again.code == compress.corrupt)
                 refused = true
-                recover codec.Step())
+                recover codec.Step()
             assert(refused)
             print(f"REJECT {statistics.input_bytes} {statistics.output_bytes}")
             return 1

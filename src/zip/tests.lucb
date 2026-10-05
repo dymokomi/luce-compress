@@ -19,16 +19,16 @@ struct Writer:
     var out: u8[]
     var at: usize
 
-    mutating func put16(value: u32):
+    func put16(value: u32):
         self.out[self.at] = (u8)value
         self.out[self.at + 1] = (u8)(value >> 8)
         self.at += 2
 
-    mutating func put32(value: u32):
+    func put32(value: u32):
         self.put16(value & 65535)
         self.put16(value >> 16)
 
-    mutating func put(data: const u8[]):
+    func put(data: const u8[]):
         if data.length > 0:
             memory.copy(self.out[self.at..], data, data.length)
         self.at += data.length
@@ -230,7 +230,7 @@ test "stored archives align their data and read back":
         StoredFile(name = "empty.txt", data = b""),
     ]
     let size = stored_size(files, 64)
-    let output = try alloc u8[size] in memory.heap
+    let output = try new u8[size] --- in memory.heap
     defer free(output) in memory.heap
     let written = try write_stored(files, 64, output)
     assert(written == size)

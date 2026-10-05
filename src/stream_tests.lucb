@@ -2,9 +2,10 @@ import compress
 import decoder as codec
 import thread
 import interop
+import memory
 
 func worker(raw: void*?):
-    discard(raw)
+    _ = raw
     for iteration in 0..<16:
         let encoded = compress.encode(b"separate stream streams") catch failure: trap(failure.message)
         defer encoded.release()
@@ -26,21 +27,21 @@ func worker(raw: void*?):
         assert(output == expected.length and input == packed.length)
 
 pub func main(arguments: str[]) -> i32!:
-    discard(arguments)
-    assert(sizeof(codec.Decoder) > 32768 and sizeof(codec.Decoder) <= 49152)
+    _ = arguments
+    assert(memory.size_of(codec.Decoder) > 32768 and memory.size_of(codec.Decoder) <= 49152)
     for framing in ["gzip", "auto"]:
         var failed = false
-        discard(codec.make_decoder(framing) catch failure:
+        _ = codec.make_decoder(framing) catch failure:
             assert(failure.code == compress.invalid)
             failed = true
-            recover codec.Decoder())
+            recover codec.Decoder()
         assert(failed)
     for budgets in 0..<2:
         var failed = false
-        discard(codec.make_decoder("zlib", -1 if budgets == 0 else 100, -1 if budgets == 1 else 100) catch failure:
+        _ = codec.make_decoder("zlib", -1 if budgets == 0 else 100, -1 if budgets == 1 else 100) catch failure:
             assert(failure.code == compress.invalid)
             failed = true
-            recover codec.Decoder())
+            recover codec.Decoder()
         assert(failed)
     let large_budget = try codec.make_decoder("raw", 9223372036854775807, 9223372036854775807)
     assert(large_budget.statistics().input_bytes == 0)
@@ -48,10 +49,10 @@ pub func main(arguments: str[]) -> i32!:
     var scratch: u8[64]
     var empty: u8[]
     var rejected = false
-    discard(uninitialized.step(b"", empty) catch failure:
+    _ = uninitialized.step(b"", empty) catch failure:
         assert(failure.code == compress.closed)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected)
     var decoder = try codec.make_decoder()
     assert((try decoder.step(b"", empty)).status == codec.need_input)
@@ -61,17 +62,17 @@ pub func main(arguments: str[]) -> i32!:
     ## Exhausted budgets must not ask for input/output that can never be accepted.
     var no_input = try codec.make_decoder(max_input = 0)
     rejected = false
-    discard(no_input.step(b"", empty) catch failure:
+    _ = no_input.step(b"", empty) catch failure:
         assert(failure.code == compress.limit_exceeded)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected and no_input.statistics().input_bytes == 0)
     var no_output = try codec.make_decoder(max_output = 0)
     rejected = false
-    discard(no_output.step(packed, empty) catch failure:
+    _ = no_output.step(packed, empty) catch failure:
         assert(failure.code == compress.limit_exceeded)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected and no_output.statistics().output_bytes == 0)
     let first = try decoder.step(packed, empty, true)
     assert(first.status == codec.need_output and first.produced == 0)
@@ -82,21 +83,21 @@ pub func main(arguments: str[]) -> i32!:
     try decoder.reset()
     assert(decoder.statistics().input_bytes == 0 and decoder.statistics().output_bytes == 0)
     rejected = false
-    discard(decoder.step(packed[..<packed.length - 1], scratch, true) catch failure:
+    _ = decoder.step(packed[..<packed.length - 1], scratch, true) catch failure:
         assert(failure.code == compress.corrupt)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected and decoder.statistics().failed)
     try decoder.reset()
     assert(not decoder.statistics().failed)
     assert((try decoder.step(packed, scratch, true)).status == codec.finished)
     try decoder.reset()
-    discard(try decoder.step(packed, empty, true))
+    _ = try decoder.step(packed, empty, true)
     rejected = false
-    discard(decoder.step(b"", scratch, true) catch failure:
+    _ = decoder.step(b"", scratch, true) catch failure:
         assert(failure.code == compress.invalid)
         rejected = true
-        recover codec.Step())
+        recover codec.Step()
     assert(rejected and decoder.statistics().failed)
     decoder.close()
     decoder.close()
@@ -125,5 +126,5 @@ pub func main(arguments: str[]) -> i32!:
     var workers: thread.Handle[8]
     for i in 0..<8: workers[i] = try thread.spawn(worker, none)
     for handle in workers: try handle.join()
-    print(f"PASS incremental lifecycle, end markers, poison/reset, raw framing, ownership, 8 workers; state={sizeof(codec.Decoder)} bytes")
+    print(f"PASS incremental lifecycle, end markers, poison/reset, raw framing, ownership, 8 workers; state={memory.size_of(codec.Decoder)} bytes")
     return 0

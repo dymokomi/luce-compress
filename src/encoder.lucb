@@ -24,12 +24,12 @@ pub func make_encoder(framing: str = "zlib", max_input: i64 = 1073741824, max_ou
 pub struct Encoder:
     var state: State*?
 
-    pub mutating func step(input: const u8[], output: u8[], final_input: bool = false,
+    pub func step(input: const u8[], output: u8[], final_input: bool = false,
         work_limit: i64 = default_work_limit) -> Step!:
         let state = self.state else error(closed, "encoder is closed or uninitialized")
         return try state.step(input, output, final_input, work_limit)
 
-    pub mutating func reset() -> !:
+    pub func reset() -> !:
         let state = self.state else error(closed, "encoder is closed or uninitialized")
         state.clear()
 
@@ -37,7 +37,7 @@ pub struct Encoder:
         let state = self.state else error(closed, "encoder is closed or uninitialized")
         return Statistics((i64)state.total_in, (i64)state.total_out, state.stage == 4, state.failed)
 
-    pub mutating func close():
+    pub func close():
         if let state = self.state:
             free(state.heads) in memory.heap
             free(state) in memory.heap
@@ -46,7 +46,7 @@ pub struct Encoder:
 ## Includes heap state and the owning handle; excludes allocator metadata/caller
 ## spans. This is a retained-state bound, not a process memory measurement.
 pub func encoder_storage_bytes() -> usize:
-    return sizeof(State) + sizeof(Encoder) + 65536 * sizeof(u64)
+    return memory.size_of(State) + memory.size_of(Encoder) + 65536 * memory.size_of(u64)
 
 struct State:
     var wrapped: bool
@@ -69,7 +69,7 @@ struct State:
     var adler_a: u32
     var adler_b: u32
 
-    mutating func clear():
+    func clear():
         self.failed = false
         self.stage = 0
         self.total_in = 0
@@ -87,30 +87,30 @@ struct State:
         for i in 0..<32768: self.history[i] = 0
         for i in 0..<258: self.ahead[i] = 0
 
-    mutating func poison():
+    func poison():
         self.failed = true
 
     func peek(index: usize) -> u8:
         return self.ahead[(self.ahead_at + index) % 258]
 
-    mutating func put(value: u32, count: u32):
+    func put(value: u32, count: u32):
         ## At most seven pending bits plus one complete match (31 bits).
         assert(self.bit_count + count <= 64)
         self.bits |= (u64)value << self.bit_count
         self.bit_count += count
 
-    mutating func code(value: u32, count: u32):
+    func code(value: u32, count: u32):
         var reversed: u32
         for i in 0..<count: reversed = (reversed << 1) | ((value >> i) & 1)
         self.put(reversed, count)
 
-    mutating func symbol(value: u32):
+    func symbol(value: u32):
         if value < 144: self.code(value + 48, 8)
         elif value < 256: self.code(value + 256, 9)
         elif value < 280: self.code(value - 256, 7)
         else: self.code(value - 88, 8)
 
-    mutating func encode_one():
+    func encode_one():
         var length: usize
         var distance: usize
         if self.ahead_count >= 3:
@@ -147,7 +147,7 @@ struct State:
         self.ahead_at = (self.ahead_at + length) % 258
         self.ahead_count -= length
 
-    mutating func step(data: const u8[], output: u8[], final_input: bool, work_limit: i64) -> Step!:
+    func step(data: const u8[], output: u8[], final_input: bool, work_limit: i64) -> Step!:
         if self.failed: error(corrupt, "encoder failed; reset before reuse")
         try check_work_limit(work_limit)
         if self.stage == 4: return Step(0, 0, finished, 0)
