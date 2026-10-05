@@ -469,6 +469,10 @@ func decode_block(s: Stream*, literals: const Table*, distances: const Table*, o
             *next_report = o + 262144
     s.pos = pos
     while true:
+        # A symbol that read past the input (into the zeros a refill pads it with) ends
+        # the stream here, rather than its zeros decoding on to the output's limit.
+        if bits < s.padded:
+            error(corrupt, "truncated deflate stream")
         if o > edge:
             o = try slide.advance(output, o)
         if bits < 48:

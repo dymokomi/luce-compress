@@ -113,6 +113,17 @@ pub func inflate_zlib_streamed(data: const u8[], maximum: usize, deliver: Delive
         error(corrupt, "zlib Adler checksum mismatch")
     return at + 4
 
+## A raw DEFLATE stream of unknown length inflated through a 256 KiB window, as
+## `inflate_zlib_streamed` does for zlib: each run of output goes to `deliver` (valid
+## during the call), at most `maximum` bytes in all. It ends after the final block (or
+## a block that ends `data`); the bytes of `data` it used, so a caller framing several
+## streams (gzip members) knows where the next begins.
+pub func inflate_raw_streamed(data: const u8[], maximum: usize, deliver: Deliver, context: void*?) -> usize!:
+    let through = try new u8[262144] --- in memory.heap
+    defer free(through) in memory.heap
+    var slide = Slide(deliver = deliver, context = context, base = 0, total = maximum, start = 0, open = true)
+    return try inflate_through(data, none, through, &slide, none, none)
+
 ## A streamed inflate's receiver: the caller's, and the Adler-32 so far.
 struct Checked:
     var deliver: Deliver
