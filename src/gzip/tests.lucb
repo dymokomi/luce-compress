@@ -1,0 +1,162 @@
+#==============================================================================================
+#
+#   gzip/tests - The module's tests
+#
+#==============================================================================================
+
+# mark: Helpers ===============================================================================
+
+## Words to compress.
+func sample(output: u8[]):
+    let words = ["gzip ", "member ", "deflate ", "header ", "crc ", "\n"]
+    var at: usize = 0
+    var state: u32 = 1
+    while at < output.length:
+        state = state *% 1103515245 +% 12345
+        let word = words[(usize)((state >> 16) % 6)]
+        for byte in word.bytes:
+            if at < output.length:
+                output[at] = byte
+                at += 1
+
+## A member of `data` with every header flag set: FTEXT, FHCRC, FEXTRA, FNAME and
+## FCOMMENT; `out` must hold it. Its length.
+func flagged(data: const u8[], out: u8[]) -> usize!:
+    let head = b"\x1f\x8b\x08\x1f\x00\x00\x00\x00\x00\x03\x06\x00AB\x02\x00hi"
+    var at: usize = 0
+    memory.copy(out, head, head.length)
+    at += head.length
+    memory.copy(out[at..], b"name.txt\x00a comment\x00", 19)
+    at += 19
+    let crc = flate.crc32(out[..<at])
+    out[at] = (u8)crc
+    out[at + 1] = (u8)(crc >> 8)
+    at += 2
+    at += try flate.deflate_raw(data, 6, out[at..], true)
+    let check = flate.crc32(data)
+    for i in 0..<(usize)4:
+        out[at + i] = (u8)(check >> (u32)(8 * i))
+        out[at + 4 + i] = (u8)((u32)data.length >> (u32)(8 * i))
+    return at + 8
+
+## Decode `packed` a `piece` and `room` at a time; the output's length (into `output`).
+func decode_pieces(packed: const u8[], output: u8[], piece: usize, room: usize, multiple: bool = true) -> (usize, usize)!:
+    var state = Decoder.open(multiple = multiple)
+    defer state.close()
+    var at: usize = 0
+    var made: usize = 0
+    var offered: usize = 0
+    while true:
+        if offered <= at:
+            offered = at + piece if at + piece < packed.length else packed.length
+        let end = made + room if made + room < output.length else output.length
+        let step = try state.step(packed[at..<offered], output[made..<end], offered == packed.length)
+        at += (usize)step.consumed
+        made += (usize)step.produced
+        if step.status == decoder.finished:
+            return (at, made)
+        if step.status == decoder.need_input:
+            assert(at == offered)
+
+## Whether two spans hold the same bytes.
+func same(a: const u8[], b: const u8[]) -> bool:
+    if a.length != b.length:
+        return false
+    for i in 0..<a.length:
+        if a[i] != b[i]:
+            return false
+    return true
+
+## The failure code of decoding `packed` whole, or `closed` when it decodes.
+func failure_of(packed: const u8[], max_output: usize = default_limit) -> ErrorCode:
+    let output = decode(packed, max_output) catch failure:
+        return failure.code
+    free(output) in memory.heap
+    return closed
+
+# mark: Tests =================================================================================
+
+test "members round-trip at every level":
+    var data: u8[30000]
+    sample(data)
+    for level: i32 in 0..<10:
+        let packed = try encode(data, level)
+        defer free(packed) in memory.heap
+        let plain = try decode(packed)
+        defer free(plain) in memory.heap
+        assert(plain.length == data.length and same(plain, data))
+        let header = try read_header(packed)
+        assert(header.length == 10 and header.flags == 0 and header.system == 255)
+
+test "every header field is read and checked":
+    var data: u8[5000]
+    sample(data)
+    var packed: u8[8000]
+    let used = try flagged(data, packed)
+    let header = try read_header(packed[..<used])
+    assert(header.flags == 0x1F and header.system == 3 and header.length == 39)
+    assert(same(header.extra, b"AB\x02\x00hi") and (str)header.name == "name.txt" and (str)header.comment == "a comment")
+    let plain = try decode(packed[..<used])
+    assert(plain.length == data.length and same(plain, data))
+    free(plain) in memory.heap
+    var out: u8[5000]
+    for piece in [(usize)1, 2, 5, 64, 100000]:
+        let (consumed, made) = try decode_pieces(packed[..<used], out, piece, piece + 3)
+        assert(consumed == used and made == data.length and same(out[..<made], data))
+    # Damage to the header CRC, a reserved flag, the method, the data CRC and the size.
+    for place in [(usize)37, 3, 2, used - 8, used - 4]:
+        var damaged = packed
+        damaged[place] ^= 0x40
+        assert(failure_of(damaged[..<used]) == corrupt)
+    for cut in 0..<used:
+        assert(failure_of(packed[..<cut]) == corrupt)
+
+test "members join, zero padding ends a file, other bytes do not":
+    var data: u8[9000]
+    sample(data)
+    let first = try encode(data[..<4000], 1)
+    defer free(first) in memory.heap
+    let empty = try encode(b"", 6)
+    defer free(empty) in memory.heap
+    let second = try encode(data[4000..], 9)
+    defer free(second) in memory.heap
+    var file: u8[12000]
+    var at: usize = 0
+    for part in [(const u8[])first, empty, second]:
+        memory.copy(file[at..], part, part.length)
+        at += part.length
+    let plain = try decode(file[..<at + 16])
+    assert(plain.length == data.length and same(plain, data))
+    free(plain) in memory.heap
+    var out: u8[9000]
+    let (consumed, made) = try decode_pieces(file[..<at + 16], out, 7, 11)
+    assert(consumed == at + 16 and made == data.length and same(out[..<made], data))
+    # One member only: consumed ends at its end.
+    let (one, made_one) = try decode_pieces(file[..<at], out, 3, 100, multiple = false)
+    assert(one == first.length and made_one == 4000)
+    file[at + 5] = 1
+    assert(failure_of(file[..<at + 16]) == corrupt)
+    let allowed = try decode(file[..<at], allow_trailing = true)
+    free(allowed) in memory.heap
+    assert(failure_of(file[..<at], 8999) == limit)
+    assert(failure_of(b"") == corrupt)
+
+test "a closed or failed decoder behaves":
+    var state = Decoder.open()
+    var out: u8[16]
+    var code = invalid
+    _ = state.step(b"\x1f\x8c", out, true) catch failure:
+        code = failure.code
+        recover decoder.Step(0, 0, 0, 0)
+    assert(code == corrupt and state.statistics().failed)
+    try state.reset()
+    let packed = try encode(b"abc")
+    defer free(packed) in memory.heap
+    let step = try state.step(packed, out, true)
+    assert(step.status == decoder.finished and (str)out[..<3] == "abc")
+    state.close()
+    code = invalid
+    _ = state.step(packed, out, true) catch failure:
+        code = failure.code
+        recover decoder.Step(0, 0, 0, 0)
+    assert(code == closed)

@@ -1,0 +1,217 @@
+#==============================================================================================
+#
+#   gzip/stream - The incremental decoder
+#
+#   DESCRIPTION:
+#       Header fields are read a byte at a time (only the header CRC needs them all, and
+#       it is kept as a running CRC-32), the member's data through an incremental raw
+#       DEFLATE decoder, and the trailer's eight bytes into a small buffer. After a
+#       member, more input starts another member or is zero padding; with
+#       `multiple = false` the decoder finishes after the first member instead, its
+#       `consumed` ending there.
+#
+#==============================================================================================
+
+## The decoder's states.
+let state_fixed: u32 = 0
+let state_extra_size: u32 = 1
+let state_extra: u32 = 2
+let state_name: u32 = 3
+let state_comment: u32 = 4
+let state_header_crc: u32 = 5
+let state_data: u32 = 6
+let state_trailer: u32 = 7
+let state_between: u32 = 8
+let state_padding: u32 = 9
+let state_done: u32 = 10
+
+## An incremental gzip decoder: `step` takes a file in pieces and gives its data in
+## pieces. Its raw DEFLATE decoder is a value of some 40 KiB; nothing is allocated.
+pub struct Decoder:
+    var ready: bool
+    var failed: bool
+    var multiple: bool
+    var max_output: u64
+    var state: u32
+    var inflater: decoder.Decoder
+    # The header: its fixed bytes, the running CRC of its bytes, counts to skip.
+    var fixed: u8[10]
+    var held: usize
+    var header_crc: u32
+    var before_crc: u32
+    var skip: usize
+    # The member's data: CRC-32 and size so far; the trailer as read.
+    var crc: u32
+    var size: u64
+    var trailer: u8[8]
+    var members: u64
+    var total_in: u64
+    var total_out: u64
+
+    ## A decoder of at most `max_output` bytes of data (`limit` beyond); after the first
+    ## member it reads more (`multiple`) or finishes.
+    pub static func open(max_output: u64 = 0x7FFFFFFFFFFFFFFF, multiple: bool = true) -> Decoder:
+        var made = Decoder()
+        made.ready = true
+        made.multiple = multiple
+        made.max_output = max_output
+        return made
+
+    ## Decode from `input` into `output`; the same contract as `brotli.Decoder.step`:
+    ## `final_input` declares the end of the file, `need_input` consumed all the input,
+    ## after `need_output` offer the rest again, and at `finished` `consumed` ends where
+    ## the file (or with `multiple = false` the first member) does.
+    pub func step(input: const u8[], output: u8[], final_input: bool = false) -> decoder.Step!:
+        if not self.ready:
+            error(closed, "gzip decoder is closed or uninitialized")
+        if self.failed:
+            error(corrupt, "gzip decoder failed; reset before reuse")
+        errdefer self.fail()
+        var at: usize = 0
+        var produced: usize = 0
+        var status = decoder.need_input
+        while true:
+            if self.state == state_done:
+                status = decoder.finished
+                break
+            if self.state == state_data:
+                let step = try self.inflater.step(input[at..], output[produced..], final_input, decoder.maximum_work_limit)
+                self.crc = flate.crc32(output[produced..<produced + (usize)step.produced], self.crc)
+                self.size += (u64)step.produced
+                self.total_out += (u64)step.produced
+                at += (usize)step.consumed
+                produced += (usize)step.produced
+                if step.status == decoder.finished:
+                    self.state = state_trailer
+                    self.held = 0
+                    continue
+                if step.status == decoder.yielded:
+                    continue
+                if step.status == decoder.need_output:
+                    status = decoder.need_output
+                break
+            if at == input.length:
+                if final_input:
+                    if self.state == state_between or self.state == state_padding:
+                        self.state = state_done
+                        continue
+                    error(corrupt, "truncated gzip file")
+                break
+            let byte = input[at]
+            if self.state == state_between:
+                if not self.multiple:
+                    self.state = state_done
+                    continue
+                self.state = state_padding if byte == 0 else state_fixed
+                self.held = 0
+                self.header_crc = 0
+                continue
+            at += 1
+            try self.header_byte(byte)
+        self.total_in += (u64)at
+        return decoder.Step((i64)at, (i64)produced, status, 0)
+
+    ## One byte of a header, trailer or padding.
+    func header_byte(byte: u8) -> !:
+        if self.state == state_padding:
+            if byte != 0:
+                error(corrupt, "trailing bytes after the gzip file")
+            return
+        if self.state == state_trailer:
+            self.trailer[self.held] = byte
+            self.held += 1
+            if self.held == 8:
+                let crc = (u32)self.trailer[0] | ((u32)self.trailer[1] << 8) | ((u32)self.trailer[2] << 16) | ((u32)self.trailer[3] << 24)
+                let size = (u32)self.trailer[4] | ((u32)self.trailer[5] << 8) | ((u32)self.trailer[6] << 16) | ((u32)self.trailer[7] << 24)
+                if crc != self.crc:
+                    error(corrupt, "gzip CRC-32 mismatch")
+                if size != (u32)self.size:
+                    error(corrupt, "gzip size mismatch")
+                self.members += 1
+                self.state = state_between
+            return
+        var one: u8[1] = [byte]
+        self.header_crc = flate.crc32(one, self.header_crc)
+        if self.state == state_fixed:
+            self.fixed[self.held] = byte
+            self.held += 1
+            if self.held < 10:
+                return
+            if self.fixed[0] != 0x1F or self.fixed[1] != 0x8B:
+                error(corrupt, "not a gzip member")
+            if self.fixed[2] != 8:
+                error(corrupt, "gzip member is not deflated")
+            if self.fixed[3] & 0xE0 != 0:
+                error(corrupt, "reserved gzip header flags are set")
+            self.held = 0
+            self.skip = 0
+            self.state = state_extra_size
+            try self.next_field()
+        elif self.state == state_extra_size:
+            self.skip |= (usize)byte << (8 * self.held)
+            self.held += 1
+            if self.held == 2:
+                self.state = state_extra
+                try self.next_field()
+        elif self.state == state_extra:
+            self.skip -= 1
+            try self.next_field()
+        elif self.state == state_name or self.state == state_comment:
+            if byte == 0:
+                self.state += 1
+                try self.next_field()
+        else:
+            # The header CRC: the low 16 bits of the CRC-32 of the bytes before it.
+            self.trailer[self.held] = byte
+            self.held += 1
+            if self.held == 2:
+                let stored = (u32)self.trailer[0] | ((u32)self.trailer[1] << 8)
+                if stored != self.before_crc & 0xFFFF:
+                    error(corrupt, "gzip header CRC mismatch")
+                try self.start_data()
+
+    ## On from the current header state to the next field the flags include.
+    func next_field() -> !:
+        let flags = self.fixed[3]
+        while true:
+            if self.state == state_extra_size and flags & flag_extra == 0:
+                self.state = state_name
+            elif self.state == state_extra and self.skip == 0:
+                self.state = state_name
+            elif self.state == state_name and flags & flag_name == 0:
+                self.state = state_comment
+            elif self.state == state_comment and flags & flag_comment == 0:
+                self.state = state_header_crc
+            elif self.state == state_header_crc and flags & flag_header_crc == 0:
+                try self.start_data()
+                return
+            else:
+                if self.state == state_header_crc:
+                    self.before_crc = self.header_crc
+                    self.held = 0
+                return
+
+    ## The member's DEFLATE data begins.
+    func start_data() -> !:
+        let left = self.max_output - self.total_out
+        self.inflater = try decoder.make_decoder("raw", 0x7FFFFFFFFFFFFFFF, (i64)(left if left < 0x7FFFFFFFFFFFFFFF else 0x7FFFFFFFFFFFFFFF))
+        self.crc = 0
+        self.size = 0
+        self.state = state_data
+
+    ## Bytes consumed and produced so far, and whether the file is complete or failed.
+    pub func statistics() -> decoder.Statistics:
+        return decoder.Statistics((i64)self.total_in, (i64)self.total_out, self.state == state_done, self.failed)
+
+    ## Start a new file with the same settings.
+    pub func reset() -> !:
+        if not self.ready:
+            error(closed, "gzip decoder is closed or uninitialized")
+        self = Decoder.open(self.max_output, self.multiple)
+
+    func fail():
+        self.failed = true
+
+    ## Close the decoder; idempotent.
+    pub func close():
+        self.ready = false

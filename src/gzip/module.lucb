@@ -1,0 +1,183 @@
+#==============================================================================================
+#
+#   gzip - The gzip file format (RFC 1952) over flate's DEFLATE
+#
+#   DESCRIPTION:
+#       A gzip file is one or more members, each a header (with optional extra field,
+#       file name, comment and header CRC), raw DEFLATE data, and the CRC-32 and size
+#       (mod 2^32) of its data; a file's data is its members' joined. `decode` reads a
+#       whole file through flate's table-driven inflater; a `Decoder` takes a file in
+#       pieces through the incremental raw DEFLATE decoder (`decoder.Decoder`, raw
+#       framing) and gives its data in pieces. Zero bytes after the last member are
+#       accepted as padding, as GNU gzip and Python accept them. `encode` writes one
+#       member.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb    headers, whole-file decoding and encoding
+#       stream.lucb    the incremental decoder
+#       tests.lucb     the module's tests
+#
+#==============================================================================================
+import memory
+import binary
+import decoder
+import flate
+from binary import invalid, corrupt, limit, closed
+
+## The whole-buffer decoder's default output limit: 64 MiB.
+pub let default_limit: usize = 67108864
+
+## Header flags (RFC 1952 section 2.3.1).
+pub let flag_text: u8 = 1
+pub let flag_header_crc: u8 = 2
+pub let flag_extra: u8 = 4
+pub let flag_name: u8 = 8
+pub let flag_comment: u8 = 16
+
+# mark: Headers ===============================================================================
+
+## A member's header. Its spans view the bytes it was read from.
+pub struct Header:
+    ## FTEXT and the other flags as stored.
+    pub var flags: u8
+    ## Modification time, seconds since 1970 (0 when unknown).
+    pub var modified: u32
+    ## XFL: 2 for the slowest compression, 4 for the fastest.
+    pub var extra_flags: u8
+    ## The operating system that wrote it (3 Unix, 255 unknown).
+    pub var system: u8
+    ## The extra field's subfields, the file name and the comment (without its zero
+    ## byte), each empty when absent.
+    pub var extra: const u8[]
+    pub var name: const u8[]
+    pub var comment: const u8[]
+    ## The header's bytes.
+    pub var length: usize
+
+## The header of the member at the start of `data`.
+pub func read_header(data: const u8[]) -> Header!:
+    if data.length < 10:
+        error(corrupt, "truncated gzip header")
+    if data[0] != 0x1F or data[1] != 0x8B:
+        error(corrupt, "not a gzip member")
+    if data[2] != 8:
+        error(corrupt, "gzip member is not deflated")
+    let flags = data[3]
+    if flags & 0xE0 != 0:
+        error(corrupt, "reserved gzip header flags are set")
+    var header = Header(flags = flags, modified = read32(data, 4), extra_flags = data[8], system = data[9])
+    var at: usize = 10
+    if flags & flag_extra != 0:
+        if data.length - at < 2:
+            error(corrupt, "truncated gzip header")
+        let size = (usize)data[at] | ((usize)data[at + 1] << 8)
+        at += 2
+        if data.length - at < size:
+            error(corrupt, "truncated gzip header")
+        header.extra = data[at..<at + size]
+        at += size
+    if flags & flag_name != 0:
+        let end = try zero_at(data, at)
+        header.name = data[at..<end]
+        at = end + 1
+    if flags & flag_comment != 0:
+        let end = try zero_at(data, at)
+        header.comment = data[at..<end]
+        at = end + 1
+    if flags & flag_header_crc != 0:
+        if data.length - at < 2:
+            error(corrupt, "truncated gzip header")
+        let stored = (u32)data[at] | ((u32)data[at + 1] << 8)
+        if stored != flate.crc32(data[..<at]) & 0xFFFF:
+            error(corrupt, "gzip header CRC mismatch")
+        at += 2
+    header.length = at
+    return header
+
+## Where the zero byte ending a header string from `at` is.
+func zero_at(data: const u8[], at: usize) -> usize!:
+    for i in at..<data.length:
+        if data[i] == 0:
+            return i
+    error(corrupt, "truncated gzip header")
+
+func read32(data: const u8[], at: usize) -> u32:
+    return (u32)data[at] | ((u32)data[at + 1] << 8) | ((u32)data[at + 2] << 16) | ((u32)data[at + 3] << 24)
+
+# mark: Whole files ===========================================================================
+
+## Output so far and the current member's CRC-32.
+struct Gathered:
+    var output: binary.Buffer
+    var crc: u32
+
+func gather(context: void*?, bytes: const u8[]) -> !:
+    let gathered = (Gathered*)(context else return)
+    gathered.crc = flate.crc32(bytes, gathered.crc)
+    try gathered.output.put(bytes)
+
+## The gzip file `data` decoded into a heap buffer the caller frees: every member's data,
+## at most `max_output` bytes (`limit` beyond). Bytes after the last member that are not
+## zero padding fail unless `allow_trailing`.
+pub func decode(data: const u8[], max_output: usize = default_limit, allow_trailing: bool = false) -> u8[]!:
+    var gathered = Gathered(output = binary.Buffer(maximum = max_output), crc = 0)
+    errdefer gathered.output.close()
+    var guess = data.length * 3 + 1024
+    if guess > max_output:
+        guess = max_output
+    try gathered.output.reserve(guess)
+    var at: usize = 0
+    var members: usize = 0
+    while members == 0 or at < data.length:
+        if members > 0 and (padding(data[at..]) or (allow_trailing and data[at] != 0x1F)):
+            break
+        let header = try read_header(data[at..])
+        at += header.length
+        let start = gathered.output.used
+        gathered.crc = 0
+        # One byte past the limit reaches the buffer, which reports the limit.
+        let used = flate.inflate_raw_streamed(data[at..], max_output - start + 1, gather, (void*)&gathered) catch failure:
+            if failure.code == memory.exhausted or failure.code == limit:
+                error(failure.code, failure.message)
+            error(corrupt, failure.message)
+        at += used
+        if data.length - at < 8:
+            error(corrupt, "truncated gzip member")
+        if read32(data, at) != gathered.crc:
+            error(corrupt, "gzip CRC-32 mismatch")
+        if read32(data, at + 4) != (u32)(gathered.output.used - start):
+            error(corrupt, "gzip size mismatch")
+        at += 8
+        members += 1
+    let result = try new u8[gathered.output.used] --- in memory.heap
+    memory.copy(result, gathered.output.view(), gathered.output.used)
+    gathered.output.close()
+    return result
+
+## Whether `rest` is all zeros (padding after the last member).
+func padding(rest: const u8[]) -> bool:
+    for byte in rest:
+        if byte != 0:
+            return false
+    return true
+
+## `data` as one gzip member deflated at `level` (0-9), with no name and time 0; a heap
+## buffer the caller frees.
+pub func encode(data: const u8[], level: i32 = 6) -> u8[]!:
+    if level < 0 or level > 9:
+        error(invalid, "compression level must be 0 through 9")
+    let scratch = try new u8[flate.deflate_bound(data.length) + 18] --- in memory.heap
+    defer free(scratch) in memory.heap
+    let header: u8[10] = [0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 2 if level >= 9 else 4 if level <= 1 else 0, 255]
+    memory.copy(scratch, header, 10)
+    var at = 10 + try flate.deflate_raw(data, level, scratch[10..], true)
+    let crc = flate.crc32(data)
+    let size = (u32)data.length
+    for i in 0..<(usize)4:
+        scratch[at + i] = (u8)(crc >> (u32)(8 * i))
+        scratch[at + 4 + i] = (u8)(size >> (u32)(8 * i))
+    at += 8
+    let out = try new u8[at] --- in memory.heap
+    memory.copy(out, scratch[..<at], at)
+    return out
