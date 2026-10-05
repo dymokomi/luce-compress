@@ -60,7 +60,7 @@ struct Symbols:
     var near: u8[256]
     var far: u8[256]
 
-    func make() -> Symbols:
+    static func make() -> Symbols:
         var s = Symbols()
         for code in 0..<(usize)29:
             let base = (usize)length_base[code]
