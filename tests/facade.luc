@@ -1,4 +1,4 @@
-from compress import encode, decode, crc32, Inflater, Deflater, finished, need_output, yielded
+from compress import encode, decode, crc32, Inflater, Deflater, finished, need_output, yielded, decode_brotli, decode_gzip, encode_gzip
 
 pub func main(arguments: list[str]) -> int!:
     let encoded = encode(b"Luce package source")
@@ -67,5 +67,14 @@ pub func main(arguments: list[str]) -> int!:
     assert(input_at == source.bytes().length and output_at == plain.length)
     decoder.close()
     encoder.close()
+    # Brotli: WBITS 16, an uncompressed meta-block of "hello", then the empty last one.
+    let hello = decode_brotli(b"\x40\x00\x10hello\x03", max_output = 5)
+    assert(hello.bytes() == b"hello" and hello.consumed() == 9)
+    hello.close()
+    let zipped = encode_gzip(b"small streaming result", level = 9)
+    let unzipped = decode_gzip(zipped.bytes())
+    assert(unzipped.bytes() == b"small streaming result")
+    unzipped.close()
+    zipped.close()
     print("PASS Luce codec API, binary ownership, consumed-byte count and one-operation cooperative yields")
     return 0

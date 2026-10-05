@@ -6,6 +6,8 @@ import decoder
 import encoder
 import flate
 import segments
+import brotli
+import gzip
 
 pub let invalid = binary.invalid
 pub let corrupt = binary.corrupt
@@ -140,6 +142,28 @@ pub func compress(data: const u8[], level: i64 = default_level) -> u8[]!:
     let out = try new u8[used] --- in memory.heap
     memory.copy(out, scratch[..<used], used)
     return out
+
+## The Brotli stream `data` (RFC 7932) decoded, at most `max_output` bytes; bytes after
+## the stream fail.
+pub func decode_brotli(data: const u8[], max_output: i64 = 67108864) -> interop.Reference[Data]!:
+    let plain = try brotli.decode(data, try binary.checked_limit(max_output))
+    return try adopt_heap(plain, data.length)
+
+## The gzip file `data` (RFC 1952) decoded: every member's data, at most `max_output`
+## bytes; bytes after the last member other than zero padding fail.
+pub func decode_gzip(data: const u8[], max_output: i64 = 67108864) -> interop.Reference[Data]!:
+    let plain = try gzip.decode(data, try binary.checked_limit(max_output))
+    return try adopt_heap(plain, data.length)
+
+## `data` as one gzip member deflated at `level` (0-9).
+pub func encode_gzip(data: const u8[], level: i64 = default_level) -> interop.Reference[Data]!:
+    if level < 0 or level > 9: error(invalid, "compression level must be 0 through 9")
+    let packed = try gzip.encode(data, (i32)level)
+    return try adopt_heap(packed, data.length)
+
+## An owned result of heap bytes, which it takes over.
+func adopt_heap(bytes: u8[], consumed: usize) -> interop.Reference[Data]!:
+    return try owned(binary.Buffer(data = bytes, used = bytes.length, maximum = bytes.length), (i64)consumed)
 
 ## Checksums are corruption checks, not cryptographic integrity/authentication.
 pub func adler32(data: const u8[]) -> i64:

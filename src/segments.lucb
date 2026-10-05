@@ -10,7 +10,6 @@ import memory
 import os
 import thread
 import flate
-from binary import corrupt
 
 pub let segment_bytes: usize = 1048576
 ## Buffers larger than this go on several threads.
