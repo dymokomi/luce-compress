@@ -94,3 +94,25 @@ The separate [resource suite](RESOURCES.md) processes a logical 4 GiB + 1 byte
 stream without a large file, but uses a paired Base encoder/decoder. It is not
 independent >4 GiB oracle coverage. Threaded Git integration, aggregate server
 admission, ThreadSanitizer and independent security review remain separate work.
+
+## Brotli and gzip
+
+```sh
+python3 tools/fuzz.py --tool build/codec_tool --cases 200000 --seed 7
+```
+
+`tools/fuzz.py` (local; it reads Google's test data from `../.donors/brotli`) mutates
+Brotli streams (Google's test data and streams Google's encoder makes at every quality
+from text, binary, periodic, incompressible and zero inputs) and gzip files (every
+header field, one or two members) with one to four bit flips, byte sets, insertions,
+deletions, repeats, splices from another stream, cuts and extensions. Each case is
+decoded whole or in random pieces (1 to 4,096 input bytes, 1 to 65,536 output bytes a
+step) under a 16 MiB output limit, 400 to a process with a time limit; a process that
+dies or times out is narrowed to its case, which is kept under `build/fuzz-failures`.
+With Python's `brotli` module each Brotli verdict is compared with Google's decoder:
+both accept with the same bytes, or both refuse. A bomb phase first decodes a
+12,751-byte Brotli stream of a thousand 16 MiB meta-blocks and a gzip member of 1 GiB
+of zeros, whole and in pieces: each must fail with `limit` within seconds.
+
+`tests/check_brotli.py` and `tests/check_gzip.py`, run in every mode and under the
+sanitizers, include a smaller seeded differential set of the same kinds.

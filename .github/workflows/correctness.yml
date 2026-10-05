@@ -47,6 +47,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
+      - name: Google's Brotli decoder as an independent oracle
+        run: python3 -m pip install brotli
       - name: Bootstrap pinned compilers without modifying their sources
         working-directory: luce-compress
         run: python3 tools/bootstrap.py

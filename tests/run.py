@@ -14,6 +14,8 @@ from check_work import check as check_work
 from check_fuzz import check as check_fuzz
 from check_large import check as check_large
 from check_flate import check as check_flate
+from check_brotli import check as check_brotli
+from check_gzip import check as check_gzip
 
 ROOT = Path(__file__).resolve().parents[1]
 MODES = {f"native{i}": ["--native", "--opt", str(i)] for i in range(4)}
@@ -55,7 +57,8 @@ def main():
                              (ROOT / "tests/stress_driver.lucb", "stress-driver"),
                              (ROOT / "src/fuzz_tests.lucb", "fuzz-driver"),
                              (ROOT / "tests/file_driver.lucb", "file-driver"),
-                             (ROOT / "tests/flate_driver.lucb", "flate-driver")]:
+                             (ROOT / "tests/flate_driver.lucb", "flate-driver"),
+                             (ROOT / "tools/codec_tool.lucb", "codec-tool")]:
             run([args.base.resolve(), "build", source, *flags, "-o", output / name])
         run([args.luce.resolve(), "build", ROOT / "tests/facade.luc", *flags, "-o", output / "facade"])
         run([output / "native"])
@@ -75,6 +78,8 @@ def main():
         check_fuzz(output / "fuzz-driver")
         check_large(output / "file-driver")
         check_flate(output / "flate-driver")
+        check_brotli(output / "codec-tool")
+        check_gzip(output / "codec-tool")
         print(f"PASS {mode} ({time.monotonic() - started:.1f}s)", flush=True)
 
 

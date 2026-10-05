@@ -12,6 +12,8 @@ from check_work import check as check_work
 from check_stress import check as check_stress
 from check_fuzz import check as check_fuzz
 from check_large import check as check_large
+from check_brotli import check as check_brotli
+from check_gzip import check as check_gzip
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,7 +38,8 @@ def main():
                          (ROOT / "src/work_tests.lucb", "work-tests"),
                          (ROOT / "tests/stress_driver.lucb", "stress-driver"),
                          (ROOT / "src/fuzz_tests.lucb", "fuzz-driver"),
-                         (ROOT / "tests/file_driver.lucb", "file-driver")]:
+                         (ROOT / "tests/file_driver.lucb", "file-driver"),
+                         (ROOT / "tools/codec_tool.lucb", "codec-tool")]:
         generated, executable = output / f"{name}.c", output / name
         run([args.base.resolve(), "build", source, "--emit=c", "-o", generated])
         run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-w", "-fno-strict-aliasing",
@@ -55,6 +58,9 @@ def main():
             check_stress(executable, instrumented=True)
         elif name == "fuzz-driver":
             check_fuzz(executable)
+        elif name == "codec-tool":
+            check_brotli(executable)
+            check_gzip(executable)
         else:
             check_large(executable)
     check_work(output / "stream-driver", output / "encode-driver")
