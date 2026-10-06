@@ -17,39 +17,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: luce-compress
-      - name: Read source pins
-        id: pins
-        shell: bash
-        run: |
-          echo "base=$(tr -d '\n' < luce-compress/bootstrap/BASE)" >> "$GITHUB_OUTPUT"
-          echo "luce=$(tr -d '\n' < luce-compress/bootstrap/LUCE)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: dymokomi/luce-base
-          ref: ${{ steps.pins.outputs.base }}
           path: luce-base
-      - name: Check out the pinned library packages
+      # every dependency at main, beside this checkout (luce-base docs/CI.md)
+      - name: Check out dependencies at main
         shell: bash
         working-directory: ${{ github.workspace }}
         run: |
-          while read -r name revision; do
-            revision=${revision%$'\r'}
-            [ -n "$name" ] || continue
-            git init -q "$name"
-            git -C "$name" fetch -q --depth 1 "https://github.com/dymokomi/$name.git" "$revision"
-            git -C "$name" checkout -q --detach FETCH_HEAD
-          done < luce-compress/bootstrap/PACKAGES
-      - uses: actions/checkout@v4
-        with:
-          repository: dymokomi/luce
-          ref: ${{ steps.pins.outputs.luce }}
-          path: luce
+          python3 luce-base/tools/checkout_main.py luce-compress luce
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
       - name: Google's Brotli decoder as an independent oracle
         run: python3 -m pip install brotli
-      - name: Bootstrap pinned compilers without modifying their sources
+      - name: Bootstrap the compilers without modifying their sources
         working-directory: luce-compress
         run: python3 tools/bootstrap.py
       - name: All six compiler modes
