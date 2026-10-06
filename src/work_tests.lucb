@@ -4,10 +4,6 @@ import native as codec
 import interop
 import thread
 
-func equal(actual: const u8[], expected: const u8[]):
-    assert(actual.length == expected.length)
-    for i in 0..<actual.length: assert(actual[i] == expected[i])
-
 ## The incremental encoder's own zlib stream of `plain` (the whole-buffer
 ## encoder, flate, writes different bytes).
 func stream_of(plain: const u8[]) -> interop.Reference[compress.Data]!:
@@ -49,7 +45,7 @@ func native_validation(framing: str) -> !:
     while true:
         let step = try decoder.step(packed[consumed..], output, calls == 0, 1)
         assert(step.work_units == 1 and step.status != codec.need_input)
-        equal(output[..<(usize)step.produced], plain[produced..<produced + (usize)step.produced])
+        assert(output[..<(usize)step.produced] == plain[produced..<produced + (usize)step.produced])
         consumed += (usize)step.consumed
         produced += (usize)step.produced
         calls += 1
@@ -66,7 +62,7 @@ func native_validation(framing: str) -> !:
     while true:
         let step = try encoder.step(plain[consumed..], output, calls == 0, 1)
         assert(step.work_units == 1)
-        equal(output[..<(usize)step.produced], packed[produced..<produced + (usize)step.produced])
+        assert(output[..<(usize)step.produced] == packed[produced..<produced + (usize)step.produced])
         consumed += (usize)step.consumed
         produced += (usize)step.produced
         calls += 1
@@ -135,8 +131,8 @@ func facade_and_cancellation(framing: str) -> !:
             assert(try output_chunk.value().status() == codec.yielded)
             let input_bytes = try input_chunk.value().bytes()
             let output_bytes = try output_chunk.value().bytes()
-            equal(input_bytes, plain[decoded..<decoded + input_bytes.length])
-            equal(output_bytes, packed[encoded..<encoded + output_bytes.length])
+            assert(input_bytes == plain[decoded..<decoded + input_bytes.length])
+            assert(output_bytes == packed[encoded..<encoded + output_bytes.length])
             decoded += input_bytes.length
             encoded += output_bytes.length
             packed_at += (usize)(try input_chunk.value().consumed())
@@ -151,8 +147,8 @@ func facade_and_cancellation(framing: str) -> !:
                     let fresh_encode = try deflater.feed(plain, 128, true, codec.maximum_work_limit)
                     assert(try fresh_decode.value().status() == codec.finished)
                     assert(try fresh_encode.value().status() == codec.finished)
-                    equal(try fresh_decode.value().bytes(), plain)
-                    equal(try fresh_encode.value().bytes(), packed)
+                    assert((try fresh_decode.value().bytes()) == plain)
+                    assert((try fresh_encode.value().bytes()) == packed)
                     fresh_decode.release()
                     fresh_encode.release()
                 ## Odd stops close the unfinished stream directly; even stops
@@ -160,8 +156,8 @@ func facade_and_cancellation(framing: str) -> !:
                 inflater.close()
                 deflater.close()
                 ## Already returned chunks remain readable after cancellation/reuse.
-                equal(try input_chunk.value().bytes(), plain[decoded - input_bytes.length..<decoded])
-                equal(try output_chunk.value().bytes(), packed[encoded - output_bytes.length..<encoded])
+                assert((try input_chunk.value().bytes()) == plain[decoded - input_bytes.length..<decoded])
+                assert((try output_chunk.value().bytes()) == packed[encoded - output_bytes.length..<encoded])
                 assert(try input_chunk.value().work_units() == 1)
                 assert(try output_chunk.value().work_units() == 1)
             input_chunk.release()

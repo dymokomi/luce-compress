@@ -73,10 +73,6 @@ struct Heap: memory.Allocator:
         assert(self.live == 0 and self.bytes == 0, "audited allocations leaked")
         for block in self.blocks: assert(block.address == none)
 
-func equal(actual: const u8[], expected: const u8[]):
-    assert(actual.length == expected.length)
-    for i in 0..<actual.length: assert(actual[i] == expected[i])
-
 func same(actual: codec.Statistics, expected: codec.Statistics):
     assert(actual.input_bytes == expected.input_bytes and actual.output_bytes == expected.output_bytes)
     assert(actual.finished == expected.finished and actual.failed == expected.failed)
@@ -195,7 +191,7 @@ func one_shot(heap: Heap*, input: const u8[], expected: const u8[], encoding: bo
     assert(allocations >= minimum_allocations, "allocation sweep became vacuous or lost a construction/growth stage")
     if let result = baseline:
         assert(expected_error == none)
-        equal(try result.value().bytes(), expected)
+        assert((try result.value().bytes()) == expected)
         result.release()
     assert(rejected == (expected_error != none))
     heap.clean()
@@ -219,7 +215,7 @@ func one_shot(heap: Heap*, input: const u8[], expected: const u8[], encoding: bo
         recover none
     assert(heap.refused == 0 and heap.attempts == allocations)
     if let result = retry:
-        equal(try result.value().bytes(), expected)
+        assert((try result.value().bytes()) == expected)
         result.release()
     heap.disarm()
     heap.clean()
@@ -237,11 +233,11 @@ func buffer_retry(heap: Heap*) -> !:
         rejected = true
     assert(rejected and heap.attempts == 1 and heap.refused == 1 and heap.live == 1)
     assert(buffer.data.data == original and buffer.data.length == length)
-    equal(buffer.view(), b"retained buffer bytes")
+    assert(buffer.view() == b"retained buffer bytes")
     heap.disarm()
     try buffer.reserve(512)
     assert(buffer.data.length > length and heap.live == 1)
-    equal(buffer.view(), b"retained buffer bytes")
+    assert(buffer.view() == b"retained buffer bytes")
     buffer.close()
     buffer.close()
     heap.clean()
@@ -259,7 +255,7 @@ func inflate_exhaustion(heap: Heap*, plain: const u8[], packed: const u8[]) -> !
     heap.disarm()
     heap.clean()
     try compress.inflate(packed, output[..<plain.length])
-    equal(output[..<plain.length], plain)
+    assert(output[..<plain.length] == plain)
     heap.clean()
 
 func native_without_allocations(heap: Heap*, plain: const u8[], packed: const u8[]) -> !:
@@ -272,7 +268,7 @@ func native_without_allocations(heap: Heap*, plain: const u8[], packed: const u8
     while true:
         let encoded = try encoder.step(plain[input_at..], output, true, 1)
         assert(encoded.work_units == 1)
-        equal(output[..<(usize)encoded.produced], packed[output_at..<output_at + (usize)encoded.produced])
+        assert(output[..<(usize)encoded.produced] == packed[output_at..<output_at + (usize)encoded.produced])
         input_at += (usize)encoded.consumed
         output_at += (usize)encoded.produced
         if encoded.status == codec.finished: break
@@ -283,7 +279,7 @@ func native_without_allocations(heap: Heap*, plain: const u8[], packed: const u8
     while true:
         let decoded = try decoder.step(packed[input_at..], output, true, 1)
         assert(decoded.work_units == 1)
-        equal(output[..<(usize)decoded.produced], plain[output_at..<output_at + (usize)decoded.produced])
+        assert(output[..<(usize)decoded.produced] == plain[output_at..<output_at + (usize)decoded.produced])
         input_at += (usize)decoded.consumed
         output_at += (usize)decoded.produced
         if decoded.status == codec.finished: break
@@ -330,7 +326,7 @@ func feed_attempt(heap: Heap*, encoding: bool, framing: str, input: const u8[], 
         let result = attempted else try current.feed(input[consumed..], room, true)
         let view = try result.value().bytes()
         assert(view.length <= expected.length - produced)
-        equal(view, expected[produced..<produced + view.length])
+        assert(view == expected[produced..<produced + view.length])
         produced += view.length
         consumed += (usize)(try result.value().consumed())
         let status = try result.value().status()
@@ -441,10 +437,10 @@ func retry_without_eof(heap: Heap*, encoding: bool, input: const u8[], expected:
     let prefix = try first.value().bytes()
     let used = (usize)(try first.value().consumed())
     let prefix_length = prefix.length
-    equal(prefix, expected[..<prefix_length])
+    assert(prefix == expected[..<prefix_length])
     let last = try current.feed(input[used..], 16384, true)
     assert((try last.value().status()) == codec.finished)
-    equal(try last.value().bytes(), expected[prefix_length..])
+    assert((try last.value().bytes()) == expected[prefix_length..])
     current.close()
     first.release()
     last.release()
@@ -470,7 +466,7 @@ func cooperative_failures(heap: Heap*, encoding: bool, input: const u8[], expect
     let first_bytes = try first.value().bytes()
     var consumed = (usize)(try first.value().consumed())
     var produced = first_bytes.length
-    equal(first_bytes, expected[..<produced])
+    assert(first_bytes == expected[..<produced])
     let baseline_live = heap.live
     let baseline_bytes = heap.bytes
     for persistent in [false, true]:
@@ -487,7 +483,7 @@ func cooperative_failures(heap: Heap*, encoding: bool, input: const u8[], expect
             let retry = try current.feed(input[consumed..], 31, false, 1)
             assert(try retry.value().work_units() == 1)
             let bytes = try retry.value().bytes()
-            equal(bytes, expected[produced..<produced + bytes.length])
+            assert(bytes == expected[produced..<produced + bytes.length])
             consumed += (usize)(try retry.value().consumed())
             produced += bytes.length
             retry.release()
@@ -496,7 +492,7 @@ func cooperative_failures(heap: Heap*, encoding: bool, input: const u8[], expect
     while true:
         let result = try current.feed(input[consumed..], 31, false, 1)
         let bytes = try result.value().bytes()
-        equal(bytes, expected[produced..<produced + bytes.length])
+        assert(bytes == expected[produced..<produced + bytes.length])
         consumed += (usize)(try result.value().consumed())
         produced += bytes.length
         let status = try result.value().status()
@@ -507,7 +503,7 @@ func cooperative_failures(heap: Heap*, encoding: bool, input: const u8[], expect
     assert(consumed == input.length and produced == expected.length)
     heap.arm(1, true)
     current.close()
-    equal(try first.value().bytes(), expected[..<first_bytes.length])
+    assert((try first.value().bytes()) == expected[..<first_bytes.length])
     first.release()
     assert(heap.attempts == 0 and heap.refused == 0)
     heap.disarm()
@@ -519,7 +515,7 @@ func cooperative_failures(heap: Heap*, encoding: bool, input: const u8[], expect
     heap.arm(1, true)
     abandoned.close()
     abandoned.close()
-    equal(try retained.value().bytes(), expected[..<(try retained.value().bytes()).length])
+    assert((try retained.value().bytes()) == expected[..<(try retained.value().bytes()).length])
     retained.release()
     assert(heap.attempts == 0 and heap.refused == 0)
     heap.disarm()

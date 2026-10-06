@@ -58,15 +58,6 @@ func decode_pieces(packed: const u8[], output: u8[], piece: usize, room: usize, 
         if step.status == decoder.need_input:
             assert(at == offered)
 
-## Whether two spans hold the same bytes.
-func same(a: const u8[], b: const u8[]) -> bool:
-    if a.length != b.length:
-        return false
-    for i in 0..<a.length:
-        if a[i] != b[i]:
-            return false
-    return true
-
 ## The failure code of decoding `packed` whole, or `closed` when it decodes.
 func failure_of(packed: const u8[], max_output: usize = default_limit) -> ErrorCode:
     let output = decode(packed, max_output) catch failure:
@@ -84,7 +75,7 @@ test "members round-trip at every level":
         defer free(packed) in memory.heap
         let plain = try decode(packed)
         defer free(plain) in memory.heap
-        assert(plain.length == data.length and same(plain, data))
+        assert(plain == data)
         let header = try read_header(packed)
         assert(header.length == 10 and header.flags == 0 and header.system == 255)
 
@@ -95,14 +86,14 @@ test "every header field is read and checked":
     let used = try flagged(data, packed)
     let header = try read_header(packed[..<used])
     assert(header.flags == 0x1F and header.system == 3 and header.length == 39)
-    assert(same(header.extra, b"AB\x02\x00hi") and (str)header.name == "name.txt" and (str)header.comment == "a comment")
+    assert(header.extra == b"AB\x02\x00hi" and (str)header.name == "name.txt" and (str)header.comment == "a comment")
     let plain = try decode(packed[..<used])
-    assert(plain.length == data.length and same(plain, data))
+    assert(plain == data)
     free(plain) in memory.heap
     var out: u8[5000]
     for piece in [(usize)1, 2, 5, 64, 100000]:
         let (consumed, made) = try decode_pieces(packed[..<used], out, piece, piece + 3)
-        assert(consumed == used and made == data.length and same(out[..<made], data))
+        assert(consumed == used and made == data.length and out[..<made] == data)
     # Damage to the header CRC, a reserved flag, the method, the data CRC and the size.
     for place in [(usize)37, 3, 2, used - 8, used - 4]:
         var damaged = packed
@@ -126,11 +117,11 @@ test "members join, zero padding ends a file, other bytes do not":
         memory.copy(file[at..], part, part.length)
         at += part.length
     let plain = try decode(file[..<at + 16])
-    assert(plain.length == data.length and same(plain, data))
+    assert(plain == data)
     free(plain) in memory.heap
     var out: u8[9000]
     let (consumed, made) = try decode_pieces(file[..<at + 16], out, 7, 11)
-    assert(consumed == at + 16 and made == data.length and same(out[..<made], data))
+    assert(consumed == at + 16 and made == data.length and out[..<made] == data)
     # One member only: consumed ends at its end.
     let (one, made_one) = try decode_pieces(file[..<at], out, 3, 100, multiple = false)
     assert(one == first.length and made_one == 4000)
