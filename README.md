@@ -336,13 +336,10 @@ not raw streams. The image library is not migrated to this package in this slice
 
 ## Tests
 
-With pinned sibling `luce-base` and `luce` checkouts:
-
 ```sh
-python3 tools/bootstrap.py
-python3 tests/run.py --mode native0
-python3 tests/run.py
-python3 tests/sanitize.py
+luc test                                 # module tests, then tests/oracles in one compiler mode
+python3 tests/oracles/gate.py --mode all # every compiler mode, by hand
+python3 tests/sanitize.py                # the C backend under sanitizers, by hand
 ```
 
 Brotli and gzip: `tests/check_brotli.py` compresses seeded inputs at every quality

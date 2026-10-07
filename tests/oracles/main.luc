@@ -1,0 +1,14 @@
+# luce-compress's self-checks, drivers and oracles: gate.py builds the self-check programs,
+# drivers and the Luce facade, runs them, and holds the codecs to zlib, Python's gzip and
+# brotli where present, and stress and fuzz rounds (tests/check_*.py).
+from luce_std import process
+
+let failed = ErrorCode.package(1)
+
+pub func main(arguments: list[str]) -> int!:
+    let here = process.variable("LUC_TEST_DIR") else "tests/oracles"
+    let done = process.run("python3", [f"{here}/gate.py"])
+    print(done.output.trim_end())
+    if done.exit_code != 0:
+        error(failed, f"gate.py: exit status {done.exit_code}\n{done.error_output}")
+    return 0

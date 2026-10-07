@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Build/run every compiler mode, with zlib only as an independent test oracle."""
+"""The self-check programs, drivers and oracles, run by tests/oracles/main.luc (`luc test`,
+which runs the module tests itself): build them in one compiler mode (native, opt 0, by
+default; --mode all for every mode) and check them, with zlib only as an independent oracle."""
 import argparse
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from check_codecs import check
 from check_stream import check as check_stream
 from check_git import check as check_git
@@ -17,31 +20,22 @@ from check_flate import check as check_flate
 from check_brotli import check as check_brotli
 from check_gzip import check as check_gzip
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 MODES = {f"native{i}": ["--native", "--opt", str(i)] for i in range(4)}
 MODES.update({"c": ["--backend=c"], "c-release": ["--backend=c", "--release"]})
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=[*MODES, "all"], default="all")
-    parser.add_argument("--base", type=Path, default=ROOT / "build/toolchain/luce-base")
-    parser.add_argument("--luce", type=Path, default=ROOT / "build/toolchain/luce")
+    parser.add_argument("--mode", choices=[*MODES, "all"], default="native0")
     args = parser.parse_args()
-    environment = dict(os.environ, LUCE_BASE=str(args.base.resolve()),
-                       LUCE_STD=os.environ.get("LUCE_STD", str(ROOT.parent / "luce-base/src/std")),
-                       LUCE_CACHE=str(ROOT / "build/cache"))
+    args.base = Path(os.environ.get("LUCE_BASE", "luce-base"))
+    args.luce = Path(os.environ.get("LUCE", "luce"))
+    environment = dict(os.environ)
     def run(command):
         subprocess.run([str(arg) for arg in command], cwd=ROOT, env=environment, check=True, timeout=180)
     run([sys.executable, ROOT / "tests/test_stress.py"])
     run([sys.executable, ROOT / "tests/test_oracles.py"])
-    for flags in (["--native"], ["--backend=c"]):
-        if args.mode == "all" or (args.mode == "c") == (flags[0] == "--backend=c"):
-            run([args.base.resolve(), "test", ROOT / "src/flate", *flags])
-            run([args.base.resolve(), "test", ROOT / "src/zip", *flags])
-            run([args.base.resolve(), "test", ROOT / "src/lz4", *flags])
-            run([args.base.resolve(), "test", ROOT / "src/brotli", *flags])
-            run([args.base.resolve(), "test", ROOT / "src/gzip", *flags])
     for mode, flags in MODES.items():
         if args.mode != "all" and args.mode != mode:
             continue
@@ -59,8 +53,8 @@ def main():
                              (ROOT / "tests/file_driver.lucb", "file-driver"),
                              (ROOT / "tests/flate_driver.lucb", "flate-driver"),
                              (ROOT / "tools/codec_tool.lucb", "codec-tool")]:
-            run([args.base.resolve(), "build", source, *flags, "-o", output / name])
-        run([args.luce.resolve(), "build", ROOT / "tests/facade.luc", *flags, "-o", output / "facade"])
+            run([args.base, "build", source, *flags, "-o", output / name])
+        run([args.luce, "build", ROOT / "tests/facade.luc", *flags, "-o", output / "facade"])
         run([output / "native"])
         run([output / "stream-tests"])
         run([output / "encoder-tests"])

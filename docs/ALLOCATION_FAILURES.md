@@ -73,5 +73,5 @@ build/toolchain/luce-base build src/failure_tests.lucb --native --opt 0 -o build
 build/failure-tests
 ```
 
-Use `python3 tests/run.py` and `python3 tests/sanitize.py` for the full supported
+Use `luc test`, `python3 tests/oracles/gate.py --mode all` and `python3 tests/sanitize.py` for the full supported
 matrix. Publication evidence belongs in [VALIDATION.md](VALIDATION.md).
