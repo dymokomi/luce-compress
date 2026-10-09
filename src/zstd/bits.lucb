@@ -1,0 +1,137 @@
+#==============================================================================================
+#
+#   zstd/bits - The backward bit reader and the forward bit writer
+#
+#   DESCRIPTION:
+#       Huffman and FSE streams are written forward, least significant bit first, and
+#       closed by a 1 bit; a reader starts at the last byte, skips the zeros above that
+#       bit and the bit itself, and reads toward the stream's first byte, each field
+#       taken from the top of what is left. `Backward` holds eight bytes of the stream
+#       in `container`, `consumed` of its top bits already read; `reload` moves the
+#       eight-byte window down by the whole bytes read. Reading past the stream's start
+#       gives meaningless bits but never reads outside it: the stream is then
+#       overflowed, which every caller checks before trusting what it read. A stream is
+#       finished when every bit, and no more, has been read.
+#
+#       `Writer` is the encoder's side: fields go into a 64-bit accumulator that is
+#       written out eight bytes at a time; its buffer keeps eight bytes of room past
+#       anything it writes.
+#
+#==============================================================================================
+
+## The index of the highest set bit of `value` (nonzero): 0 for 1, 31 for 2^31.
+inline func high_bit(value: u32) -> u32:
+    var v = value
+    var bit: u32 = 0
+    if v >= 0x10000:
+        v >>= 16
+        bit += 16
+    if v >= 0x100:
+        v >>= 8
+        bit += 8
+    if v >= 0x10:
+        v >>= 4
+        bit += 4
+    if v >= 4:
+        v >>= 2
+        bit += 2
+    if v >= 2:
+        bit += 1
+    return bit
+
+# mark: Reading backward ======================================================================
+
+struct Backward:
+    var stream: const u8[]
+    ## The stream byte where the container's eight bytes start.
+    var at: usize
+    var container: u64
+    var consumed: u32
+
+    ## A reader of `stream`; fails when it is empty or its last byte holds no end bit.
+    static func open(stream: const u8[]) -> Backward!:
+        if stream.length == 0: error(corrupt, "empty zstd bit stream")
+        let last = stream[stream.length - 1]
+        if last == 0: error(corrupt, "zstd bit stream without its end bit")
+        var reader: Backward
+        reader.stream = stream
+        reader.consumed = 8 - high_bit((u32)last)
+        if stream.length >= 8:
+            reader.at = stream.length - 8
+            reader.container = memory.read[u64](stream.data + reader.at)
+        else:
+            for index in 0..<stream.length:
+                reader.container |= (u64)stream[index] << (u64)(index * 8)
+            reader.consumed += (u32)(8 - stream.length) * 8
+        return reader
+
+    ## The next `count` (0..57) bits, not consumed.
+    inline func look(count: u32) -> u64:
+        return (self.container << (u64)(self.consumed & 63)) >> 1 >> (u64)((63 -% count) & 63)
+
+    ## The next `count` (0..57) bits.
+    inline func read(count: u32) -> u64:
+        let value = self.look(count)
+        self.consumed +%= count
+        return value
+
+    ## Move the window down by the whole bytes read, while the stream has them.
+    inline func reload():
+        if self.consumed > 64: return
+        if self.at >= 8:
+            self.at -= (usize)(self.consumed >> 3)
+            self.consumed &= 7
+            self.container = memory.read[u64](self.stream.data + self.at)
+            return
+        if self.at == 0: return
+        var bytes = (usize)(self.consumed >> 3)
+        if bytes > self.at: bytes = self.at
+        self.at -= bytes
+        self.consumed -= (u32)bytes * 8
+        self.container = memory.read[u64](self.stream.data + self.at)
+
+    ## Whether the window holds at least eight unread bytes beyond the container, so a
+    ## reload restores 57 readable bits.
+    inline func roomy() -> bool:
+        return self.at >= 8
+
+    ## Whether bits past the stream's start were read.
+    inline func overflowed() -> bool:
+        return self.consumed > 64
+
+    ## Whether every bit was read, and no more.
+    inline func finished() -> bool:
+        return self.at == 0 and self.consumed == 64
+
+# mark: Writing forward =======================================================================
+
+struct Writer:
+    var out: u8[]
+    var at: usize
+    var accumulator: u64
+    var count: u32
+
+    ## A writer into `out`, which must hold everything written plus eight bytes.
+    static func into(out: u8[]) -> Writer:
+        var writer: Writer
+        writer.out = out
+        return writer
+
+    ## Add the low `bits` (0..31 while fewer than 33 are held) bits of `value`.
+    inline func add(value: u64, bits: u32):
+        self.accumulator |= (value & (((u64)1 << (u64)(bits & 63)) -% 1)) << (u64)(self.count & 63)
+        self.count +%= bits
+
+    ## Write out the whole bytes held; at most 7 bits stay.
+    inline func flush():
+        memory.write[u64](self.out.data + self.at, self.accumulator)
+        let bytes = self.count >> 3
+        self.at +%= (usize)bytes
+        self.count &= 7
+        self.accumulator = self.accumulator >> (u64)(bytes * 8) if bytes < 8 else 0
+
+    ## Add the end bit and write everything; the stream's length.
+    func close() -> usize:
+        self.add(1, 1)
+        self.flush()
+        return self.at + (1 if self.count > 0 else 0)

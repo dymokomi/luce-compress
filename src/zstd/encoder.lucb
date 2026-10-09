@@ -1,0 +1,66 @@
+#==============================================================================================
+#
+#   zstd/encoder - Writing a frame
+#
+#   DESCRIPTION:
+#       One frame: a header with the content size (a single segment when the content
+#       fits the level's window), 128 KiB blocks, and the XXH64 checksum. Each block is
+#       compressed (block.lucb), or stored raw when that is no larger, or as one
+#       repeated byte when it is one.
+#
+#==============================================================================================
+
+## The bytes an encoding of `size` bytes may take at most: raw blocks and the frame.
+func frame_bound(size: usize) -> usize:
+    return size + (size // block_largest + 1) * 3 + 18 + 8
+
+## Write `data` as one frame at `level`.
+func encode_frame(data: const u8[], level: i32) -> u8[]!:
+    let scratch = try new u8[frame_bound(data.length)] --- in memory.heap
+    defer free(scratch) in memory.heap
+    var compressor = try Compressor.open(data, level)
+    defer compressor.close()
+    var at = write_frame_header(scratch, data.length, compressor.window_log)
+    var start: usize = 0
+    while true:
+        let end = start + block_largest if data.length - start > block_largest else data.length
+        let last = end == data.length
+        at += try compressor.block(start, end, last, scratch[at..])
+        start = end
+        if last: break
+    let check = (u32)xxhash64(data)
+    for index in 0..<(usize)4: scratch[at + index] = (u8)(check >> (u32)(index * 8))
+    at += 4
+    let result = try new u8[at] --- in memory.heap
+    memory.copy(result, scratch[..<at], at)
+    return result
+
+## Write a frame header for `size` bytes of content and a window of 2^`window_log`;
+## its bytes.
+func write_frame_header(out: u8[], size: usize, window_log: u32) -> usize:
+    for index in 0..<(usize)4: out[index] = (u8)(frame_magic >> (u32)(index * 8))
+    let single = (u64)size <= (u64)1 << (u64)window_log
+    var flag: u32 = 0
+    var bytes: usize = 0
+    var value = (u64)size
+    if single and size < 256:
+        bytes = 1
+    elif size >= 256 and size < 65792:
+        flag = 1
+        bytes = 2
+        value -= 256
+    elif (u64)size <= 0xFFFFFFFF:
+        flag = 2
+        bytes = 4
+    else:
+        flag = 3
+        bytes = 8
+    # Content size flag, single segment, checksum.
+    out[4] = (u8)((flag << 6) | (32 if single else 0) | 4)
+    var at: usize = 5
+    if not single:
+        out[at] = (u8)((window_log - 10) << 3)
+        at += 1
+    for index in 0..<bytes:
+        out[at + index] = (u8)(value >> (u64)(index * 8))
+    return at + bytes

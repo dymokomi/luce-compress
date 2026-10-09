@@ -1,0 +1,160 @@
+#==============================================================================================
+#
+#   zstd/sequences - The sequences section and sequence execution
+#
+#   DESCRIPTION:
+#       After the literals, a block holds its sequences: how many, the table mode of
+#       each code kind (predefined, RLE, FSE-compressed or the previous block's), the
+#       tables, and one backward bit stream of FSE states and extra bits. Each sequence
+#       copies literals, then a match from earlier output in the frame; offsets 1 to 3
+#       name the three most recent offsets (RFC 8878 section 3.1.2.5). Sequences are
+#       executed as they are decoded, straight into the output; copies move a word at
+#       a time where the output has room past the copy, and every length and offset is
+#       checked against the literals, the block and the frame first.
+#
+#==============================================================================================
+
+let mode_predefined: u32 = 0
+let mode_rle: u32 = 1
+let mode_compressed: u32 = 2
+let mode_repeat: u32 = 3
+
+extend SeqTable:
+    ## Read a code kind's table in `mode` from the start of `data`; its bytes.
+    func read(mode: u32, data: const u8[], most_code: u32, most_log: u32, defaults: const i16[], default_log: u32, bases: const u32*, extras: const u8*) -> usize!:
+        if mode == mode_predefined:
+            self.build(defaults.data, (u32)defaults.length, default_log, bases, extras)
+            return 0
+        if mode == mode_rle:
+            if data.length == 0: error(corrupt, "truncated zstd sequence table")
+            if (u32)data[0] > most_code: error(corrupt, "zstd sequence code out of range")
+            self.single((usize)data[0], bases, extras)
+            return 1
+        if mode == mode_compressed:
+            let distribution = try read_distribution(data, most_code, most_log)
+            self.build(&distribution.counts[0], distribution.symbols, distribution.log, bases, extras)
+            return distribution.size
+        if not self.ready: error(corrupt, "zstd repeat table without a previous one")
+        return 0
+
+## Copy `count` bytes from `source` to `to`, which may overlap when `to` follows `source` by 8 or more,
+## eight at a time: up to 7 bytes past `to + count` are written.
+inline func copy_words(to: u8*, source: const u8*, count: usize):
+    var at: usize = 0
+    while at < count:
+        memory.write[u64](to + at, memory.read[u64](source + at))
+        at +%= 8
+
+extend Context:
+    ## Decode and execute the sequences section `section` into `output`, after the
+    ## block's literals; the frame's output starts at `frame_start` and the block may
+    ## end no later than `block_end`.
+    func run_sequences(section: const u8[], output: Output*, frame_start: usize, block_end: usize) -> !:
+        if section.length == 0: error(corrupt, "truncated zstd sequences")
+        var at: usize = 1
+        var count = (usize)section[0]
+        if count == 255:
+            if section.length < 3: error(corrupt, "truncated zstd sequences")
+            count = ((usize)section[1] | (usize)section[2] << 8) + 0x7F00
+            at = 3
+        elif count >= 128:
+            if section.length < 2: error(corrupt, "truncated zstd sequences")
+            count = ((count - 128) << 8) + (usize)section[1]
+            at = 2
+        if count == 0:
+            if at != section.length: error(corrupt, "bytes after an empty zstd sequences section")
+            try self.rest_of_literals(0, output, block_end)
+            return
+        if at >= section.length: error(corrupt, "truncated zstd sequences")
+        let modes = (u32)section[at]
+        at += 1
+        if modes & 3 != 0: error(corrupt, "reserved zstd sequence mode bits")
+        at += try self.literal_lengths.read(modes >> 6, section[at..], max_literals_code, literals_most_log, literals_default, literals_default_log, &literals_bases[0], &literals_extras[0])
+        at += try self.offsets.read((modes >> 4) & 3, section[at..], max_offset_code, offset_most_log, offset_default, offset_default_log, &offset_bases[0], &offset_extras[0])
+        at += try self.match_lengths.read((modes >> 2) & 3, section[at..], max_match_code, match_most_log, match_default, match_default_log, &match_bases[0], &match_extras[0])
+        try self.execute(section[at..], count, output, frame_start, block_end)
+
+    ## Decode `count` sequences from `stream` and execute each.
+    func execute(stream: const u8[], count: usize, output: Output*, frame_start: usize, block_end: usize) -> !:
+        var reader = try Backward.open(stream)
+        let literal_rows = &self.literal_lengths.rows[0]
+        let offset_rows = &self.offsets.rows[0]
+        let match_rows = &self.match_lengths.rows[0]
+        var literal_state = (usize)reader.read(self.literal_lengths.log)
+        reader.reload()
+        var offset_state = (usize)reader.read(self.offsets.log)
+        reader.reload()
+        var match_state = (usize)reader.read(self.match_lengths.log)
+        reader.reload()
+        var repeat0 = self.repeats[0]
+        var repeat1 = self.repeats[1]
+        var repeat2 = self.repeats[2]
+        let out = output.data.data
+        let room = output.data.length
+        let end = block_end if block_end < output.limit else output.limit
+        let literals = self.literals.data
+        let literal_end = self.literal_count
+        var literal_at: usize = 0
+        var op = output.used
+        for index in 0..<count:
+            let literal_row = literal_rows[literal_state]
+            let offset_row = offset_rows[offset_state]
+            let match_row = match_rows[match_state]
+            # The offset: a new one, or one of the three recent ones.
+            let code = (u32)offset_row.extra
+            var offset: u64 = 0
+            if code > 1:
+                offset = (u64)offset_row.base +% reader.read(code) -% 3
+                repeat2 = repeat1
+                repeat1 = repeat0
+                repeat0 = offset
+            else:
+                let pick = code +% (u32)reader.read(code) +% (1 if literal_row.base == 0 else 0)
+                if pick == 0:
+                    offset = repeat0
+                else:
+                    offset = repeat1 if pick == 1 else (repeat2 if pick == 2 else repeat0 -% 1)
+                    if offset == 0: error(corrupt, "zstd repeat offset of zero")
+                    if pick != 1: repeat2 = repeat1
+                    repeat1 = repeat0
+                    repeat0 = offset
+            let match_length = (usize)match_row.base +% (usize)reader.read((u32)match_row.extra)
+            reader.reload()
+            let literal_length = (usize)literal_row.base +% (usize)reader.read((u32)literal_row.extra)
+            # The literals, then the match.
+            if literal_length > literal_end - literal_at: error(corrupt, "zstd sequence overruns its literals")
+            let total = literal_length + match_length
+            if total > end - op:
+                error(corrupt if total > block_end - op else limit, "zstd block output exceeds its limit")
+            if op + total + 8 <= room:
+                copy_words(out + op, literals + literal_at, literal_length)
+            else:
+                memory.copy(output.data[op..], self.literals[literal_at..], literal_length)
+            op += literal_length
+            literal_at += literal_length
+            if offset > (u64)(op - frame_start): error(corrupt, "zstd offset before the frame's start")
+            let source = out + (op - (usize)offset)
+            if offset >= 8 and op + match_length + 8 <= room:
+                copy_words(out + op, source, match_length)
+            else:
+                for at in 0..<match_length: out[op + at] = source[at]
+            op += match_length
+            if index + 1 < count:
+                literal_state = (usize)literal_row.next +% (usize)reader.read((u32)literal_row.bits)
+                match_state = (usize)match_row.next +% (usize)reader.read((u32)match_row.bits)
+                offset_state = (usize)offset_row.next +% (usize)reader.read((u32)offset_row.bits)
+                reader.reload()
+        reader.reload()
+        if not reader.finished(): error(corrupt, "damaged zstd sequences")
+        self.repeats = [repeat0, repeat1, repeat2]
+        output.used = op
+        try self.rest_of_literals(literal_at, output, block_end)
+
+    ## Copy the literals from `first` on to the output.
+    func rest_of_literals(first: usize, output: Output*, block_end: usize) -> !:
+        let left = self.literal_count - first
+        let end = block_end if block_end < output.limit else output.limit
+        if left > end - output.used:
+            error(corrupt if left > block_end - output.used else limit, "zstd block output exceeds its limit")
+        if left > 0: memory.copy(output.data[output.used..], self.literals[first..<self.literal_count], left)
+        output.used += left

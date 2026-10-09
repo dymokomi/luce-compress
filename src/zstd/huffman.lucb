@@ -1,0 +1,162 @@
+#==============================================================================================
+#
+#   zstd/huffman - Huffman tables and literal streams, decoding
+#
+#   DESCRIPTION:
+#       A tree is described by its symbols' weights, 4 bits each or FSE-compressed with
+#       two interleaved states; the last symbol's weight is implied by completing the
+#       code to a power of two, whose log is the longest code (at most 12 here, as the
+#       reference decoder allows; the format's encoders write at most 11). The decoding
+#       table has a row per value of the next `log` bits: the symbol and its code's
+#       length. A stream decodes four symbols per reload while the reader has eight
+#       bytes in hand, then one at a time; it must end exactly at its first bit.
+#
+#==============================================================================================
+
+## The longest code a table may have.
+let huffman_most_bits: u32 = 12
+
+## Read the tree description at the start of `data` into `table` (u16 rows: symbol << 8 |
+## length); its log and the description's bytes.
+func read_huffman(data: const u8[], table: u16*) -> (u32, usize)!:
+    if data.length == 0: error(corrupt, "missing zstd Huffman tree")
+    var weights: u8[256]
+    let header = (usize)data[0]
+    var count: usize = 0
+    var size: usize = 0
+    if header >= 128:
+        count = header - 127
+        size = 1 + (count + 1) // 2
+        if size > data.length: error(corrupt, "truncated zstd Huffman tree")
+        for index in 0..<count:
+            let byte = data[1 + index // 2]
+            weights[index] = byte >> 4 if index % 2 == 0 else byte & 15
+    else:
+        size = 1 + header
+        if size > data.length: error(corrupt, "truncated zstd Huffman tree")
+        count = try read_fse_weights(data[1..<size], &weights[0])
+    # Weights to code lengths; the last symbol's completes the code.
+    var ranks: u32[16]
+    var total: u32 = 0
+    for index in 0..<count:
+        let weight = (u32)weights[index]
+        if weight > huffman_most_bits: error(corrupt, "zstd Huffman weight too large")
+        ranks[(usize)weight] += 1
+        if weight > 0: total += (u32)1 << (weight - 1)
+    if total == 0: error(corrupt, "zstd Huffman tree without symbols")
+    let log = high_bit(total) + 1
+    if log > huffman_most_bits: error(corrupt, "zstd Huffman tree too deep")
+    let rest = ((u32)1 << log) - total
+    if rest & (rest - 1) != 0: error(corrupt, "incomplete zstd Huffman tree")
+    let last = high_bit(rest) + 1
+    weights[count] = (u8)last
+    ranks[(usize)last] += 1
+    count += 1
+    if ranks[1] < 2 or ranks[1] & 1 != 0: error(corrupt, "damaged zstd Huffman tree")
+    # Rows: weight by weight from the lightest, symbols in order within a weight.
+    var start: u32[16]
+    var next: u32 = 0
+    for weight in 1..<log + 1:
+        start[(usize)weight] = next
+        next += ranks[(usize)weight] << (weight - 1)
+    for symbol in 0..<count:
+        let weight = (u32)weights[symbol]
+        if weight == 0: continue
+        let length = log + 1 - weight
+        let row = (u16)((symbol << 8) | (usize)length)
+        let first = start[(usize)weight]
+        let rows = (u32)1 << (weight - 1)
+        for at in first..<first + rows:
+            table[(usize)at] = row
+        start[(usize)weight] = first + rows
+    return (log, size)
+
+## Weights compressed with FSE (two states over one table of log <= 6) from `data` into
+## `weights`; how many.
+func read_fse_weights(data: const u8[], weights: u8*) -> usize!:
+    let distribution = try read_distribution(data, 255, 6)
+    var table: State[64]
+    build_states(&distribution.counts[0], distribution.symbols, distribution.log, &table[0])
+    var reader = try Backward.open(data[distribution.size..])
+    let log = distribution.log
+    var first = (usize)reader.read(log)
+    reader.reload()
+    var second = (usize)reader.read(log)
+    reader.reload()
+    if reader.overflowed(): error(corrupt, "truncated zstd Huffman weights")
+    var count: usize = 0
+    while true:
+        if count > 253: error(corrupt, "too many zstd Huffman weights")
+        let one = table[first]
+        weights[count] = one.symbol
+        count += 1
+        first = (usize)one.next + (usize)reader.read((u32)one.bits)
+        reader.reload()
+        if reader.overflowed():
+            weights[count] = table[second].symbol
+            return count + 1
+        if count > 253: error(corrupt, "too many zstd Huffman weights")
+        let two = table[second]
+        weights[count] = two.symbol
+        count += 1
+        second = (usize)two.next + (usize)reader.read((u32)two.bits)
+        reader.reload()
+        if reader.overflowed():
+            weights[count] = table[first].symbol
+            return count + 1
+    return count
+
+## Decode `stream` into `out` (exactly its length) with `table` of `log` bits.
+func decode_stream(stream: const u8[], out: u8[], table: const u16*, log: u32) -> !:
+    var reader = try Backward.open(stream)
+    try finish_stream(&reader, out.data, 0, out.length, table, log)
+
+## Decode four streams (`data` starts with their jump table) into `out`: the four
+## readers take turns while each has eight bytes in hand, then each finishes alone.
+func decode_four(data: const u8[], out: u8[], table: const u16*, log: u32) -> !:
+    if data.length < 10 or out.length < 6: error(corrupt, "damaged zstd Huffman streams")
+    let one = (usize)data[0] | (usize)data[1] << 8
+    let two = (usize)data[2] | (usize)data[3] << 8
+    let three = (usize)data[4] | (usize)data[5] << 8
+    if 6 + one + two + three >= data.length: error(corrupt, "damaged zstd Huffman jump table")
+    let segment = (out.length + 3) // 4
+    var readers: Backward[4]
+    readers[0] = try Backward.open(data[6..<6 + one])
+    readers[1] = try Backward.open(data[6 + one..<6 + one + two])
+    readers[2] = try Backward.open(data[6 + one + two..<6 + one + two + three])
+    readers[3] = try Backward.open(data[6 + one + two + three..])
+    let target = out.data
+    var at: usize = 0
+    # Each stream fills a quarter; the last may be up to 3 bytes shorter.
+    let last = out.length - 3 * segment
+    while at + 4 <= last and readers[0].roomy() and readers[1].roomy() and readers[2].roomy() and readers[3].roomy():
+        for lane in 0..<(usize)4: readers[lane].reload()
+        for step in 0..<(usize)4:
+            for lane in 0..<(usize)4:
+                let row = table[(usize)readers[lane].look(log)]
+                readers[lane].consumed +%= (u32)(row & 255)
+                target[lane * segment + at + step] = (u8)(row >> 8)
+        at += 4
+    for lane in 0..<(usize)4:
+        let end = segment if lane < 3 else last
+        try finish_stream(&readers[lane], target + lane * segment, at, end, table, log)
+
+## Decode symbols `at..<end` of a stream already begun into `target`, then check that the
+## stream ended exactly.
+func finish_stream(reader: Backward*, target: u8*, at: usize, end: usize, table: const u16*, log: u32) -> !:
+    var position = at
+    while position + 4 <= end and reader.roomy():
+        reader.reload()
+        for _ in 0..<(usize)4:
+            let row = table[(usize)reader.look(log)]
+            reader.consumed +%= (u32)(row & 255)
+            target[position] = (u8)(row >> 8)
+            position += 1
+    while position < end:
+        reader.reload()
+        let row = table[(usize)reader.look(log)]
+        reader.consumed +%= (u32)(row & 255)
+        target[position] = (u8)(row >> 8)
+        position += 1
+    reader.reload()
+    if not reader.finished(): error(corrupt, "damaged zstd Huffman stream")

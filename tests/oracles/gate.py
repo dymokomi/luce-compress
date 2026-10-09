@@ -19,6 +19,7 @@ from check_large import check as check_large
 from check_flate import check as check_flate
 from check_brotli import check as check_brotli
 from check_gzip import check as check_gzip
+from check_zstd import check as check_zstd
 
 ROOT = Path(__file__).resolve().parents[2]
 MODES = {f"native{i}": ["--native", "--opt", str(i)] for i in range(4)}
@@ -74,6 +75,7 @@ def main():
         check_flate(output / "flate-driver")
         check_brotli(output / "codec-tool")
         check_gzip(output / "codec-tool")
+        check_zstd(output / "codec-tool")
         print(f"PASS {mode} ({time.monotonic() - started:.1f}s)", flush=True)
 
 

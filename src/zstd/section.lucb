@@ -1,0 +1,339 @@
+#==============================================================================================
+#
+#   zstd/section - Writing a block's literals and sequences sections
+#
+#   DESCRIPTION:
+#       Literals are written raw, as one repeated byte, or Huffman-coded (one stream up
+#       to 255 literals, four beyond) when that is smaller; the tree goes as 4-bit
+#       weights or FSE-compressed ones, whichever is shorter. Sequences become codes and
+#       extra bits; each code kind is sent with the predefined table, one repeated code
+#       (RLE) or its own FSE table, by estimated size, and the bit stream is written
+#       from the last sequence back, as the decoder reads it from the end.
+#
+#==============================================================================================
+
+## A literals section header of `kind` (0 raw, 1 RLE) for `count` literals; its bytes.
+func write_plain_literals_header(out: u8[], kind: u32, count: usize) -> usize:
+    if count < 32:
+        out[0] = (u8)((count << 3) | (usize)kind)
+        return 1
+    if count < 4096:
+        let value = (count << 4) | (1 << 2) | (usize)kind
+        out[0] = (u8)value
+        out[1] = (u8)(value >> 8)
+        return 2
+    let value = (count << 4) | (3 << 2) | (usize)kind
+    out[0] = (u8)value
+    out[1] = (u8)(value >> 8)
+    out[2] = (u8)(value >> 16)
+    return 3
+
+## How the encoder sends one sequence code kind.
+struct KindChoice:
+    var mode: u32
+    var rle_code: u32
+    var shares: i16[64]
+    var symbols: u32
+    var log: u32
+
+extend Compressor:
+    # mark: Literals ==========================================================================
+
+    ## The literals section into `out`; its bytes.
+    func write_literals(out: u8[]) -> usize:
+        let count = self.literal_count
+        let literals = self.literals[..<count]
+        var counts: u32[256]
+        var top: usize = 0
+        var distinct: u32 = 0
+        for byte in literals:
+            if counts[(usize)byte] == 0: distinct += 1
+            counts[(usize)byte] += 1
+            if (usize)byte > top: top = (usize)byte
+        if distinct == 1 and count > 2:
+            let header = write_plain_literals_header(out, 1, count)
+            out[header] = literals[0]
+            return header + 1
+        if count >= 64 and distinct > 1:
+            let coded = self.write_huffman_literals(out, &counts[0], top + 1)
+            if coded > 0: return coded
+        let header = write_plain_literals_header(out, 0, count)
+        if count > 0: memory.copy(out[header..], literals, count)
+        return header + count
+
+    ## Huffman-coded literals into `out`, or 0 when that is not smaller than raw.
+    func write_huffman_literals(out: u8[], counts: const u32*, symbols: usize) -> usize:
+        let count = self.literal_count
+        var lengths: u8[256]
+        let most = huffman_lengths(counts, symbols, huffman_longest, &lengths[0])
+        var codes: u16[256]
+        huffman_codes(&lengths[0], symbols, most, &codes[0])
+        var bits: u64 = 0
+        for symbol in 0..<symbols: bits += (u64)counts[symbol] * (u64)lengths[symbol]
+        let single = count < 256
+        # The content goes after room for the longest header, then moves down.
+        let room: usize = 5
+        let tree = self.write_tree(out[room..], &lengths[0], symbols, most)
+        if tree == 0 or (usize)(bits >> 3) + tree + 16 >= count: return 0
+        var at = room + tree
+        if single:
+            at += write_stream(out[at..], self.literals[..<count], &codes[0], &lengths[0])
+        else:
+            let segment = (count + 3) // 4
+            let table = at
+            at += 6
+            for part in 0..<(usize)4:
+                let first = part * segment
+                let last = first + segment if part < 3 else count
+                let size = write_stream(out[at..], self.literals[first..<last], &codes[0], &lengths[0])
+                if part < 3:
+                    out[table + part * 2] = (u8)size
+                    out[table + part * 2 + 1] = (u8)(size >> 8)
+                at += size
+        let packed = at - room
+        if packed + 5 >= count: return 0
+        # The header: sizes of 10, 14 or 18 bits.
+        let largest = count if count > packed else packed
+        var header: usize = 3
+        var format: usize = 0 if single else 1
+        if largest >= 16384:
+            header = 5
+            format = 3
+        elif largest >= 1024:
+            header = 4
+            format = 2
+        let value = (u64)2 | (u64)format << 2 | (u64)count << 4 | (u64)packed << (u64)(4 + (header * 8 - 4) // 2)
+        for index in 0..<header: out[index] = (u8)(value >> (u64)(index * 8))
+        memory.move(out[header..], out[room..<at], packed)
+        return header + packed
+
+    ## The tree description of `lengths` (longest `most`) into `out`; its bytes, or 0
+    ## when it cannot be written.
+    func write_tree(out: u8[], lengths: const u8*, symbols: usize, most: u32) -> usize:
+        # Weights of every symbol but the last, whose weight the decoder infers.
+        let count = symbols - 1
+        var weights: u8[256]
+        var tally: u32[16]
+        var kinds: u32 = 0
+        for symbol in 0..<count:
+            let length = (u32)lengths[symbol]
+            weights[symbol] = (u8)(most + 1 - length) if length > 0 else 0
+            if tally[(usize)weights[symbol]] == 0: kinds += 1
+            tally[(usize)weights[symbol]] += 1
+        var best: usize = 0
+        if count >= 2 and kinds >= 2:
+            best = self.write_weights_fse(out, &weights[0], count, &tally[0], kinds)
+        let direct = 1 + (count + 1) // 2
+        if count <= 128 and (best == 0 or direct < best):
+            out[0] = (u8)(127 + count)
+            for index in 0..<(count + 1) // 2:
+                let high = weights[index * 2]
+                let low = weights[index * 2 + 1] if index * 2 + 1 < count else 0
+                out[1 + index] = (high << 4) | low
+            return direct
+        return best
+
+    ## Weights compressed with FSE into `out`; its bytes, or 0 when 127 or more.
+    func write_weights_fse(out: u8[], weights: const u8*, count: usize, tally: const u32*, kinds: u32) -> usize:
+        var shares: i16[16]
+        let log = table_log((u32)count, kinds, 6)
+        normalize(tally, 13, (u32)count, log, &shares[0])
+        var top: u32 = 13
+        while top > 0 and shares[(usize)top - 1] == 0: top -= 1
+        var header: u8[64]
+        let size = write_distribution(&shares[0], top, log, header)
+        if size >= 64: return 0
+        var coder = &self.coders[0].weights
+        coder.build(&shares[0], top, log)
+        # Room for the stream's worst case (6 bits a weight) before writing.
+        if 1 + size + (count * 6 + 2 * 6) // 8 + 16 >= out.length: return 0
+        memory.copy(out[1..], header[..<size], size)
+        var writer = Writer.into(out[1 + size..])
+        var lanes: u32[2]
+        lanes[(count - 1) & 1] = coder.start((usize)weights[count - 1])
+        lanes[(count - 2) & 1] = coder.start((usize)weights[count - 2])
+        var index = count - 2
+        while index > 0:
+            index -= 1
+            lanes[index & 1] = coder.put(&writer, lanes[index & 1], (usize)weights[index])
+            writer.flush()
+        coder.finish(&writer, lanes[1])
+        writer.flush()
+        coder.finish(&writer, lanes[0])
+        let total = 1 + size + writer.close()
+        if total > 128: return 0
+        out[0] = (u8)(total - 1)
+        return total
+
+    # mark: Sequences =========================================================================
+
+    ## The sequences section into `out`; its bytes.
+    func write_sequences(out: u8[]) -> usize:
+        let count = self.sequence_count
+        var at: usize = 0
+        if count < 128:
+            out[0] = (u8)count
+            at = 1
+        elif count < 0x7F00:
+            out[0] = (u8)((count >> 8) + 0x80)
+            out[1] = (u8)count
+            at = 2
+        else:
+            out[0] = 255
+            out[1] = (u8)(count - 0x7F00)
+            out[2] = (u8)((count - 0x7F00) >> 8)
+            at = 3
+        if count == 0: return at
+        self.code_sequences()
+        let literal_codes = self.codes[..<count]
+        let offset_codes = self.codes[count..<2 * count]
+        let match_codes = self.codes[2 * count..<3 * count]
+        let modes_at = at
+        at += 1
+        let literal = choose_kind(literal_codes, max_literals_code, literals_most_log, literals_default, literals_default_log)
+        at += write_kind(out[at..], &literal, &self.coders[0].literal_lengths)
+        let offset = choose_kind(offset_codes, max_offset_code, offset_most_log, offset_default, offset_default_log)
+        at += write_kind(out[at..], &offset, &self.coders[0].offsets)
+        let matched = choose_kind(match_codes, max_match_code, match_most_log, match_default, match_default_log)
+        at += write_kind(out[at..], &matched, &self.coders[0].match_lengths)
+        out[modes_at] = (u8)((literal.mode << 6) | (offset.mode << 4) | (matched.mode << 2))
+        return at + self.write_sequence_stream(out[at..], literal.mode == mode_rle, offset.mode == mode_rle, matched.mode == mode_rle)
+
+    ## Codes for the block's sequences: literals length, offset and match length codes
+    ## in thirds of `codes`, offset values (after repeat offsets) in `values`.
+    func code_sequences():
+        let count = self.sequence_count
+        var repeat0 = self.repeats[0]
+        var repeat1 = self.repeats[1]
+        var repeat2 = self.repeats[2]
+        for index in 0..<count:
+            let sequence = self.sequences[index]
+            let offset = sequence.offset
+            var value = offset + 3
+            if sequence.literals > 0:
+                if offset == repeat0:
+                    value = 1
+                elif offset == repeat1:
+                    value = 2
+                elif offset == repeat2:
+                    value = 3
+            elif offset == repeat1:
+                value = 1
+            elif offset == repeat2:
+                value = 2
+            elif offset == repeat0 - 1:
+                value = 3
+            # The decoder's update of the recent offsets.
+            if value > 3:
+                repeat2 = repeat1
+                repeat1 = repeat0
+                repeat0 = offset
+            else:
+                let pick = value - 1 + (1 if sequence.literals == 0 else 0)
+                if pick > 0:
+                    if pick != 1: repeat2 = repeat1
+                    repeat1 = repeat0
+                    repeat0 = offset
+            self.values[index] = value
+            self.codes[index] = (u8)literals_code(sequence.literals)
+            self.codes[count + index] = (u8)high_bit(value)
+            self.codes[2 * count + index] = (u8)match_code(sequence.length)
+        self.repeats = [repeat0, repeat1, repeat2]
+
+    ## The sequences' bit stream into `out`, from the last sequence back; its bytes.
+    func write_sequence_stream(out: u8[], literal_rle: bool, offset_rle: bool, match_rle: bool) -> usize:
+        let count = self.sequence_count
+        let coders = &self.coders[0]
+        var writer = Writer.into(out)
+        let last = count - 1
+        var literal_state: u32 = 0
+        var offset_state: u32 = 0
+        var match_state: u32 = 0
+        if not match_rle: match_state = coders.match_lengths.start((usize)self.codes[2 * count + last])
+        if not offset_rle: offset_state = coders.offsets.start((usize)self.codes[count + last])
+        if not literal_rle: literal_state = coders.literal_lengths.start((usize)self.codes[last])
+        self.put_extras(&writer, last)
+        var index = last
+        while index > 0:
+            index -= 1
+            if not offset_rle: offset_state = coders.offsets.put(&writer, offset_state, (usize)self.codes[count + index])
+            if not match_rle: match_state = coders.match_lengths.put(&writer, match_state, (usize)self.codes[2 * count + index])
+            if not literal_rle: literal_state = coders.literal_lengths.put(&writer, literal_state, (usize)self.codes[index])
+            writer.flush()
+            self.put_extras(&writer, index)
+        if not match_rle: coders.match_lengths.finish(&writer, match_state)
+        writer.flush()
+        if not offset_rle: coders.offsets.finish(&writer, offset_state)
+        writer.flush()
+        if not literal_rle: coders.literal_lengths.finish(&writer, literal_state)
+        return writer.close()
+
+    ## Sequence `index`'s extra bits: literals length, match length, then offset.
+    inline func put_extras(writer: Writer*, index: usize):
+        let count = self.sequence_count
+        let sequence = self.sequences[index]
+        let literal_code = (usize)self.codes[index]
+        let length_code = (usize)self.codes[2 * count + index]
+        writer.add((u64)(sequence.literals - literals_bases[literal_code]), (u32)literals_extras[literal_code])
+        writer.add((u64)(sequence.length - match_bases[length_code]), (u32)match_extras[length_code])
+        writer.flush()
+        let offset_code = (u32)self.codes[count + index]
+        writer.add((u64)self.values[index], offset_code)
+        writer.flush()
+
+## How to send `codes` (all at most `most_code`): RLE for one code, else the predefined
+## table or a new one of log at most `most_log`, whichever costs fewer bits.
+func choose_kind(codes: const u8[], most_code: u32, most_log: u32, defaults: const i16[], default_log: u32) -> KindChoice:
+    var choice: KindChoice
+    var counts: u32[64]
+    var distinct: u32 = 0
+    var top: u32 = 0
+    for code in codes:
+        if counts[(usize)code] == 0: distinct += 1
+        counts[(usize)code] += 1
+        if (u32)code + 1 > top: top = (u32)code + 1
+    if distinct == 1:
+        choice.mode = mode_rle
+        choice.rle_code = top - 1
+        return choice
+    let total = (u32)codes.length
+    choice.log = table_log(total, distinct, most_log)
+    normalize(&counts[0], top, total, choice.log, &choice.shares[0])
+    choice.symbols = top
+    var header: u8[128]
+    let header_bits = (u64)write_distribution(&choice.shares[0], top, choice.log, header) * 8 * 256
+    let own = (coded_cost(&counts[0], top, &choice.shares[0], top, choice.log) else 0xFFFFFFFFFFFF) + header_bits
+    choice.mode = mode_compressed
+    if let predefined = coded_cost(&counts[0], top, defaults.data, (u32)defaults.length, default_log):
+        if predefined <= own:
+            choice.mode = mode_predefined
+            for index in 0..<defaults.length: choice.shares[index] = defaults[index]
+            choice.symbols = (u32)defaults.length
+            choice.log = default_log
+    return choice
+
+## A kind's table into `out` (none for predefined) and its coder; the table's bytes.
+func write_kind(out: u8[], choice: const KindChoice*, coder: Coder*) -> usize:
+    if choice.mode == mode_rle:
+        out[0] = (u8)choice.rle_code
+        return 1
+    coder.build(&choice.shares[0], choice.symbols, choice.log)
+    if choice.mode == mode_predefined: return 0
+    return write_distribution(&choice.shares[0], choice.symbols, choice.log, out)
+
+## A literals stream: `literals` coded from the last back into `out`; its bytes.
+func write_stream(out: u8[], literals: const u8[], codes: const u16*, lengths: const u8*) -> usize:
+    var writer = Writer.into(out)
+    var index = literals.length
+    while index >= 4:
+        for _ in 0..<(usize)4:
+            index -= 1
+            let symbol = (usize)literals[index]
+            writer.add((u64)codes[symbol], (u32)lengths[symbol])
+        writer.flush()
+    while index > 0:
+        index -= 1
+        let symbol = (usize)literals[index]
+        writer.add((u64)codes[symbol], (u32)lengths[symbol])
+        writer.flush()
+    return writer.close()

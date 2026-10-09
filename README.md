@@ -10,6 +10,7 @@ allocation-failure tests.** Resource, larger-stream and seeded fuzz tests are in
 this is not yet the completed compression milestone or a full zlib replacement.
 Brotli decoding (RFC 7932) and the gzip format (RFC 1952), whole-buffer and
 incremental, serve WOFF2 fonts and HTTP `Content-Encoding: br` and `gzip`.
+Zstandard (RFC 8878), whole-buffer decoding and encoding, serves SPZ splat files.
 
 ## API
 
@@ -312,6 +313,41 @@ the file) and checked against RFC 7932's appendices.
 Luce programs use `compress.decode_brotli`, `decode_gzip` and `encode_gzip`, which
 return the owning `Data` result.
 
+## Zstandard (`zstd`)
+
+`import zstd` (Base) reads and writes Zstandard (RFC 8878), whole buffers:
+
+```luce
+import zstd
+
+let plain = try zstd.decode(frames, max_output = 1 << 28)   # heap; free it
+let used = try zstd.decode_into(frames, output)             # into a buffer you size
+let packed = try zstd.encode(data, level = 3)               # one frame; free it
+```
+
+- `decode(data, max_output = 64 MiB, allow_trailing = false) -> u8[]` decodes every
+  frame of `data` into one heap buffer (sized at once when the frames declare their
+  content sizes), passing over skippable frames. The whole format is read: raw, RLE
+  and compressed blocks; raw, RLE, Huffman and treeless literals in one or four
+  streams; predefined, RLE, FSE and repeat sequence tables; repeat offsets; windows
+  up to 2 GiB; the XXH64 checksum. A frame that needs a dictionary fails with
+  `unsupported`, damage with `corrupt`, output past the bound with `limit`; bytes
+  after the last frame fail unless `allow_trailing`.
+- `decode_into(data, output) -> usize` decodes into a buffer of known size (an SPZ
+  attribute stream's) and returns the bytes produced; more fails with `limit`.
+- `encode(data, level = 3) -> u8[]` writes one frame with its content size and
+  checksum, in 128 KiB blocks (a block that does not shrink is stored raw). Levels:
+  1–2 a greedy hash matcher, 3–5 a double hash (8- and 5-byte, as zstd's dfast), 6–9
+  a lazy matcher over hash chains of growing depth; 10–22 are level 9. Literals are
+  Huffman-coded (four streams past 255 literals, weights FSE-compressed when that is
+  shorter) and each sequence code kind takes the predefined, RLE or its own FSE
+  table, whichever the cost estimate favours. Ratios are within a few percent of the
+  `zstd` CLI at the same level.
+
+On the M4 Max, decoding runs at 540–850 MB/s (Huffman-heavy SPZ position streams to
+text) and level 3 encodes at 150–260 MB/s. Luce programs use `compress.decode_zstd`
+and `encode_zstd`.
+
 ## Bounds and errors
 
 For the whole-buffer API, input is limited to 1 GiB; the output bound defaults to
@@ -330,7 +366,7 @@ old and new allocations, encoding also uses a 65,536-entry native-size match tab
 and Luce byte copies add memory. Bound concurrency too. Do not use this API as an
 unbounded public decompression service.
 
-No preset dictionaries, Brotli encoder, asynchronous cancellation,
+No preset dictionaries, Brotli encoder, incremental Zstandard, asynchronous cancellation,
 dynamic-Huffman incremental encoder or tuning levels yet. The one-shot encoder still emits zlib,
 not raw streams. The image library is not migrated to this package in this slice.
 
@@ -348,6 +384,13 @@ whole and in seeded pieces, and checks that damaged streams are accepted exactly
 Google's decoder accepts them, with its bytes; `tests/check_gzip.py` does the same for
 gzip against an RFC 1952 reading over Python's zlib and its `gzip` module. Both run in
 every mode and under the sanitizers (CI installs the `brotli` module as an oracle).
+Zstandard: `tests/check_zstd.py` has the reference `zstd` CLI (skipped without it)
+compress seeded inputs at levels 1–19 and 22, with long windows, without checksums or
+content sizes and as several frames with skippable ones, which the codec decodes byte
+for byte; damaged frames fail exactly when the reference rejects them, with its bytes
+otherwise; and the codec's frames at levels 1–9 decode with the reference to their
+input. `src/zstd/vectors.lucb` (`tools/zstd_vectors.py`) holds the zstd repository's
+golden frames and reference frames as module tests.
 Locally, with Google's repository cloned to `../.donors/brotli`:
 
 ```sh

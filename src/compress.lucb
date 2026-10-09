@@ -8,6 +8,7 @@ import flate
 import segments
 import brotli
 import gzip
+import zstd
 
 pub let invalid = binary.invalid
 pub let corrupt = binary.corrupt
@@ -159,6 +160,19 @@ pub func decode_gzip(data: const u8[], max_output: i64 = 67108864) -> interop.Re
 pub func encode_gzip(data: const u8[], level: i64 = default_level) -> interop.Reference[Data]!:
     if level < 0 or level > 9: error(invalid, "compression level must be 0 through 9")
     let packed = try gzip.encode(data, (i32)level)
+    return try adopt_heap(packed, data.length)
+
+## Every Zstandard frame of `data` (RFC 8878) decoded, at most `max_output` bytes;
+## skippable frames are passed over and other bytes after the last frame fail.
+pub func decode_zstd(data: const u8[], max_output: i64 = 67108864) -> interop.Reference[Data]!:
+    let plain = try zstd.decode(data, try binary.checked_limit(max_output))
+    return try adopt_heap(plain, data.length)
+
+## `data` as one Zstandard frame at `level` (1 fastest through 9 smallest; 3 by
+## default), with its content size and checksum.
+pub func encode_zstd(data: const u8[], level: i64 = 3) -> interop.Reference[Data]!:
+    if level < 1 or level > 22: error(invalid, "zstd level must be 1 through 22")
+    let packed = try zstd.encode(data, (i32)level)
     return try adopt_heap(packed, data.length)
 
 ## An owned result of heap bytes, which it takes over.

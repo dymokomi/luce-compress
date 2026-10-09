@@ -1,17 +1,18 @@
 #==============================================================================================
 #
-#   codec_tool - Decode Brotli and gzip files for the conformance, fuzz and speed runners
+#   codec_tool - Brotli, gzip and Zstandard files for the conformance, fuzz and speed runners
 #
 #   DESCRIPTION:
 #       codec_tool batch LIST [LIMIT]
 #           Each line of LIST is `MODE INPUT [OUTPUT]`; for each, one line on standard
 #           output: `OK <consumed> <produced> <crc32>` or `ERR <code> <message>`. MODE is
-#           brotli or gzip (whole buffer), or brotli/IN/OUT or gzip/IN/OUT (incremental,
-#           IN input bytes and OUT output bytes per step). OUTPUT, when given, receives
-#           the decoded bytes. Output is limited to LIMIT bytes (256 MiB by default).
+#           brotli, gzip or zstd (whole buffer), brotli/IN/OUT or gzip/IN/OUT (incremental,
+#           IN input bytes and OUT output bytes per step), or zstd-encode/LEVEL (a zstd
+#           frame of the input). OUTPUT, when given, receives the result's bytes. Output
+#           is limited to LIMIT bytes (256 MiB by default).
 #       codec_tool time FORMAT INPUT ROUNDS
-#           The best of ROUNDS whole-buffer decodes of INPUT (brotli or gzip): bytes out and
-#           microseconds.
+#           The best of ROUNDS whole-buffer runs of INPUT in FORMAT (brotli, gzip, zstd or
+#           zstd-encode/LEVEL): bytes out and microseconds.
 #
 #==============================================================================================
 from luce_std import files
@@ -23,6 +24,7 @@ import binary
 import brotli
 import flate
 import gzip
+import zstd
 
 ## The default output limit.
 let default_most: usize = 268435456
@@ -56,7 +58,14 @@ func run(mode: str, data: const u8[], most: usize) -> Decoded!:
         if parts[0] == "gzip":
             let output = try gzip.decode(data, most)
             return Decoded(consumed = data.length, output = output)
+        if parts[0] == "zstd":
+            let output = try zstd.decode(data, most)
+            return Decoded(consumed = data.length, output = output)
         error(binary.invalid, "unknown mode")
+    if parts.length == 2 and parts[0] == "zstd-encode":
+        let level = (i32)(strings.parse_u64(parts[1]) else 3)
+        let output = try zstd.encode(data, level)
+        return Decoded(consumed = data.length, output = output)
     let piece = (usize)(strings.parse_u64(parts[1]) else 1)
     let room = (usize)(strings.parse_u64(parts[2]) else 1)
     if parts[0] == "brotli":

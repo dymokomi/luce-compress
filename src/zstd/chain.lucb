@@ -1,0 +1,81 @@
+#==============================================================================================
+#
+#   zstd/chain - The lazy match finder over hash chains
+#
+#   DESCRIPTION:
+#       Every position is linked to the previous one with the same 5-byte hash (`heads`
+#       holds each hash's latest, `links` the chain, a ring of 2^chain_log positions).
+#       A search walks a chain to the level's depth for the longest match. A match is
+#       not taken at once: while the next position (up to `lazy` of them) offers one
+#       worth more, judged by length against the bits its offset costs, the current
+#       byte becomes a literal instead.
+#
+#==============================================================================================
+
+extend Compressor:
+    ## Link every position from `self.linked` up to `at` into the chains.
+    inline func link_to(at: usize):
+        let base = self.input.data
+        let heads = self.hashes.data
+        let links = self.links.data
+        let bits = self.level.hash_log
+        let mask = ((usize)1 << self.level.chain_log) - 1
+        while self.linked < at:
+            let slot = hash5(memory.read[u64](base + self.linked), bits)
+            links[self.linked & mask] = heads[slot]
+            heads[slot] = (u32)self.linked
+            self.linked += 1
+
+    ## The longest match at `at` along its chain (and the most recent offset).
+    func search(at: usize, end: usize) -> Found:
+        self.link_to(at)
+        let base = self.input.data
+        let links = self.links.data
+        let mask = ((usize)1 << self.level.chain_log) - 1
+        var best = self.repeat_at(at, end)
+        if at + best.length >= end: return best
+        var candidate = (usize)self.hashes[hash5(memory.read[u64](base + at), self.level.hash_log)]
+        var tries = self.level.depth
+        while tries > 0 and self.reachable(candidate, at) and at - candidate <= mask:
+            # The byte that would make a longer match is checked first.
+            if base[candidate + best.length] == base[at + best.length] and memory.read[u32](base + candidate) == memory.read[u32](base + at):
+                let length = 4 + count_match(base, candidate + 4, at + 4, end)
+                if length > best.length:
+                    best = Found(length, at - candidate)
+                    if at + length >= end: break
+            candidate = (usize)links[candidate & mask]
+            tries -= 1
+        return best
+
+    ## Sequences of the input `start..<end` by the lazy finder.
+    func find_lazy(start: usize, end: usize):
+        let base = self.input.data
+        var at = start
+        var anchor = start
+        while at + 8 <= end:
+            var found = self.search(at, end)
+            if found.length < 4:
+                at += 1 + ((at - anchor) >> 8)
+                continue
+            var first = at
+            var steps: u32 = 0
+            while steps < self.level.lazy and first + 9 <= end:
+                let next = self.search(first + 1, end)
+                if next.length < 4 or worth(next) <= worth(found) + 4: break
+                found = next
+                first += 1
+                steps += 1
+            # Extend backward over literals that also match.
+            var source = first - found.offset
+            while first > anchor and source > 0 and base[first - 1] == base[source - 1]:
+                first -= 1
+                source -= 1
+                found.length += 1
+            self.emit(anchor, first, found)
+            at = first + found.length
+            anchor = at
+        self.finish(anchor, end)
+
+## What a match is worth: four per byte, less the bits of its offset.
+inline func worth(found: Found) -> i64:
+    return (i64)found.length * 4 - (i64)high_bit((u32)found.offset)

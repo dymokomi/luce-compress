@@ -4,9 +4,9 @@ def package "luce-compress" {
     str version = "0.9.0"
     str kind = "package"
     str language = "luce-base"
-    str description = "Native Luce Base compression with an owning Luce API: zlib, DEFLATE, gzip, Brotli decoding, LZ4 and ZIP. MIT OR Apache-2.0 (see provenance for the retained MIT notice). No C codec, foreign library or subprocess."
+    str description = "Native Luce Base compression with an owning Luce API: zlib, DEFLATE, gzip, Zstandard, Brotli decoding, LZ4 and ZIP. MIT OR Apache-2.0 (see provenance for the retained MIT notice). No C codec, foreign library or subprocess."
     str readme = "README.md"
-    str[] public = ["compress", "native", "flate", "lz4", "zip", "brotli", "gzip"]
+    str[] public = ["compress", "native", "flate", "lz4", "zip", "brotli", "gzip", "zstd"]
 
     def dependency "luce-std" {
         str owner = "dymokomi"

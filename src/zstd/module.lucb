@@ -1,0 +1,123 @@
+#==============================================================================================
+#
+#   zstd - Zstandard (RFC 8878): whole-buffer decoding and encoding
+#
+#   DESCRIPTION:
+#       `decode` reads every frame of a buffer, skippable frames included, into one
+#       heap buffer; `decode_into` reads them into a caller's buffer of known size.
+#       The whole format is read: raw, RLE and compressed blocks, raw, RLE, Huffman and
+#       treeless literals in one or four streams, FSE sequence tables in predefined,
+#       RLE, compressed and repeat modes, repeat offsets and the XXH64 content checksum.
+#       Frames that need a dictionary are refused as unsupported. Damaged input fails
+#       with `corrupt` and output past a limit with `limit`, never a trap.
+#
+#       `encode` writes one frame with its content size and checksum: a hash matcher
+#       chosen by level (greedy, double-hash or lazy over hash chains) finds the
+#       sequences of each 128 KiB block, Huffman codes its literals and FSE codes its
+#       sequences in whichever table mode is smallest, and a block that does not shrink
+#       is stored raw.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb       the API and the output buffer
+#       xxhash.lucb       XXH64, the content checksum
+#       bits.lucb         the backward bit reader and the forward bit writer
+#       fse.lucb          FSE distributions, decoding and encoding tables
+#       huffman.lucb      Huffman tables and literal streams, decoding
+#       literals.lucb     the literals section
+#       sequences.lucb    the sequences section and sequence execution
+#       frame.lucb        frame headers, blocks and frames
+#       codes.lucb        the format's length and offset codes
+#       match.lucb        the encoder's greedy and double-hash match finders
+#       chain.lucb        the lazy match finder over hash chains
+#       entropy.lucb      Huffman code lengths and FSE distributions for the encoder
+#       block.lucb        the compressor and its blocks
+#       section.lucb      writing the literals and sequences sections
+#       encoder.lucb      writing a frame
+#       tests.lucb        the module's tests
+#       vectors.lucb      reference and crafted frames
+#
+#==============================================================================================
+import memory
+import binary
+from binary import invalid, corrupt, limit, unsupported, closed
+
+## The decoders' default output limit: 64 MiB.
+pub let default_limit: usize = 67108864
+
+## Bytes kept writable past a growable output's end, so copies may overrun by a word.
+let slack: usize = 32
+
+# mark: The API ===============================================================================
+
+## Every frame of `data` decoded into a heap buffer the caller frees (`free(x) in
+## memory.heap`); at most `max_output` bytes, or the call fails with `limit`. Bytes after
+## the last frame that do not begin another fail unless `allow_trailing`.
+pub func decode(data: const u8[], max_output: usize = default_limit, allow_trailing: bool = false) -> u8[]!:
+    var output = Output.growable(max_output)
+    errdefer output.close()
+    # Frames that declare their sizes are decoded into one allocation.
+    if let total = content_size(data):
+        if total <= (u64)max_output: try output.reserve((usize)total)
+    try decode_frames(data, &output, allow_trailing)
+    let result = try new u8[output.used] --- in memory.heap
+    if output.used > 0: memory.copy(result, output.data[..<output.used], output.used)
+    output.close()
+    return result
+
+## Every frame of `data` decoded into `output`; the bytes produced. More output than it
+## holds fails with `limit`, bytes after the last frame with `corrupt`.
+pub func decode_into(data: const u8[], output: u8[]) -> usize!:
+    var target = Output.fixed(output)
+    try decode_frames(data, &target, false)
+    return target.used
+
+## `data` as one Zstandard frame at `level` (1 fastest .. 9 smallest; 3 by default),
+## with its content size and checksum, in a heap buffer the caller frees.
+pub func encode(data: const u8[], level: i32 = 3) -> u8[]!:
+    if level < 1 or level > 22: error(invalid, "zstd level must be 1 through 22")
+    if data.length > binary.maximum: error(limit, "input exceeds 1 GiB")
+    return try encode_frame(data, level)
+
+# mark: Output ================================================================================
+
+## Where decoded bytes go: a caller's fixed buffer, or a heap buffer grown up to a limit.
+## `data` may extend past `limit` by `slack` bytes for overrunning copies.
+struct Output:
+    var data: u8[]
+    var used: usize
+    var limit: usize
+    var grows: bool
+
+    ## A heap output of at most `most` bytes.
+    static func growable(most: usize) -> Output:
+        var made: Output
+        made.limit = most
+        made.grows = true
+        return made
+
+    ## The caller's buffer.
+    static func fixed(buffer: u8[]) -> Output:
+        var made: Output
+        made.data = buffer
+        made.limit = buffer.length
+        return made
+
+    ## Make room for `count` more bytes plus the slack, when it can grow: fails with
+    ## `limit` past the limit. A fixed output is checked by its writers instead.
+    func reserve(count: usize) -> !:
+        if not self.grows: return
+        let wanted = self.used + (count if count < self.limit - self.used else self.limit - self.used)
+        if wanted + slack <= self.data.length: return
+        var size = self.data.length * 2
+        if size < wanted + slack: size = wanted + slack
+        if size > self.limit + slack: size = self.limit + slack
+        let grown = try new u8[size] --- in memory.heap
+        if self.used > 0: memory.copy(grown, self.data[..<self.used], self.used)
+        if self.data.length > 0: free(self.data) in memory.heap
+        self.data = grown
+
+    func close():
+        if self.grows and self.data.length > 0: free(self.data) in memory.heap
+        var empty: u8[]
+        self.data = empty

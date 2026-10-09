@@ -1,0 +1,207 @@
+#==============================================================================================
+#
+#   zstd/match - The encoder's match finders
+#
+#   DESCRIPTION:
+#       A block's input becomes sequences: literals, then a match at an offset back. The
+#       finders keep hash tables of input positions (absolute, the frame being one
+#       input), so a match may reach into earlier blocks, up to the window.
+#
+#       - `greedy` (levels 1 and 2): one table of 5-byte hashes; the first match found
+#         is taken, and over input that does not match the step grows.
+#       - `double` (levels 3 to 5): a table of 8-byte hashes beside the 5-byte one; a
+#         long match is preferred, and a short one is tried against a long one a byte
+#         later (as zstd's dfast strategy does).
+#       - `lazy` (levels 6 to 9, chain.lucb): hash chains searched to a depth, and a
+#         match deferred while the next position offers a better one.
+#
+#       Each finder first tries the most recent offset a byte ahead, which costs the
+#       fewest bits to send.
+#
+#==============================================================================================
+
+## A match found: its length (0 for none) and offset.
+struct Found:
+    var length: usize
+    var offset: usize
+
+## One sequence of a block: literals, then a match.
+struct Sequence:
+    var literals: u32
+    var length: u32
+    var offset: u32
+
+## The parameters of a level.
+struct Level:
+    var strategy: u32
+    var window_log: u32
+    var hash_log: u32
+    var long_log: u32
+    var chain_log: u32
+    var depth: u32
+    var lazy: u32
+
+let strategy_greedy: u32 = 0
+let strategy_double: u32 = 1
+let strategy_lazy: u32 = 2
+
+## The parameters of `level` (levels past 9 are 9).
+func level_parameters(level: i32) -> Level:
+    if level <= 1: return Level(strategy_greedy, 21, 15, 0, 0, 0, 0)
+    if level == 2: return Level(strategy_greedy, 21, 16, 0, 0, 0, 0)
+    if level == 3: return Level(strategy_double, 21, 16, 17, 0, 0, 0)
+    if level == 4: return Level(strategy_double, 22, 17, 18, 0, 0, 0)
+    if level == 5: return Level(strategy_double, 22, 18, 19, 0, 0, 0)
+    if level == 6: return Level(strategy_lazy, 22, 17, 0, 17, 8, 1)
+    if level == 7: return Level(strategy_lazy, 23, 18, 0, 18, 12, 1)
+    if level == 8: return Level(strategy_lazy, 23, 18, 0, 18, 16, 2)
+    return Level(strategy_lazy, 23, 19, 0, 19, 32, 2)
+
+inline func hash5(value: u64, bits: u32) -> usize:
+    return (usize)(((value << 24) *% 889523592379) >> (u64)(64 - bits))
+
+inline func hash8(value: u64, bits: u32) -> usize:
+    return (usize)((value *% 0xCF1BBCDCB7A56463) >> (u64)(64 - bits))
+
+## How many bytes at `a` and `b` (b after a) agree, reading no further than `end`.
+inline func count_match(base: const u8*, a: usize, b: usize, end: usize) -> usize:
+    var length: usize = 0
+    while b + length + 8 <= end:
+        let difference = memory.read[u64](base + a + length) ^ memory.read[u64](base + b + length)
+        if difference != 0:
+            var bits = difference
+            while bits & 255 == 0:
+                bits >>= 8
+                length += 1
+            return length
+        length += 8
+    while b + length < end and base[a + length] == base[b + length]:
+        length += 1
+    return length
+
+extend Compressor:
+    ## Note a sequence: the literals from `anchor` to `at`, then `found`.
+    inline func emit(anchor: usize, at: usize, found: Found):
+        let count = at - anchor
+        if count > 0: memory.copy(self.literals[self.literal_count..], self.input[anchor..<at], count)
+        self.literal_count += count
+        self.sequences[self.sequence_count] = Sequence((u32)count, (u32)found.length, (u32)found.offset)
+        self.sequence_count += 1
+        self.recent1 = self.recent0
+        self.recent0 = found.offset
+
+    ## The most recent offset's match at `at`, at least 4 bytes, or none.
+    inline func repeat_at(at: usize, end: usize) -> Found:
+        var found: Found
+        let offset = self.recent0
+        if offset == 0 or offset > at: return found
+        let base = self.input.data
+        if memory.read[u32](base + at) != memory.read[u32](base + at - offset): return found
+        found.length = 4 + count_match(base, at - offset + 4, at + 4, end)
+        found.offset = offset
+        return found
+
+    ## Whether `candidate` is a usable earlier position for `at`.
+    inline func reachable(candidate: usize, at: usize) -> bool:
+        return candidate < at and at - candidate <= self.window
+
+    ## Sequences of the input `start..<end` by the greedy finder.
+    func find_greedy(start: usize, end: usize):
+        let base = self.input.data
+        let table = self.hashes.data
+        let bits = self.level.hash_log
+        var at = start
+        var anchor = start
+        while at + 8 <= end:
+            let repeat = self.repeat_at(at + 1, end)
+            if repeat.length > 0:
+                self.emit(anchor, at + 1, repeat)
+                at += 1 + repeat.length
+                anchor = at
+                continue
+            let slot = hash5(memory.read[u64](base + at), bits)
+            let candidate = (usize)table[slot]
+            table[slot] = (u32)at
+            if self.reachable(candidate, at) and memory.read[u32](base + candidate) == memory.read[u32](base + at):
+                var found = Found(4 + count_match(base, candidate + 4, at + 4, end), at - candidate)
+                # Extend backward over literals that also match.
+                var first = at
+                var source = candidate
+                while first > anchor and source > 0 and base[first - 1] == base[source - 1]:
+                    first -= 1
+                    source -= 1
+                    found.length += 1
+                self.emit(anchor, first, found)
+                at = first + found.length
+                anchor = at
+                # Hash a position inside the match for the next search.
+                if at + 8 <= end: table[hash5(memory.read[u64](base + at - 2), bits)] = (u32)(at - 2)
+                continue
+            at += 1 + ((at - anchor) >> 6)
+        self.finish(anchor, end)
+
+    ## Sequences of the input `start..<end` by the double-hash finder.
+    func find_double(start: usize, end: usize):
+        let base = self.input.data
+        let short = self.hashes.data
+        let long = self.long_hashes.data
+        let short_bits = self.level.hash_log
+        let long_bits = self.level.long_log
+        var at = start
+        var anchor = start
+        while at + 8 <= end:
+            let repeat = self.repeat_at(at + 1, end)
+            if repeat.length > 0:
+                self.emit(anchor, at + 1, repeat)
+                at += 1 + repeat.length
+                anchor = at
+                continue
+            let word = memory.read[u64](base + at)
+            let long_slot = hash8(word, long_bits)
+            let short_slot = hash5(word, short_bits)
+            let long_candidate = (usize)long[long_slot]
+            let short_candidate = (usize)short[short_slot]
+            long[long_slot] = (u32)at
+            short[short_slot] = (u32)at
+            var found: Found
+            var first = at
+            if self.reachable(long_candidate, at) and memory.read[u64](base + long_candidate) == word:
+                found = Found(8 + count_match(base, long_candidate + 8, at + 8, end), at - long_candidate)
+            elif self.reachable(short_candidate, at) and memory.read[u32](base + short_candidate) == (u32)word:
+                found = Found(4 + count_match(base, short_candidate + 4, at + 4, end), at - short_candidate)
+                # A long match a byte later wins over a short one here.
+                if at + 9 <= end:
+                    let next_word = memory.read[u64](base + at + 1)
+                    let next_slot = hash8(next_word, long_bits)
+                    let next_candidate = (usize)long[next_slot]
+                    long[next_slot] = (u32)(at + 1)
+                    if self.reachable(next_candidate, at + 1) and memory.read[u64](base + next_candidate) == next_word:
+                        let next_length = 8 + count_match(base, next_candidate + 8, at + 9, end)
+                        if next_length > found.length:
+                            found = Found(next_length, at + 1 - next_candidate)
+                            first = at + 1
+            else:
+                at += 1 + ((at - anchor) >> 7)
+                continue
+            # Extend backward over literals that also match.
+            var source = first - found.offset
+            while first > anchor and source > 0 and base[first - 1] == base[source - 1]:
+                first -= 1
+                source -= 1
+                found.length += 1
+            self.emit(anchor, first, found)
+            at = first + found.length
+            anchor = at
+            # Hash positions inside the match for the next searches.
+            if at + 8 <= end:
+                let inside = at - 2
+                let value = memory.read[u64](base + inside)
+                long[hash8(value, long_bits)] = (u32)inside
+                short[hash5(value, short_bits)] = (u32)inside
+        self.finish(anchor, end)
+
+    ## The literals from `anchor` to the block's end.
+    func finish(anchor: usize, end: usize):
+        let count = end - anchor
+        if count > 0: memory.copy(self.literals[self.literal_count..], self.input[anchor..<end], count)
+        self.literal_count += count

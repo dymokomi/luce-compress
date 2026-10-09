@@ -1,0 +1,146 @@
+#==============================================================================================
+#
+#   zstd/entropy - Huffman code lengths and FSE distributions for the encoder
+#
+#   DESCRIPTION:
+#       Literals get a Huffman code no longer than 11 bits: lengths come from the
+#       two-queue construction over symbols sorted by count, and when the longest is
+#       too long the counts are flattened (halved, kept nonzero) and the code rebuilt.
+#       Lengths become zstd's weights and canonical codes as the decoder derives them.
+#
+#       An FSE distribution scales counts to 2^log shares, every present symbol at
+#       least one; the rounding left over goes to or comes from the largest shares.
+#       Costs are estimated in 1/256 bits from a piecewise-linear log2.
+#
+#==============================================================================================
+
+## The longest Huffman code the encoder writes.
+let huffman_longest: u32 = 11
+
+## log2(`value`) (> 0) in 1/256 units, linear between powers of two.
+inline func log2_fixed(value: u32) -> u32:
+    let bit = high_bit(value)
+    let fraction = ((value - ((u32)1 << bit)) << 8) >> bit if bit <= 23 else ((value - ((u32)1 << bit)) >> (bit - 8))
+    return (bit << 8) + fraction
+
+## Code lengths for `counts` (`symbols` of them, at least two nonzero) into `lengths`,
+## none longer than `longest`; the longest.
+func huffman_lengths(counts: const u32*, symbols: usize, longest: u32, lengths: u8*) -> u32:
+    var weights: u32[256]
+    for symbol in 0..<symbols: weights[symbol] = counts[symbol]
+    while true:
+        let most = huffman_build(&weights[0], symbols, lengths)
+        if most <= longest: return most
+        for symbol in 0..<symbols:
+            if weights[symbol] > 0: weights[symbol] = (weights[symbol] >> 1) | 1
+
+## One Huffman construction over `counts`; the longest length.
+func huffman_build(counts: const u32*, symbols: usize, lengths: u8*) -> u32:
+    # Leaves sorted by count (insertion sort: at most 256), then the two-queue merge.
+    var order: u16[256]
+    var leaves: usize = 0
+    for symbol in 0..<symbols:
+        lengths[symbol] = 0
+        if counts[symbol] == 0: continue
+        var at = leaves
+        while at > 0 and counts[(usize)order[at - 1]] > counts[symbol]:
+            order[at] = order[at - 1]
+            at -= 1
+        order[at] = (u16)symbol
+        leaves += 1
+    var weight: u64[512]
+    var parent: u16[512]
+    for index in 0..<leaves: weight[index] = (u64)counts[(usize)order[index]]
+    var next_leaf: usize = 0
+    var next_node = leaves
+    var made = leaves
+    while made < 2 * leaves - 1:
+        var pair: usize[2]
+        for side in 0..<(usize)2:
+            if next_leaf < leaves and (next_node >= made or weight[next_leaf] <= weight[next_node]):
+                pair[side] = next_leaf
+                next_leaf += 1
+            else:
+                pair[side] = next_node
+                next_node += 1
+        weight[made] = weight[pair[0]] + weight[pair[1]]
+        parent[pair[0]] = (u16)made
+        parent[pair[1]] = (u16)made
+        made += 1
+    # Depths from the root down.
+    var depth: u8[512]
+    var most: u32 = 0
+    var node = made - 1
+    while node > 0:
+        node -= 1
+        depth[node] = depth[(usize)parent[node]] + 1
+        if node < leaves:
+            lengths[(usize)order[node]] = depth[node]
+            if (u32)depth[node] > most: most = (u32)depth[node]
+    return most
+
+## Canonical codes for `lengths` (longest `most`), as the decoder derives them from
+## weights: lighter weights first, symbols in order within a weight.
+func huffman_codes(lengths: const u8*, symbols: usize, most: u32, codes: u16*):
+    var ranks: u32[16]
+    for symbol in 0..<symbols:
+        if lengths[symbol] > 0: ranks[(usize)(most + 1 - (u32)lengths[symbol])] += 1
+    var start: u32[16]
+    var next: u32 = 0
+    for weight in 1..<most + 1:
+        start[(usize)weight] = next
+        next += ranks[(usize)weight] << (weight - 1)
+    for symbol in 0..<symbols:
+        let length = (u32)lengths[symbol]
+        if length == 0: continue
+        let weight = most + 1 - length
+        codes[symbol] = (u16)(start[(usize)weight] >> (weight - 1))
+        start[(usize)weight] += (u32)1 << (weight - 1)
+
+## The table log for `total` samples of `distinct` symbols, at most `most_log`.
+func table_log(total: u32, distinct: u32, most_log: u32) -> u32:
+    var log = high_bit(total) + 1
+    if log > most_log: log = most_log
+    if log < 5: log = 5
+    while ((u32)1 << log) < distinct * 2 and log < most_log: log += 1
+    return log
+
+## Scale `counts` (`symbols` of them, summing to `total`) to shares of 2^log in
+## `shares`, each present symbol at least one.
+func normalize(counts: const u32*, symbols: u32, total: u32, log: u32, shares: i16*):
+    let size = (i64)1 << log
+    var assigned: i64 = 0
+    var largest: usize = 0
+    for symbol in 0..<(usize)symbols:
+        let count = (i64)counts[symbol]
+        if count == 0:
+            shares[symbol] = 0
+            continue
+        var share = (count * size + (i64)total // 2) // (i64)total
+        if share == 0: share = 1
+        shares[symbol] = (i16)share
+        assigned += share
+        if count > (i64)counts[largest]: largest = symbol
+    var left = size - assigned
+    if left > 0: shares[largest] += (i16)left
+    while left < 0:
+        # Take one from the largest share above one.
+        var pick: usize = 0
+        for symbol in 0..<(usize)symbols:
+            if shares[symbol] > shares[pick]: pick = symbol
+        shares[pick] -= 1
+        left += 1
+
+## The cost in 1/256 bits of `counts` coded with `shares` of 2^log; none when a
+## present symbol has no share.
+func coded_cost(counts: const u32*, symbols: u32, shares: const i16*, share_symbols: u32, log: u32) -> u64?:
+    var cost: u64 = 0
+    for symbol in 0..<symbols:
+        let count = counts[(usize)symbol]
+        if count == 0: continue
+        if symbol >= share_symbols: return none
+        let share = (i32)shares[(usize)symbol]
+        if share == 0: return none
+        let bits = (log << 8) - (0 if share < 0 else log2_fixed((u32)share))
+        cost += (u64)count * (u64)bits
+    return cost

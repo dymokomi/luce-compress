@@ -1,0 +1,131 @@
+#==============================================================================================
+#
+#   zstd/block - Writing blocks
+#
+#   DESCRIPTION:
+#       A `Compressor` holds an input's match finder state and a block's sequences and
+#       literals. `block` finds the sequences of 128 KiB of input, writes the compressed
+#       block into its scratch and keeps it when it is smaller than the input; otherwise
+#       the block is stored raw, or as one repeated byte. The recent offsets the decoder
+#       will keep are tracked here exactly, so matches at them are sent as repeat codes;
+#       a block stored raw leaves them as they were.
+#
+#       The sections themselves are written by section.lucb.
+#
+#==============================================================================================
+
+## The encoder's FSE tables: one per sequence code kind and one for Huffman weights.
+struct Coders:
+    var literal_lengths: Coder
+    var offsets: Coder
+    var match_lengths: Coder
+    var weights: Coder
+
+## The most sequences a block can hold: every match at least 4 bytes.
+let most_sequences: usize = 131072 // 4 + 1
+
+struct Compressor:
+    var input: const u8[]
+    var level: Level
+    var window_log: u32
+    var window: usize
+    # The match finders' tables (match.lucb, chain.lucb).
+    var hashes: u32[]
+    var long_hashes: u32[]
+    var links: u32[]
+    var linked: usize
+    var recent0: usize
+    var recent1: usize
+    # The block being written: its literals and sequences.
+    var literals: u8[]
+    var literal_count: usize
+    var sequences: Sequence[]
+    var sequence_count: usize
+    # The decoder's recent offsets as of the block's start.
+    var repeats: u32[3]
+    # Per-sequence codes, extra-bit values, and the block's scratch output.
+    var codes: u8[]
+    var values: u32[]
+    var scratch: u8[]
+    var coders: Coders[]
+
+    ## A compressor of `input` at `level`.
+    static func open(input: const u8[], level: i32) -> Compressor!:
+        var made: Compressor
+        errdefer made.close()
+        made.input = input
+        made.level = level_parameters(level)
+        made.window_log = made.level.window_log
+        made.window = (usize)1 << made.window_log
+        made.repeats = [1, 4, 8]
+        made.hashes = try new u32[(usize)1 << made.level.hash_log] in memory.heap
+        if made.level.long_log > 0: made.long_hashes = try new u32[(usize)1 << made.level.long_log] in memory.heap
+        if made.level.chain_log > 0: made.links = try new u32[(usize)1 << made.level.chain_log] in memory.heap
+        made.literals = try new u8[block_largest + 64] --- in memory.heap
+        made.sequences = try new Sequence[most_sequences] --- in memory.heap
+        made.codes = try new u8[most_sequences * 3] --- in memory.heap
+        made.values = try new u32[most_sequences] --- in memory.heap
+        made.scratch = try new u8[block_largest * 6 + 4096] --- in memory.heap
+        made.coders = try new Coders[1] in memory.heap
+        return made
+
+    func close():
+        if self.hashes.length > 0: free(self.hashes) in memory.heap
+        if self.long_hashes.length > 0: free(self.long_hashes) in memory.heap
+        if self.links.length > 0: free(self.links) in memory.heap
+        if self.literals.length > 0: free(self.literals) in memory.heap
+        if self.sequences.length > 0: free(self.sequences) in memory.heap
+        if self.codes.length > 0: free(self.codes) in memory.heap
+        if self.values.length > 0: free(self.values) in memory.heap
+        if self.scratch.length > 0: free(self.scratch) in memory.heap
+        if self.coders.length > 0: free(self.coders) in memory.heap
+        var empty: Compressor
+        empty.input = self.input
+        self = empty
+
+    ## Write the block of input bytes `start..<end` into `out`; its bytes.
+    func block(start: usize, end: usize, last: bool, out: u8[]) -> usize!:
+        let size = end - start
+        let data = self.input[start..<end]
+        if size > 1 and repeated(data):
+            write_block_header(out, size, 1, last)
+            out[3] = data[0]
+            return 4
+        if size >= 16:
+            self.literal_count = 0
+            self.sequence_count = 0
+            if self.level.strategy == strategy_greedy:
+                self.find_greedy(start, end)
+            elif self.level.strategy == strategy_double:
+                self.find_double(start, end)
+            else:
+                self.find_lazy(start, end)
+            let saved = self.repeats
+            let packed = self.write_sections()
+            if packed < size:
+                write_block_header(out, packed, 2, last)
+                memory.copy(out[3..], self.scratch[..<packed], packed)
+                return 3 + packed
+            self.repeats = saved
+        write_block_header(out, size, 0, last)
+        if size > 0: memory.copy(out[3..], data, size)
+        return 3 + size
+
+    ## The block's literals and sequences sections into the scratch; their bytes.
+    func write_sections() -> usize:
+        let literals = self.write_literals(self.scratch)
+        return literals + self.write_sequences(self.scratch[literals..])
+
+## Whether every byte of `data` (nonempty) is the first.
+func repeated(data: const u8[]) -> bool:
+    let first = data[0]
+    for byte in data:
+        if byte != first: return false
+    return true
+
+## A block header: `size`, `kind` (0 raw, 1 RLE, 2 compressed) and the last flag.
+func write_block_header(out: u8[], size: usize, kind: usize, last: bool):
+    let header = (size << 3) | (kind << 1) | (1 if last else 0)
+    out[0] = (u8)header
+    out[1] = (u8)(header >> 8)
+    out[2] = (u8)(header >> 16)

@@ -1,0 +1,206 @@
+#==============================================================================================
+#
+#   zstd/tests - The module's tests
+#
+#   DESCRIPTION:
+#       Hand-made frames (empty, raw, RLE, skippable, damaged headers), the predefined
+#       tables against the format's Appendix A, encoder round trips at every level over
+#       text, records, runs and noise of many sizes, and every truncation and many
+#       corruptions of frames failing cleanly; vectors.lucb adds reference frames.
+#
+#==============================================================================================
+
+# mark: Helpers ===============================================================================
+
+## CRC-32 (ISO 3309), bit by bit: the vectors' check, kept apart from the codecs.
+func checksum(data: const u8[]) -> u32:
+    var crc: u32 = 0xFFFFFFFF
+    for byte in data:
+        crc ^= (u32)byte
+        for _ in 0..<8:
+            crc = (crc >> 1) ^ (0xEDB88320 if crc & 1 != 0 else 0)
+    return ~crc
+
+## Check a frame: decoded whole and into an exact buffer, to `size` bytes of CRC-32
+## `crc`; one byte less of room fails with `limit`.
+func check_vector(frame: const u8[], size: usize, crc: u32) -> !:
+    let whole = try decode(frame)
+    assert(whole.length == size and checksum(whole) == crc)
+    free(whole) in memory.heap
+    var into = try new u8[size] in memory.heap
+    defer free(into) in memory.heap
+    assert(try decode_into(frame, into) == size and checksum(into) == crc)
+    if size > 0:
+        assert(failure_of(frame, size - 1) == limit)
+
+## The failure code of decoding `frame` whole, or `invalid` when it decodes.
+func failure_of(frame: const u8[], max_output: usize = default_limit) -> ErrorCode:
+    let output = decode(frame, max_output) catch failure:
+        return failure.code
+    free(output) in memory.heap
+    return invalid
+
+## Deterministic words, as tools/zstd_vectors.py makes them.
+func sample_text(output: u8[], seed: u32):
+    let words = ["the", "zstd", "window", "of", "and", "frame", "<div>", "</div>", "sequence", "été",
+        "\n", "for", "a", "literal", "0123", "http://", ".com/", "ing ", "The ", "block"]
+    var at: usize = 0
+    var state = seed
+    while at < output.length:
+        state = (state *% 1103515245 +% 12345) & 0x7FFFFFFF
+        let word = words[(usize)((state >> 16) % 20)]
+        for byte in word.bytes:
+            if at < output.length:
+                output[at] = byte
+                at += 1
+        if at < output.length:
+            output[at] = 32
+            at += 1
+
+## Records like SPZ's attribute streams: quantized fields with some noise.
+func sample_records(output: u8[], seed: u32):
+    var state = seed
+    for at in 0..<output.length:
+        state = state *% 1103515245 +% 12345
+        let noise = (u8)(state >> 24)
+        output[at] = (u8)(at // 3 % 7) +% (noise & 7) if at % 3 != 2 else noise
+
+## Bytes from a 32-bit LCG: incompressible.
+func sample_noise(output: u8[], seed: u32):
+    var state = seed
+    for at in 0..<output.length:
+        state = state *% 1664525 +% 1013904223
+        output[at] = (u8)(state >> 24)
+
+## Encode `data` at `level` and decode it back.
+func round_trip(data: const u8[], level: i32) -> !:
+    let packed = try encode(data, level)
+    defer free(packed) in memory.heap
+    let back = try decode(packed, data.length)
+    defer free(back) in memory.heap
+    assert(back.length == data.length)
+    for at in 0..<data.length:
+        assert(back[at] == data[at])
+
+# mark: Hand-made frames ======================================================================
+
+test "raw, RLE and empty blocks, single segment and windowed":
+    # Single segment of 5 bytes, one raw last block "hello", no checksum.
+    let raw = b"\x28\xb5\x2f\xfd\x20\x05\x29\x00\x00hello"
+    let out = try decode(raw)
+    assert((str)out == "hello")
+    free(out) in memory.heap
+    # Window 1 KiB, no content size: an RLE block of 7 'z', then an empty last raw block.
+    let rle = b"\x28\xb5\x2f\xfd\x00\x00\x3a\x00\x00z\x01\x00\x00"
+    let zs = try decode(rle)
+    assert((str)zs == "zzzzzzz")
+    free(zs) in memory.heap
+    # Trailing bytes, a reserved bit, a reserved block type, a dictionary and a size lie.
+    assert(failure_of(b"\x28\xb5\x2f\xfd\x20\x05\x29\x00\x00helloX") == corrupt)
+    let trailing = try decode(b"\x28\xb5\x2f\xfd\x20\x05\x29\x00\x00hello!!!!!", allow_trailing = true)
+    free(trailing) in memory.heap
+    assert(failure_of(b"\x28\xb5\x2f\xfd\x28\x05\x29\x00\x00hello") == corrupt)
+    assert(failure_of(b"\x28\xb5\x2f\xfd\x20\x05\x2f\x00\x00hello") == corrupt)
+    assert(failure_of(b"\x28\xb5\x2f\xfd\x21\x07\x05\x29\x00\x00hello") == unsupported)
+    assert(failure_of(b"\x28\xb5\x2f\xfd\x20\x06\x29\x00\x00hello") == corrupt)
+    assert(failure_of(b"") == corrupt)
+    assert(failure_of(b"\x28\xb5\x2f") == corrupt)
+
+test "a skippable frame alone, and a block larger than the window":
+    let skip = b"\x5f\x2a\x4d\x18\x02\x00\x00\x00ab"
+    let out = try decode(skip)
+    assert(out.length == 0)
+    free(out) in memory.heap
+    assert(failure_of(b"\x5f\x2a\x4d\x18\x03\x00\x00\x00ab") == corrupt)
+    # A 1 KiB window holds at most 1 KiB blocks: an RLE block of 1025 fails.
+    assert(failure_of(b"\x28\xb5\x2f\xfd\x00\x00\x0b\x20\x00z") == corrupt)
+
+test "a compressed block of exactly 128 KiB of raw literals":
+    # zstd's golden block-128k.zst: window 128 KiB, one compressed block of 131072
+    # bytes holding 131068 raw literals and no sequences.
+    var frame = try new u8[131081] in memory.heap
+    defer free(frame) in memory.heap
+    let head = b"\x28\xb5\x2f\xfd\x00\x38\x05\x00\x10\xcc\xff\x1f"
+    memory.copy(frame, head, head.length)
+    try check_vector(frame, 131068, 2334817000)
+
+test "the predefined tables match the format's Appendix A":
+    var table: SeqTable
+    table.build(&literals_default[0], 36, 6, &literals_bases[0], &literals_extras[0])
+    # State: baseline (the code's), state bits, next-state base.
+    assert(table.rows[0].base == 0 and table.rows[0].bits == 4 and table.rows[0].next == 0)
+    assert(table.rows[1].base == 0 and table.rows[1].bits == 4 and table.rows[1].next == 16)
+    assert(table.rows[2].base == 1 and table.rows[2].bits == 5 and table.rows[2].next == 32)
+    assert(table.rows[31].base == 13 and table.rows[63].base == 8192 and table.rows[63].bits == 6 and table.rows[63].next == 0)
+    table.build(&match_default[0], 53, 6, &match_bases[0], &match_extras[0])
+    assert(table.rows[0].base == 3 and table.rows[0].bits == 6 and table.rows[0].next == 0)
+    assert(table.rows[1].base == 4 and table.rows[1].bits == 4 and table.rows[1].next == 0)
+    assert(table.rows[31].base == 21 and table.rows[63].base == 1027 and table.rows[63].bits == 6)
+    table.build(&offset_default[0], 29, 5, &offset_bases[0], &offset_extras[0])
+    assert(table.rows[0].extra == 0 and table.rows[0].bits == 5)
+    assert(table.rows[1].extra == 6 and table.rows[1].bits == 4 and table.rows[1].next == 0)
+    assert(table.rows[2].extra == 9 and table.rows[31].extra == 24 and table.rows[31].bits == 5)
+
+test "XXH64 of known inputs":
+    assert(xxhash64(b"") == 0xEF46DB3751D8E999)
+    assert(xxhash64(b"a") == 0xD24EC4F1A98C6E5B)
+    assert(xxhash64(b"abc") == 0x44BC2CF5AD770999)
+    assert(xxhash64(b"Nobody inspects the spammish repetition") == 0xFBCEA83C8A378BF1)
+
+# mark: Encoder round trips ===================================================================
+
+test "every level round-trips text, records, runs and noise of many sizes":
+    let sizes: usize[9] = [0, 1, 15, 16, 100, 1000, 70000, 140000, 300000]
+    var data = try new u8[300000] in memory.heap
+    defer free(data) in memory.heap
+    for kind in 0..<(usize)4:
+        if kind == 0: sample_text(data, 3)
+        elif kind == 1: sample_records(data, 5)
+        elif kind == 2: memory.set(data, 7)
+        else: sample_noise(data, 9)
+        for level in 1..<(i32)10:
+            for size in sizes:
+                try round_trip(data[..<size], level)
+
+test "encoded frames shrink what compresses and barely grow noise":
+    var data = try new u8[200000] in memory.heap
+    defer free(data) in memory.heap
+    sample_text(data, 21)
+    let text = try encode(data, 3)
+    assert(text.length < data.length // 3)
+    free(text) in memory.heap
+    sample_noise(data, 22)
+    let noise = try encode(data, 3)
+    assert(noise.length < data.length + 64)
+    free(noise) in memory.heap
+    assert(failure_of_encode(0) == invalid)
+
+## The failure code of encoding at `level`, or `closed` when it encodes.
+func failure_of_encode(level: i32) -> ErrorCode:
+    let packed = encode(b"abc", level) catch failure:
+        return failure.code
+    free(packed) in memory.heap
+    return closed
+
+# mark: Damage ================================================================================
+
+test "every truncation of a frame fails and damage never traps":
+    var data = try new u8[3000] in memory.heap
+    defer free(data) in memory.heap
+    sample_text(data, 31)
+    for level in [(i32)1, 3, 7]:
+        let packed = try encode(data, level)
+        defer free(packed) in memory.heap
+        for length in 0..<packed.length:
+            assert(failure_of(packed[..<length]) == corrupt)
+        var damaged = try new u8[packed.length] in memory.heap
+        defer free(damaged) in memory.heap
+        var state: u32 = 77
+        for _ in 0..<(usize)3000:
+            memory.copy(damaged, packed, packed.length)
+            state = state *% 1103515245 +% 12345
+            let at = (usize)(state >> 8) % packed.length
+            damaged[at] ^= (u8)(1 << ((state >> 4) & 7))
+            if state & 0x10000 != 0:
+                damaged[(at + 7) % packed.length] = (u8)(state >> 20)
+            _ = failure_of(damaged)

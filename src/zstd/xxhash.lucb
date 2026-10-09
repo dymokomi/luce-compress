@@ -1,0 +1,69 @@
+#==============================================================================================
+#
+#   zstd/xxhash - XXH64, the content checksum
+#
+#   DESCRIPTION:
+#       A frame's checksum is the low 32 bits of XXH64 (seed 0) of its content. Four
+#       lanes take 32-byte stripes; the tail is folded in 8, 4 and 1 bytes; an avalanche
+#       mixes the result. All arithmetic wraps, as the hash defines it.
+#
+#==============================================================================================
+
+let prime1: u64 = 11400714785074694791
+let prime2: u64 = 14029467366897019727
+let prime3: u64 = 1609587929392839161
+let prime4: u64 = 9650029242287828579
+let prime5: u64 = 2870177450012600261
+
+inline func rotate(value: u64, count: u64) -> u64:
+    return (value << count) | (value >> (64 - count))
+
+inline func lane_round(accumulator: u64, input: u64) -> u64:
+    return rotate(accumulator +% input *% prime2, 31) *% prime1
+
+inline func merge_lane(hash: u64, lane: u64) -> u64:
+    return (hash ^ lane_round(0, lane)) *% prime1 +% prime4
+
+## XXH64 of `data` with seed 0.
+pub func xxhash64(data: const u8[]) -> u64:
+    let base = data.data
+    let length = data.length
+    var at: usize = 0
+    var hash: u64 = 0
+    if length >= 32:
+        var v1 = prime1 +% prime2
+        var v2 = prime2
+        var v3: u64 = 0
+        var v4 = 0 -% prime1
+        while at + 32 <= length:
+            v1 = lane_round(v1, memory.read[u64](base + at))
+            v2 = lane_round(v2, memory.read[u64](base + at + 8))
+            v3 = lane_round(v3, memory.read[u64](base + at + 16))
+            v4 = lane_round(v4, memory.read[u64](base + at + 24))
+            at += 32
+        hash = rotate(v1, 1) +% rotate(v2, 7) +% rotate(v3, 12) +% rotate(v4, 18)
+        hash = merge_lane(hash, v1)
+        hash = merge_lane(hash, v2)
+        hash = merge_lane(hash, v3)
+        hash = merge_lane(hash, v4)
+    else:
+        hash = prime5
+    hash +%= (u64)length
+    while at + 8 <= length:
+        hash ^= lane_round(0, memory.read[u64](base + at))
+        hash = rotate(hash, 27) *% prime1 +% prime4
+        at += 8
+    if at + 4 <= length:
+        hash ^= (u64)memory.read[u32](base + at) *% prime1
+        hash = rotate(hash, 23) *% prime2 +% prime3
+        at += 4
+    while at < length:
+        hash ^= (u64)data[at] *% prime5
+        hash = rotate(hash, 11) *% prime1
+        at += 1
+    hash ^= hash >> 33
+    hash *%= prime2
+    hash ^= hash >> 29
+    hash *%= prime3
+    hash ^= hash >> 32
+    return hash

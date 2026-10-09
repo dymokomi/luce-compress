@@ -1,4 +1,4 @@
-from compress import encode, decode, crc32, Inflater, Deflater, finished, need_output, yielded, decode_brotli, decode_gzip, encode_gzip
+from compress import encode, decode, crc32, Inflater, Deflater, finished, need_output, yielded, decode_brotli, decode_gzip, encode_gzip, decode_zstd, encode_zstd
 
 pub func main(arguments: list[str]) -> int!:
     let encoded = encode(b"Luce package source")
@@ -76,5 +76,10 @@ pub func main(arguments: list[str]) -> int!:
     assert(unzipped.bytes() == b"small streaming result")
     unzipped.close()
     zipped.close()
+    let squeezed = encode_zstd(b"small streaming result small streaming result", level = 3)
+    let unsqueezed = decode_zstd(squeezed.bytes(), max_output = 45)
+    assert(unsqueezed.bytes() == b"small streaming result small streaming result")
+    unsqueezed.close()
+    squeezed.close()
     print("PASS Luce codec API, binary ownership, consumed-byte count and one-operation cooperative yields")
     return 0

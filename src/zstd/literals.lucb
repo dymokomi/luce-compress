@@ -1,0 +1,80 @@
+#==============================================================================================
+#
+#   zstd/literals - The literals section of a compressed block
+#
+#   DESCRIPTION:
+#       A block's literals come first: raw, one byte repeated (RLE), or Huffman-coded in
+#       one stream or four, with a new tree or the frame's previous one (treeless). They
+#       are decoded into the context's buffer, from which sequences copy them.
+#
+#==============================================================================================
+
+let literals_raw: u32 = 0
+let literals_rle: u32 = 1
+let literals_huffman: u32 = 2
+let literals_treeless: u32 = 3
+
+extend Context:
+    ## Decode the literals section at the start of `block` (a compressed block's content)
+    ## into `literals`; its size, and the literals' count in `literal_count`.
+    func read_literals(block: const u8[]) -> usize!:
+        if block.length < 2: error(corrupt, "truncated zstd block")
+        let first = (u32)block[0]
+        let kind = first & 3
+        let format = (first >> 2) & 3
+        if kind == literals_raw or kind == literals_rle:
+            var header: usize = 1
+            var count: usize = (usize)(first >> 3)
+            if format == 1:
+                header = 2
+                count = (usize)(first >> 4) + ((usize)block[1] << 4)
+            elif format == 3:
+                header = 3
+                if block.length < 3: error(corrupt, "truncated zstd literals")
+                count = (usize)(first >> 4) + ((usize)block[1] << 4) + ((usize)block[2] << 12)
+            if count > self.block_most: error(corrupt, "zstd literals exceed the block size")
+            self.literal_count = count
+            if kind == literals_raw:
+                if header + count > block.length: error(corrupt, "truncated zstd literals")
+                if count > 0: memory.copy(self.literals, block[header..<header + count], count)
+                return header + count
+            if header + 1 > block.length: error(corrupt, "truncated zstd literals")
+            memory.set(self.literals[..<count], block[header])
+            return header + 1
+        # Huffman-coded: sizes of 10, 14 or 18 bits each.
+        if block.length < 5: error(corrupt, "truncated zstd literals")
+        var header: usize = 3
+        var count: usize = 0
+        var packed: usize = 0
+        let low = (usize)block[0] | (usize)block[1] << 8 | (usize)block[2] << 16
+        if format <= 1:
+            count = (low >> 4) & 1023
+            packed = (low >> 14) & 1023
+        elif format == 2:
+            header = 4
+            let word = low | (usize)block[3] << 24
+            count = (word >> 4) & 16383
+            packed = word >> 18
+        else:
+            header = 5
+            let word = low | (usize)block[3] << 24 | (usize)block[4] << 32
+            count = (word >> 4) & 262143
+            packed = word >> 22
+        let single = format == 0
+        if count > self.block_most: error(corrupt, "zstd literals exceed the block size")
+        if not single and count < 6: error(corrupt, "too few zstd literals for four streams")
+        if header + packed > block.length: error(corrupt, "truncated zstd literals")
+        var streams = block[header..<header + packed]
+        if kind == literals_huffman:
+            let (log, size) = try read_huffman(streams, &self.huffman[0])
+            if size >= streams.length: error(corrupt, "truncated zstd literals")
+            self.huffman_log = log
+            streams = streams[size..]
+        elif self.huffman_log == 0:
+            error(corrupt, "treeless zstd literals without a previous tree")
+        self.literal_count = count
+        if single:
+            try decode_stream(streams, self.literals[..<count], &self.huffman[0], self.huffman_log)
+        else:
+            try decode_four(streams, self.literals[..<count], &self.huffman[0], self.huffman_log)
+        return header + packed
